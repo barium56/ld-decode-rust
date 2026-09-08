@@ -37,6 +37,8 @@ pub struct DecodeWriter {
     /// in memory and dumps the array only at close time; rust must do the
     /// same so the filler aliasing (below) can be resolved before writing.
     json_entries: Vec<FieldInfoEntry>,
+    /// Scratch for the i8->u8 EFM byte conversion (reused across fields).
+    efm_bytes: Vec<u8>,
     field_count: usize,
     first_field_write: Option<Instant>,
     last_field_write: Option<Instant>,
@@ -107,6 +109,7 @@ impl DecodeWriter {
             outfile_pre_efm: pre_efm.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
             json_file: json,
             json_entries: Vec::new(),
+    efm_bytes: Vec::new(),
             field_count: 0,
             first_field_write: None,
             last_field_write: None,
@@ -139,11 +142,14 @@ impl DecodeWriter {
         }
         if let Some(efm_file) = self.outfile_efm.as_mut() {
             if !field.efm.is_empty() {
-                let mut bytes = Vec::with_capacity(field.efm.len());
+                // Reuse the scratch buffer across fields (saves a ~15KB
+                // alloc+copy per field on the serial write path).
+                self.efm_bytes.clear();
+                self.efm_bytes.reserve(field.efm.len());
                 for v in &field.efm {
-                    bytes.push(*v as u8);
+                    self.efm_bytes.push(*v as u8);
                 }
-                efm_file.write_all(&bytes)?;
+                efm_file.write_all(&self.efm_bytes)?;
             }
         }
         if let Some(pre_efm_file) = self.outfile_pre_efm.as_mut() {
