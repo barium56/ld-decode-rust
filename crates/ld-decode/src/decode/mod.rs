@@ -1112,24 +1112,86 @@ impl Decoder {
                 startloc: block_begin as u64,
             };
             let t_ext0 = std::time::Instant::now();
-            for (i, decoded) in decoded.into_iter().enumerate() {
-                let decoded = decoded.expect("every block resolved");
-                raw.video.demod.extend_from_slice(&decoded.video.demod);
-                raw.video.demod_raw.extend_from_slice(&decoded.video.demod_raw);
-                raw.video.demod_05.extend_from_slice(&decoded.video.demod_05);
-                raw.video.demod_burst.extend_from_slice(&decoded.video.demod_burst);
-                for ch in 0..2 {
-                    raw.video.audio[ch]
-                        .extend_from_slice(&decoded.video.audio[ch]);
+            // Each channel is a concatenation of per-block slices into
+            // disjoint pre-reserved ranges, so the ~140MB/field memcpy fans
+            // out across cores per channel (same bytes, same order — the
+            // per-channel layout is unchanged, only the copy parallelism).
+            let decoded_list: Vec<Arc<BlockDecode>> = decoded
+                .into_iter()
+                .map(|d| d.expect("every block resolved"))
+                .collect();
+            let input_parts: Vec<&[f32]> = (0..numblocks_read)
+                .map(|i| {
+                    let off = first_in_window as usize + i * spec.blocksize;
+                    let block = &data[off..off + spec.blocklen];
+                    let cut_end = spec.blockcut_end.min(block.len());
+                    &block[spec.blockcut..block.len() - cut_end]
+                })
+                .collect();
+            let fpart = |get: fn(&BlockDecode) -> &[f32]| -> Vec<&[f32]> {
+                decoded_list.iter().map(|d| get(d)).collect()
+            };
+            let ipart = |get: fn(&BlockDecode) -> &[i16]| -> Vec<&[i16]> {
+                decoded_list.iter().map(|d| get(d)).collect()
+            };
+            let aparts: [Vec<&[f32]>; 2] = [
+                decoded_list.iter().map(|d| &d.video.audio[0][..]).collect(),
+                decoded_list.iter().map(|d| &d.video.audio[1][..]).collect(),
+            ];
+            // Nine independent channel concatenations; run them as parallel
+            // tasks on the rayon pool so the per-channel copies use more
+            // memory bandwidth than the single-threaded chain. Each channel
+            // still receives its per-block slices in window order, so the
+            // assembled bytes are identical to the sequential extends.
+            let p_demod = &mut raw.video.demod as *mut Vec<f32>;
+            let p_demod_raw = &mut raw.video.demod_raw as *mut Vec<f32>;
+            let p_demod_05 = &mut raw.video.demod_05 as *mut Vec<f32>;
+            let p_demod_burst = &mut raw.video.demod_burst as *mut Vec<f32>;
+            let p_audio0 = &mut raw.video.audio[0] as *mut Vec<f32>;
+            let p_audio1 = &mut raw.video.audio[1] as *mut Vec<f32>;
+            let p_efm = &mut raw.video.efm as *mut Vec<i16>;
+            let p_rfhpf = &mut raw.rfhpf as *mut Vec<f32>;
+            let p_input = &mut raw.input as *mut Vec<f32>;
+            let parts_demod: Vec<&[f32]> = decoded_list.iter().map(|d| &d.video.demod[..]).collect();
+            let parts_demod_raw: Vec<&[f32]> = decoded_list.iter().map(|d| &d.video.demod_raw[..]).collect();
+            let parts_demod_05: Vec<&[f32]> = decoded_list.iter().map(|d| &d.video.demod_05[..]).collect();
+            let parts_demod_burst: Vec<&[f32]> = decoded_list.iter().map(|d| &d.video.demod_burst[..]).collect();
+            let parts_audio0: Vec<&[f32]> = decoded_list.iter().map(|d| &d.video.audio[0][..]).collect();
+            let parts_audio1: Vec<&[f32]> = decoded_list.iter().map(|d| &d.video.audio[1][..]).collect();
+            let parts_efm: Vec<&[i16]> = decoded_list.iter().map(|d| &d.video.efm[..]).collect();
+            let parts_rfhpf: Vec<&[f32]> = decoded_list.iter().map(|d| &d.rfhpf[..]).collect();
+            let parts_input: Vec<&[f32]> = input_parts.clone();
+            let t_ext0 = t_ext0;
+            struct SendPtr(*mut ());
+            unsafe impl Send for SendPtr {}
+            unsafe impl Sync for SendPtr {}
+            let send_ptrs: [SendPtr; 9] = [
+                SendPtr(p_demod as *mut ()),
+                SendPtr(p_demod_raw as *mut ()),
+                SendPtr(p_demod_05 as *mut ()),
+                SendPtr(p_demod_burst as *mut ()),
+                SendPtr(p_audio0 as *mut ()),
+                SendPtr(p_audio1 as *mut ()),
+                SendPtr(p_efm as *mut ()),
+                SendPtr(p_rfhpf as *mut ()),
+                SendPtr(p_input as *mut ()),
+            ];
+            let write_one = |k: usize| unsafe {
+                match k {
+                    0 => write_par_concat(&mut *(send_ptrs[0].0 as *mut Vec<f32>), &parts_demod),
+                    1 => write_par_concat(&mut *(send_ptrs[1].0 as *mut Vec<f32>), &parts_demod_raw),
+                    2 => write_par_concat(&mut *(send_ptrs[2].0 as *mut Vec<f32>), &parts_demod_05),
+                    3 => write_par_concat(&mut *(send_ptrs[3].0 as *mut Vec<f32>), &parts_demod_burst),
+                    4 => write_par_concat(&mut *(send_ptrs[4].0 as *mut Vec<f32>), &parts_audio0),
+                    5 => write_par_concat(&mut *(send_ptrs[5].0 as *mut Vec<f32>), &parts_audio1),
+                    6 => write_par_concat(&mut *(send_ptrs[6].0 as *mut Vec<i16>), &parts_efm),
+                    7 => write_par_concat(&mut *(send_ptrs[7].0 as *mut Vec<f32>), &parts_rfhpf),
+                    _ => write_par_concat(&mut *(send_ptrs[8].0 as *mut Vec<f32>), &parts_input),
                 }
-                raw.video.efm.extend_from_slice(&decoded.video.efm);
-                raw.rfhpf.extend_from_slice(&decoded.rfhpf);
-                let off = first_in_window as usize + i * spec.blocksize;
-                let block = &data[off..off + spec.blocklen];
-                let cut_end = spec.blockcut_end.min(block.len());
-                raw.input
-                    .extend_from_slice(&block[spec.blockcut..block.len() - cut_end]);
-            }
+            };
+            (0..9usize).into_par_iter().for_each(|k| {
+                write_one(k)
+            });
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
             let t_ph0 = std::time::Instant::now();
             let phase2 = audio_phase2(&spec, &raw.video.audio);
@@ -1678,4 +1740,28 @@ fn decode_bcd(bcd: i64) -> Result<i64, ()> {
         return Err(());
     }
     Ok(10 * decode_bcd(bcd >> 4)? + digit)
+}
+
+/// Concatenate `parts` into `dst` (which must be pre-reserved) with the
+/// per-part copies spread across the rayon pool. The destination layout is
+/// identical to sequential `extend_from_slice` calls in `parts` order; only
+/// the copy parallelism differs, so the produced bytes are the same.
+fn write_par_concat<T: Copy + Default + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
+    let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+    let total: usize = lens.iter().sum();
+    dst.resize(dst.len() + total, T::default());
+    // Split the fresh tail into one &mut slice per part (disjoint by
+    // construction), then copy each part in parallel.
+    let start = dst.len() - total;
+    let mut slices: Vec<&mut [T]> = Vec::with_capacity(parts.len());
+    let mut rest = &mut dst[start..];
+    for &l in &lens {
+        let (head, tail) = rest.split_at_mut(l);
+        slices.push(head);
+        rest = tail;
+    }
+    slices
+        .into_par_iter()
+        .zip(parts.par_iter())
+        .for_each(|(d, p)| d.copy_from_slice(p));
 }
