@@ -576,13 +576,18 @@ impl Field {
         let offset = self.spec.sys_output_zero as f64
             - self.levels.vsync_ire * self.out_scale
             - self.levels.ire0 * scale;
-        input
-            .iter()
-            .map(|&sample| {
-                let value = f64::from(sample) * scale + offset + 0.5;
-                value.clamp(0.0, 65535.0) as u16
-            })
-            .collect()
+        // Elementwise map: chunk-parallel with identical per-sample
+        // arithmetic, so the output is bit-identical to the serial loop.
+        let mut out = vec![0u16; input.len()];
+        out.par_chunks_mut(16384)
+            .zip(input.par_chunks(16384))
+            .for_each(|(dst, src)| {
+                for (slot, &sample) in dst.iter_mut().zip(src.iter()) {
+                    let value = f64::from(sample) * scale + offset + 0.5;
+                    *slot = value.clamp(0.0, 65535.0) as u16;
+                }
+            });
+        out
     }
 
     #[allow(dead_code)]
