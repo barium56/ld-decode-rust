@@ -20,13 +20,14 @@ mod field;
 mod vits;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::request::ColorSystem;
+use rustfft::num_complex::Complex64;
 use crate::spec::{CalibLevels, DecoderSpec};
 use audio::audio_phase2;
 use demodblock::{BlockDecode, VideoChannels};
@@ -1055,17 +1056,26 @@ impl Decoder {
                     )
                 })
                 .collect();
-            // All blocks of this pass share the same MTF, so compute the
-            // `MTF ** mtf_level` spectrum once (16k complex pows) and share it.
-            let mtf_pow = if mtf != 0.0 {
-                Some(compute_mtf_pow(&spec.filters.mtf, mtf))
-            } else {
-                None
-            };
+            // All blocks of this pass share the same MTF, so the
+            // `MTF ** mtf_level` spectrum is computed lazily inside the
+            // parallel closure: when every window block is a cache hit
+            // (`missing` empty) the 16k complex pows never run, and when it
+            // does run it lands inside the parallel demod timing instead of
+            // the serial tail. Same value, same call sites as before.
+            let mtf_pow: OnceLock<Option<Vec<Complex64>>> = OnceLock::new();
             let t_demod0 = std::time::Instant::now();
             let computed: Vec<BlockDecode> = missing
                 .par_iter()
-                .map(|&(_, off)| demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, mtf_pow.as_deref(), spec.delays.video_rot))
+                .map(|&(_, off)| {
+                    let pow = mtf_pow.get_or_init(|| {
+                        if mtf != 0.0 {
+                            Some(compute_mtf_pow(&spec.filters.mtf, mtf))
+                        } else {
+                            None
+                        }
+                    });
+                    demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pow.as_deref(), spec.delays.video_rot)
+                })
                 .collect();
             self.dbg.demod = t_demod0.elapsed().as_nanos() as u64;
             let t_asm0 = std::time::Instant::now();
@@ -1206,7 +1216,14 @@ impl Decoder {
                 } else {
                     let computed: Vec<BlockDecode> = prefetch
                         .par_iter()
-                        .map(|&(_, off)| demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, mtf_pow.as_deref(), spec.delays.video_rot))
+                        .map(|&(_, off)| {
+                            let pf_pow = if mtf != 0.0 {
+                                Some(compute_mtf_pow(&spec.filters.mtf, mtf))
+                            } else {
+                                None
+                            };
+                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref(), spec.delays.video_rot)
+                        })
                         .collect();
                     for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
                         self.cache_insert(bnum, mtf, bd);
