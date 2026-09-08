@@ -213,28 +213,10 @@ impl DecodeWriter {
             // reference, whose `build_json` also writes the header only at
             // close time.
             //
-            // Python aliases the stored `fi` dict: a filler field's writeout
-            // re-processes the stored field's efm through the shared PLL and
-            // overwrites `efmTValues`/`audioSamples`/`ac3Symbols` in the *same*
-            // dict that was appended when the field was first written. Every
-            // json entry for a duplicated fileLoc (filler) must therefore show
-            // the last writeout's values.
-            let mut loc_to_last: std::collections::HashMap<u64, usize> =
-                std::collections::HashMap::new();
-            for (i, e) in self.json_entries.iter().enumerate() {
-                loc_to_last.insert(e.file_loc, i);
-            }
-            for i in 0..self.json_entries.len() {
-                if let Some(&last) = loc_to_last.get(&self.json_entries[i].file_loc) {
-                    if last != i {
-                        let last = self.json_entries[last].clone();
-                        self.json_entries[i].efm_t_values = last.efm_t_values;
-                        self.json_entries[i].audio_samples = last.audio_samples;
-                        self.json_entries[i].ac3_symbols = last.ac3_symbols;
-                    }
-                }
-            }
-
+            // Python's json dumper thread serializes each field's dict when it
+            // arrives (pushed at its writeout), so a later in-place mutation of
+            // the aliased dict never reaches the json. Entries keep the values
+            // from their own writeout, duplicated fileLoc included.
             let mut chunk = Vec::new();
             append_header(&mut chunk, &metadata, field_count)?;
             for (i, e) in self.json_entries.iter().enumerate() {

@@ -250,10 +250,6 @@ pub struct Decoder {
     /// Line codes of the last decoded *first* field, for VBI frame decoding.
     firstfield_linecode: Option<Vec<Option<i64>>>,
     lastvalidfield: [Option<WriteableField>; 2],
-    /// fieldinfo index of the most recent json entry for each field parity
-    /// (python aliases the stored fi dict, so a filler's efm re-process must
-    /// update the original entry's efmTValues too).
-    lastvalid_json_idx: [Option<usize>; 2],
     /// (fields_written, readloc) of the last written field, for the analog
     /// audio A/V-sync offset (port of `LDdecode.lastFieldWritten`).
     last_written: Option<(f64, u64)>,
@@ -336,7 +332,6 @@ impl Decoder {
             prevfield: None,
             firstfield_linecode: None,
             lastvalidfield: [None, None],
-            lastvalid_json_idx: [None, None],
             last_written: None,
             efm_pll: EfmPll::new(),
             cached_vits: None,
@@ -738,28 +733,16 @@ impl Decoder {
         let t_o0 = std::time::Instant::now();
         if need_filler {
             if let Some(other) = self.lastvalidfield[1 - idx].clone() {
-                let orig_idx = self.lastvalid_json_idx[1 - idx];
                 output.push(self.writeout(other)?);
-                // Python's filler re-processes the stored field's efm through
-                // the shared PLL and stores the result in the *same* fi dict
-                // that was appended when the field was first written, so the
-                // original json entry's efmTValues is overwritten with the
-                // re-processed length. Mirror that aliasing here.
-                if let Some(orig) = orig_idx {
-                    let new_len = self.fieldinfo.last().map(|e| e.efm_t_values).unwrap_or(0);
-                    self.fieldinfo[orig].efm_t_values = new_len;
-                }
             }
             if let Some(current) = self.lastvalidfield[idx].clone() {
                 output.push(self.writeout(current)?);
-                self.lastvalid_json_idx[idx] = Some(self.fieldinfo.len() - 1);
             }
         } else if let Some(current) = self.lastvalidfield[idx].clone() {
             // Mirror LDdecode: the A/V-sync offset is computed from the last
             // written field, recorded before this write.
             self.last_written = Some((self.fields_written as f64, current.info.file_loc));
             output.push(self.writeout(current)?);
-            self.lastvalid_json_idx[idx] = Some(self.fieldinfo.len() - 1);
         }
         t_out += t_o0.elapsed().as_nanos() as u64;
 
