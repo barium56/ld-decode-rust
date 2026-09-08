@@ -66,13 +66,16 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
     });
 
     let s_p1 = s0.elapsed().as_nanos() as u64;
-    // Build sets of min/max valid levels.
+    // Build sets of min/max valid levels. The per-line sync ranges are
+    // narrow, so store them as intervals and let the element-wise pass test
+    // membership instead of materializing two 5.8M-element f32 vectors that
+    // are 99% default values.
     let iretohz = |ire: f64| field.levels.iretohz(ire);
     let demod = &field.data.video.demod;
     let demod_05 = &field.data.video.demod_05;
-    let mut valid_min = vec![iretohz(-50.0) as f32; demod.len()];
+    let valid_min_default = iretohz(-50.0) as f32;
     let valid_max = iretohz(160.0) as f32;
-    let mut valid_min05 = vec![iretohz(-30.0) as f32; demod_05.len()];
+    let valid_min05_default = iretohz(-30.0) as f32;
     let valid_max05 = iretohz(115.0) as f32;
 
     let hsync_len = field.lt.hsync.1 as usize;
@@ -83,6 +86,7 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
     let vsync_lines = field.get_vsync_lines();
     let n = field.linelocs.len();
 
+    let mut sync_ranges: Vec<(usize, usize)> = Vec::new();
     for l in 1..n.saturating_sub(1) {
         let start = field.linelocs[l] as usize;
         let end = if vsync_lines.contains(&l) {
@@ -90,13 +94,17 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
         } else {
             start + hsync_len
         };
-        let end = end.min(valid_min.len());
-        for i in start..end {
-            valid_min[i] = sync_min;
-            if i < valid_min05.len() {
-                valid_min05[i] = sync_min_05;
-            }
+        let end = end.min(demod.len());
+        if end > start {
+            sync_ranges.push((start, end));
         }
+    }
+    // 1-bit-per-sample mask: building it touches only the (narrow) sync
+    // ranges instead of writing two 46MB value vectors, and the per-sample
+    // lookup below is a plain array index.
+    let mut sync_mask = vec![false; demod.len()];
+    for &(s, e) in &sync_ranges {
+        sync_mask[s..e].fill(true);
     }
 
     let s_vm = s0.elapsed().as_nanos() as u64;
@@ -114,11 +122,17 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
             if gi < demod_raw.len() && demod_raw[gi] > freq_hz_half {
                 *flag = true;
             }
-            if gi < demod.len() && (demod[gi] < valid_min[gi] || demod[gi] > valid_max) {
-                *flag = true;
+            if gi < demod.len() {
+                let vmin = if sync_mask[gi] { sync_min } else { valid_min_default };
+                if demod[gi] < vmin || demod[gi] > valid_max {
+                    *flag = true;
+                }
             }
-            if gi < demod_05.len() && (demod_05[gi] < valid_min05[gi] || demod_05[gi] > valid_max05) {
-                *flag = true;
+            if gi < demod_05.len() {
+                let vmin = if sync_mask[gi] { sync_min_05 } else { valid_min05_default };
+                if demod_05[gi] < vmin || demod_05[gi] > valid_max05 {
+                    *flag = true;
+                }
             }
         }
     });
