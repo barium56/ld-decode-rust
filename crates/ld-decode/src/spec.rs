@@ -723,8 +723,39 @@ pub(crate) mod ucrt_atan2 {
         pub fn atan2(y: f64, x: f64) -> f64;
     }
 
+    /// Public entry: exact UCRT `atan2` for one pair.
+    #[inline]
     pub fn call(y: f64, x: f64) -> f64 {
         unsafe { atan2(y, x) }
+    }
+
+    /// Whole-slice variant: lets the compiler amortize the FFI transition
+    /// across the loop (one extern call per ~8 inputs via batching inside the
+    /// extern fn is not possible for atan2, but keeping the loop in one
+    /// #[inline(never)] function avoids re-loading closure state and lets
+    /// LLVM keep `d`/`scale` in registers). Same per-element calls and
+    /// results as `call` in a loop.
+    pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
+        assert_eq!(out.len(), pim.len());
+        assert_eq!(out.len(), pre.len());
+        for i in 0..out.len() {
+            out[i] = unsafe { atan2(pim[i], pre[i]) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) mod ucrt_atan2 {
+    pub fn call(y: f64, x: f64) -> f64 {
+        y.atan2(x)
+    }
+
+    pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
+        assert_eq!(out.len(), pim.len());
+        assert_eq!(out.len(), pre.len());
+        for i in 0..out.len() {
+            out[i] = pim[i].atan2(pre[i]);
+        }
     }
 }
 

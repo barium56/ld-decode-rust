@@ -115,19 +115,25 @@ pub(crate) fn unwrap_hilbert(hilbert: &[Complex64], freq_hz: f64) -> Vec<f64> {
         return out;
     }
     let scale = freq_hz / TAU;
+    // Stage 1: conjugate-product components. numba's jitted complex128
+    // multiply uses the plain 4-product formula (no FMA), NOT numpy's SIMD
+    // fmaddsub kernel. Verified bit-for-bit against numba 0.62 complex
+    // multiply on real data.
+    let mut pim = vec![0.0f64; len];
+    let mut pre = vec![0.0f64; len];
     for i in 1..len {
-        // numba's jitted complex128 multiply uses the plain 4-product formula
-        // (no FMA), NOT numpy's SIMD fmaddsub kernel. Verified bit-for-bit
-        // against numba 0.62 complex multiply on real data.
         let z = hilbert[i];
         let w = hilbert[i - 1];
         let (a, bb) = (z.re, z.im);
         let (c, dd) = (w.re, -w.im); // conj(w)
-        let pre = a * c - bb * dd;
-        let pim = a * dd + bb * c;
-        // numpy's np.arctan2 calls UCRT atan2 exactly; rust's std f64::atan2
-        // can deviate by 1-2 ulp, so call UCRT directly on Windows.
-        let mut d = crate::spec::ucrt_atan2::call(pim, pre);
+        pre[i] = a * c - bb * dd;
+        pim[i] = a * dd + bb * c;
+    }
+    // Stage 2: one tight atan2 loop over the slice (same UCRT calls, same
+    // results, but no per-iteration closure state).
+    crate::spec::ucrt_atan2::call_slice(&mut out, &pim, &pre);
+    for i in 1..len {
+        let mut d = out[i];
         if d < 0.0 {
             d += TAU;
         }
