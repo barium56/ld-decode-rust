@@ -42,6 +42,9 @@ pub(crate) struct ValidPulse {
 }
 
 /// Everything the decoder needs from the previously decoded field.
+/// The large buffers are `Arc`ed: `to_prevfield` takes them via
+/// `std::mem::take` (ownership moves out of the consumed field), so the
+/// snapshot is a pointer bump instead of a multi-megabyte memcpy.
 #[derive(Clone)]
 pub(crate) struct PrevField {
     pub linelocs: Vec<f64>,
@@ -50,13 +53,13 @@ pub(crate) struct PrevField {
     pub sync_confidence: i64,
     pub valid: bool,
     pub startloc: u64,
-    pub demod: Vec<f32>,
+    pub demod: Arc<Vec<f32>>,
     pub lineoffset: usize,
     pub outlinecount: usize,
     pub phase_adjust_median: f64,
     pub field_phase_id: i64,
     /// TBC picture of the previous field (for 3D comb metrics).
-    pub dspicture: Vec<u16>,
+    pub dspicture: Arc<Vec<u16>>,
     pub out_scale: f64,
 }
 
@@ -456,7 +459,7 @@ impl Field {
 
     /// Snapshot the state a later field needs from this one (port of the
     /// `prevfield` chain in the Python decoder).
-    pub fn to_prevfield(&self) -> PrevField {
+    pub fn to_prevfield(&mut self) -> PrevField {
         PrevField {
             linelocs: self.linelocs.clone(),
             linecount: self.linecount.unwrap_or(0),
@@ -464,12 +467,12 @@ impl Field {
             sync_confidence: self.sync_confidence,
             valid: self.valid,
             startloc: self.data.startloc,
-            demod: self.data.video.demod.clone(),
+            demod: Arc::new(std::mem::take(&mut self.data.video.demod)),
             lineoffset: self.lineoffset,
             outlinecount: self.outlinecount,
             phase_adjust_median: self.phase_adjust_median,
             field_phase_id: self.field_phase_id,
-            dspicture: self.dspicture.clone(),
+            dspicture: Arc::new(std::mem::take(&mut self.dspicture)),
             out_scale: self.out_scale,
         }
     }
