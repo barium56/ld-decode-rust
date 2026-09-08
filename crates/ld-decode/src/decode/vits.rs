@@ -16,6 +16,7 @@ pub(crate) struct CombInput<'a> {
 }
 
 /// The two JSON-reported metrics plus the MTF-driving RF ratio.
+#[derive(Clone)]
 pub(crate) struct VitsOutcome {
     pub w_snr: Option<f64>,
     pub b_psnr: Option<f64>,

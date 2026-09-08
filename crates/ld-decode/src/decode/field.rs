@@ -154,7 +154,6 @@ pub(crate) struct Field {
     /// The TBC picture (u16) once downscaled.
     pub dspicture: Vec<u16>,
     /// The raw (f32) downscaled luma.
-    pub dsout_f32: Vec<f32>,
     /// Downscaled interleaved int16 audio for the .pcm output.
     pub dsaudio: Vec<i16>,
     /// EFM slice for the .efm output (fed to the PLL at write time).
@@ -429,7 +428,6 @@ impl Field {
             linecode: vec![None; 3],
             out_scale: 0.0,
             dspicture: Vec::new(),
-            dsout_f32: Vec::new(),
             dsaudio: Vec::new(),
             efmout: Vec::new(),
             lt: Timings::default(),
@@ -1724,7 +1722,10 @@ impl Field {
         audio_freq: f64,
         audio_offset: f64,
     ) -> Result<Vec<f32>> {
+        let sub = std::env::var_os("LD_SUBTIME").is_some();
+        let t0 = std::time::Instant::now();
         let (interpolated_pixel_locs, wowfactors) = self.computewow_scaled()?;
+        let t_wow = t0.elapsed().as_nanos() as u64;
         if let Some(p) = std::env::var_os("LD_DUMP_WOW") {
             use std::io::Write;
             let filter = std::env::var("LD_DUMP_WOW_FILTER").unwrap_or_default();
@@ -1774,6 +1775,7 @@ impl Field {
                 }
             }
         }
+        let t1 = std::time::Instant::now();
         scale_field_sinc(
             channel_data,
             &mut dsout,
@@ -1787,11 +1789,12 @@ impl Field {
                 level_adjust_threshold: 15.0,
             },
         );
+        let t_sinc = t1.elapsed().as_nanos() as u64;
 
+        let t2 = std::time::Instant::now();
         if final_ {
             self.dspicture = self.hz_to_output_array(&dsout);
         }
-        self.dsout_f32 = dsout.clone();
 
         if let Some(p) = std::env::var_os("LD_DUMP_FIELDCHAIN") {
             use std::io::Write;
@@ -1831,8 +1834,10 @@ impl Field {
                 }
             }
         }
+        let t_hz = t2.elapsed().as_nanos() as u64;
 
         // Analog audio: resample the stage-2 audio to the output rate.
+        let t3 = std::time::Instant::now();
         if audio_freq != 0.0 {
             let linecount = self.linecount.unwrap_or(self.outlinecount);
             let (dsaudio, _next) = crate::decode::audio::downscale_audio(
@@ -1846,8 +1851,10 @@ impl Field {
             );
             self.dsaudio = dsaudio;
         }
+        let t_aud = t3.elapsed().as_nanos() as u64;
 
         // EFM: slice the equalised signal between the first and last lines.
+        let t4 = std::time::Instant::now();
         if self.data.efm.len() > 2 && self.linelocs.len() > 2 {
             let linecount = self.linecount.unwrap_or(self.outlinecount);
             let start = self.linelocs[1] as usize;
@@ -1948,6 +1955,10 @@ impl Field {
                 }
                 self.efmout = self.data.efm[start..end].to_vec();
             }
+        }
+        let t_efm = t4.elapsed().as_nanos() as u64;
+        if sub {
+            eprintln!("SUBTIME wow={:.3} sinc={:.3} hz={:.3} aud={:.3} efm={:.3} ms", t_wow as f64 / 1e6, t_sinc as f64 / 1e6, t_hz as f64 / 1e6, t_aud as f64 / 1e6, t_efm as f64 / 1e6);
         }
 
         Ok(dsout)

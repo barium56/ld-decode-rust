@@ -258,6 +258,9 @@ pub struct Decoder {
     last_written: Option<(f64, u64)>,
     /// EFM PLL, carried across fields (the EFM track is continuous).
     efm_pll: EfmPll,
+    /// Vits metrics computed in the decode loop for the current field, reused
+    /// by buildmetadata (wSNR/bPSNR don't depend on the previous field).
+    cached_vits: Option<vits::VitsOutcome>,
     frame_number: Option<i64>,
     // CLV/CAV VBI state.
     is_clv: bool,
@@ -335,6 +338,7 @@ impl Decoder {
             lastvalid_json_idx: [None, None],
             last_written: None,
             efm_pll: EfmPll::new(),
+            cached_vits: None,
             frame_number: None,
             is_clv: false,
             early_clv: false,
@@ -551,7 +555,10 @@ impl Decoder {
                         self.analog_audio_freq,
                         audio_offset,
                     )?;
-                    picture = Some(LumaOutput::Encoded(field.hz_to_output_array(&luma)));
+                    // downscale(final_=true) already encoded the luma into
+                    // field.dspicture with the same levels; reuse it instead of
+                    // recomputing the identical 1M-sample conversion.
+                    picture = Some(LumaOutput::Encoded(field.dspicture.clone()));
                     self.metadata = Some(MetadataFieldState {
                         out_scale: field.out_scale,
                         outlinecount: field.outlinecount,
@@ -560,6 +567,10 @@ impl Decoder {
                     t_down += t_d0.elapsed().as_nanos() as u64;
                     let t_v0 = std::time::Instant::now();
                     let metrics = vits::compute_vits_metrics(&self.spec, field, None);
+                    // Cache for buildmetadata: wSNR/bPSNR don't depend on the
+                    // previous field, so the second call in buildmetadata is a
+                    // pure duplicate for this field.
+                    self.cached_vits = Some(metrics.clone());
                     if let Some(p) = std::env::var_os("LD_DUMP_BWRATIO") {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
@@ -1366,7 +1377,13 @@ impl Decoder {
 
         let fp = self.prevfield.clone();
         let t_v2 = std::time::Instant::now();
-        let metrics = vits::compute_vits_metrics(&self.spec, field, fp.as_ref());
+        // Reuse the metrics computed in the decode loop for this same field;
+        // only the fp-dependent line-19 metrics differ, and neither wSNR nor
+        // bPSNR read those.
+        let metrics = self
+            .cached_vits
+            .take()
+            .unwrap_or_else(|| vits::compute_vits_metrics(&self.spec, field, fp.as_ref()));
         self.dbg.meta_vits = t_v2.elapsed().as_nanos() as u64;
         fi.decode_faults = Some(decode_faults);
         fi.vits_metrics = Some(VitsMetrics {
