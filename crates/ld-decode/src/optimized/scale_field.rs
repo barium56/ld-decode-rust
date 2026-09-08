@@ -287,6 +287,40 @@ fn make_interp_spline<const K: usize>(
 /// Evaluate the spline value and first derivative at `x`. `span` is the
 /// running knot-span index (updated in place) so consecutive evaluations walk
 /// forward efficiently. Ported from the tape-decode Rust project.
+/// Evaluate the spline value and first derivative at `x` with the knot span
+/// already known. Identical arithmetic to [`eval_spline_value_deriv_k`]; only
+/// the span search is hoisted out (precomputed serially by the caller).
+pub(crate) fn eval_spline_at<const K: usize>(
+    t: &[f64],
+    c: &[f64],
+    nt: usize,
+    span: usize,
+    x: f64,
+) -> (f64, f64) {
+    if K == 1 {
+        let s = span;
+        let inv_h = 1.0 / (t[s + 1] - t[s]);
+        let b0 = (t[s + 1] - x) * inv_h;
+        let b1 = (x - t[s]) * inv_h;
+        let c0 = c[s - 1];
+        let c1 = c[s];
+        let mut deriv = c0 * (-inv_h);
+        deriv += c1 * inv_h;
+        return (b0 * c0 + b1 * c1, deriv);
+    }
+    let ders = bspline_ders_basis::<K>(t, span, x, 1);
+    let cofs = &c[span - K..=span];
+    let mut value = 0.0;
+    let mut deriv = 0.0;
+    let dh = fitpack_deboor_deriv::<K>(t, span, x);
+    for j in 0..=K {
+        let cj = cofs[j];
+        value += ders[0][j] * cj;
+        deriv += dh[j] * cj;
+    }
+    (value, deriv)
+}
+
 pub(crate) fn eval_spline_value_deriv_k<const K: usize>(
     t: &[f64],
     c: &[f64],

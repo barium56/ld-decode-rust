@@ -9,8 +9,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::decode::demodblock::VideoChannels;
+use rayon::prelude::*;
+
 use crate::optimized::{
-    eval_spline_value_deriv_k, make_interp_spline_scaled, scale_field_sinc, sinc_lut,
+    eval_spline_at, eval_spline_value_deriv_k, make_interp_spline_scaled, scale_field_sinc,
+    sinc_lut,
     SincScaleParams,
 };
 use crate::spec::{CalibLevels, DecoderSpec, SYS_HZ_IRE, SYS_IRE0};
@@ -1694,18 +1697,57 @@ impl Field {
         let nt = t.len() - k - 1;
 
         let eval_count = outsamples + outline_offset;
-        let mut interpolated_pixel_locs = Vec::with_capacity(eval_count);
-        let mut wowfactors = Vec::with_capacity(eval_count);
-        let mut span = k;
-        for i in 0..eval_count {
-            let x = i as f64 * outscale;
-            let (loc, wow) = match k {
-                1 => eval_spline_value_deriv_k::<1>(&t, &c, nt, &mut span, x),
-                2 => eval_spline_value_deriv_k::<2>(&t, &c, nt, &mut span, x),
-                _ => eval_spline_value_deriv_k::<3>(&t, &c, nt, &mut span, x),
-            };
-            interpolated_pixel_locs.push(loc);
-            wowfactors.push(wow);
+
+        // x is strictly increasing (i * outscale), so every knot span is
+        // precomputable in one amortized-O(n) serial pass; the per-point
+        // spline arithmetic is then independent and runs in parallel. Same
+        // arithmetic as the serial loop, bit-for-bit.
+        let xs: Vec<f64> = (0..eval_count).map(|i| i as f64 * outscale).collect();
+        let mut spans = vec![k; eval_count];
+        {
+            let mut span = k;
+            for (sp, &x) in spans.iter_mut().zip(xs.iter()) {
+                if x <= t[k] {
+                    span = k;
+                } else if x >= t[nt] {
+                    span = nt - 1;
+                } else {
+                    while span + 1 < nt && x >= t[span + 1] {
+                        span += 1;
+                    }
+                }
+                *sp = span;
+            }
+        }
+
+        let mut interpolated_pixel_locs = vec![0.0f64; eval_count];
+        let mut wowfactors = vec![0.0f64; eval_count];
+        {
+            let chunk = 16384usize;
+            let n_chunks = eval_count.div_ceil(chunk);
+            let locs_out: Vec<&mut [f64]> = interpolated_pixel_locs.chunks_mut(chunk).collect();
+            let wows_out: Vec<&mut [f64]> = wowfactors.chunks_mut(chunk).collect();
+            let spans_par: Vec<&[usize]> = spans.chunks(chunk).collect();
+            let xs_par: Vec<&[f64]> = xs.chunks(chunk).collect();
+            locs_out
+                .into_par_iter()
+                .zip(wows_out)
+                .zip(spans_par)
+                .zip(xs_par)
+                .enumerate()
+                .for_each(|(ci, (((locs, wows), sp), xsp))| {
+                    let lo = ci * chunk;
+                    for (k_i, (loc_slot, wow_slot)) in locs.iter_mut().zip(wows.iter_mut()).enumerate() {
+                        let i = lo + k_i;
+                        let (loc, wow) = match k {
+                            1 => eval_spline_at::<1>(&t, &c, nt, sp[k_i], xsp[k_i]),
+                            2 => eval_spline_at::<2>(&t, &c, nt, sp[k_i], xsp[k_i]),
+                            _ => eval_spline_at::<3>(&t, &c, nt, sp[k_i], xsp[k_i]),
+                        };
+                        *loc_slot = loc;
+                        *wow_slot = wow;
+                    }
+                });
         }
 
         Ok((interpolated_pixel_locs, wowfactors))
