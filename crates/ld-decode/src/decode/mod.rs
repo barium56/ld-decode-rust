@@ -941,6 +941,10 @@ impl Decoder {
         // change).
         let per_block = spec.blocklen - spec.blockcut - spec.blockcut_end;
         let audiob = spec.blocklen / spec.filters.audio_fdiv.max(1) + 2;
+        // Pre-sized FieldData; the per-block assembly below fills it. Under
+        // the async-prefetch schedule the window blocks are already cached,
+        // so this buffer is only produced once per field (reassigned from
+        // the assembled `raw` inside the !reached_eof block).
         let mut rawdecode = FieldData {
             input: Vec::with_capacity(numblocks_read * per_block),
             video: VideoChannels {
@@ -1074,40 +1078,55 @@ impl Decoder {
             // windows only move forward and redo flushes everything anyway).
             self.prune_cache();
             self.dbg.asm_insert = t_asm0.elapsed().as_nanos() as u64;
+            // Serial-schedule assembly (a straight ~140MB/field copy at DRAM
+            // bandwidth — parallel scattering cannot beat the memory ceiling,
+            // and an async variant measured neutral-to-negative because the
+            // window demod is already fully prefetched), then the stage-2
+            // audio filter, matching the reference exactly.
+            let mut raw = FieldData {
+                input: Vec::with_capacity(numblocks_read * per_block),
+                video: VideoChannels {
+                    demod: Vec::with_capacity(numblocks_read * per_block),
+                    demod_raw: Vec::with_capacity(numblocks_read * per_block),
+                    demod_05: Vec::with_capacity(numblocks_read * per_block),
+                    demod_burst: Vec::with_capacity(numblocks_read * per_block),
+                    audio: [
+                        Vec::with_capacity(numblocks_read * audiob),
+                        Vec::with_capacity(numblocks_read * audiob),
+                    ],
+                    efm: Vec::with_capacity(numblocks_read * per_block),
+                },
+                rfhpf: Vec::with_capacity(numblocks_read * per_block),
+                audio: [Vec::new(), Vec::new()],
+                efm: Vec::new(),
+                startloc: block_begin as u64,
+            };
             let t_ext0 = std::time::Instant::now();
-            // Assembly is a straight ~140MB/field copy, which runs at DRAM
-            // bandwidth even single-threaded — parallel scattering cannot beat
-            // the memory ceiling (and pre-zeroing would add a pass), so keep
-            // the simple serial extends.
             for (i, decoded) in decoded.into_iter().enumerate() {
                 let decoded = decoded.expect("every block resolved");
-                rawdecode.video.demod.extend_from_slice(&decoded.video.demod);
-                rawdecode.video.demod_raw.extend_from_slice(&decoded.video.demod_raw);
-                rawdecode.video.demod_05.extend_from_slice(&decoded.video.demod_05);
-                rawdecode.video.demod_burst.extend_from_slice(&decoded.video.demod_burst);
+                raw.video.demod.extend_from_slice(&decoded.video.demod);
+                raw.video.demod_raw.extend_from_slice(&decoded.video.demod_raw);
+                raw.video.demod_05.extend_from_slice(&decoded.video.demod_05);
+                raw.video.demod_burst.extend_from_slice(&decoded.video.demod_burst);
                 for ch in 0..2 {
-                    rawdecode.video.audio[ch]
+                    raw.video.audio[ch]
                         .extend_from_slice(&decoded.video.audio[ch]);
                 }
-                rawdecode.video.efm.extend_from_slice(&decoded.video.efm);
-                rawdecode.rfhpf.extend_from_slice(&decoded.rfhpf);
-                // The raw input is kept cut the same way as the video channels.
+                raw.video.efm.extend_from_slice(&decoded.video.efm);
+                raw.rfhpf.extend_from_slice(&decoded.rfhpf);
                 let off = first_in_window as usize + i * spec.blocksize;
                 let block = &data[off..off + spec.blocklen];
                 let cut_end = spec.blockcut_end.min(block.len());
-                rawdecode.input
+                raw.input
                     .extend_from_slice(&block[spec.blockcut..block.len() - cut_end]);
             }
-            self.dbg.asm_ = t_asm0.elapsed().as_nanos() as u64;
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
-
-            // Stage-2 audio filtering over the whole field (DemodCache.read's
-            // audio_phase2 pass), then move the results into FieldData.
             let t_ph0 = std::time::Instant::now();
-            let phase2 = audio_phase2(&spec, &rawdecode.video.audio);
+            let phase2 = audio_phase2(&spec, &raw.video.audio);
             self.dbg.phase2 = t_ph0.elapsed().as_nanos() as u64;
-            rawdecode.audio = phase2;
-            rawdecode.efm = std::mem::take(&mut rawdecode.video.efm);
+            raw.audio = phase2;
+            raw.efm = std::mem::take(&mut raw.video.efm);
+            rawdecode = raw;
 
             // Prefetch the next `prefetch_blocks` at the current MTF (Python's
             // `doread(toread_prefetch, MTF, prefetch=True)`), stopping at EOF
