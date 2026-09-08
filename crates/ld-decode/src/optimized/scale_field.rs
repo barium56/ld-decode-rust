@@ -135,20 +135,26 @@ pub(crate) fn scale_field_sinc(
                 // computed in f32.
                 let phase_pos = frac * SINC_PHASE_COUNT as f32;
                 let phase_start = phase_pos as usize;
-                let phase_end = phase_start + 1;
                 let alpha = phase_pos - phase_start as f32;
 
-                let w_start = &sinc_lut[phase_start * SINC_TAP_COUNT..];
-                let w_end = &sinc_lut[phase_end * SINC_TAP_COUNT..];
+                // The two adjacent phase rows are contiguous in the LUT, so
+                // one slice covers both; the blend below is the same f32
+                // arithmetic as the original two-slice version.
+                let row = &sinc_lut[phase_start * SINC_TAP_COUNT..(phase_start + 2) * SINC_TAP_COUNT];
 
                 let start = coord_int - half_taps_m1;
-                // numba types `result = 0.0` as float64, so the accumulator
-                // is f64 while each product is computed in f32.
+                // Blend the two LUT rows first (independent f32 ops, then
+                // vectorizable), numba types `result = 0.0` as float64 so the
+                // accumulator is f64 while each product is computed in f32.
+                let mut w = [0.0f32; SINC_TAP_COUNT];
+                for t in 0..SINC_TAP_COUNT {
+                    let ws = row[t];
+                    w[t] = ws + alpha * (row[SINC_TAP_COUNT + t] - ws);
+                }
+                let win = &buf[start..start + SINC_TAP_COUNT];
                 let mut result = 0.0f64;
                 for t in 0..SINC_TAP_COUNT {
-                    let ws = w_start[t];
-                    let interp = ws + alpha * (w_end[t] - ws); // f32
-                    result += (buf[start + t] * interp) as f64;
+                    result += f64::from(win[t] * w[t]);
                 }
 
                 // The final level_adjust * result multiply happens in f64,
