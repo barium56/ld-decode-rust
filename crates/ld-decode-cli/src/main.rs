@@ -2,6 +2,7 @@
 //! to a `.tbc` picture plus `.tbc.json` sidecar.
 
 mod db;
+mod prefetch;
 mod reader;
 mod writer;
 
@@ -264,10 +265,10 @@ fn decode_rewind(spec: &DecoderSpec) -> u64 {
 
 /// Sliding-window helper shared by `decode_all` and `run_seek`: read the next
 /// chunk from `reader` into `window` (advancing `base`/`read_pos`/`final_chunk`).
-fn refill_window(
-    reader: &mut DecodeReader,
+/// Consume one prefetched read and append its samples to the window.
+fn refill_take(
+    pf: &mut prefetch::PrefetchReader,
     window: &mut Vec<f32>,
-    buffer: &mut [f32],
     chunk: usize,
     read_pos: &mut u64,
     final_chunk: &mut bool,
@@ -276,35 +277,20 @@ fn refill_window(
     if *final_chunk {
         return Ok(());
     }
-    let t_r0 = std::time::Instant::now();
-    let read = reader.read(buffer)?;
-    let t_read = t_r0.elapsed().as_micros();
-    if std::env::var_os("LD_TRACE_REFILL").is_some() {
-        ld_decode::teeprintln!("REFILL read={read} chunk={chunk} wlen={} read_pos={} us={t_read}", window.len(), *read_pos);
-    }
-    if let Some(p) = std::env::var_os("LD_DUMP_FIRST_RAW") {
-        if *read_pos == initial_base {
-            let mut f = std::fs::File::create(&p).unwrap();
-            use std::io::Write;
-            for v in buffer[..read].iter().take(1 << 16) {
-                f.write_all(&v.to_le_bytes()).unwrap();
-            }
-            tracing::info!("dumped first {read} raw samples to {}", p.to_string_lossy());
-            let _ = std::env::remove_var("LD_DUMP_FIRST_RAW");
-        }
-    }
-    window.extend_from_slice(&buffer[..read]);
+    let (buf, read) = pf.take()?;
+    window.extend_from_slice(&buf[..read]);
     *read_pos += read as u64;
     if read < chunk {
         *final_chunk = true;
     }
+    let _ = initial_base;
     Ok(())
 }
 
 /// Drop the head of the window so it starts at `keep`, re-seeking the reader if
 /// the window was fully drained.
 fn keep_window(
-    reader: &mut DecodeReader,
+    reader: &mut prefetch::PrefetchReader,
     window: &mut Vec<f32>,
     keep: u64,
     base: &mut u64,
@@ -363,6 +349,14 @@ fn decode_all(
     max_frames: Option<u64>,
     initial_base: u64,
 ) -> Result<()> {
+    // Overlap the blocking sample reads with the decode: wrap the reader in
+    // the prefetch worker. All reads are served FIFO by one thread, so the
+    // sample stream the decoder sees is identical to the synchronous path.
+    let prefetch_reader = prefetch::spawn_prefetch(DecodeReader::new(std::mem::replace(
+        &mut reader.source,
+        Box::new(reader::NullSource),
+    )))?;
+    let mut pf = prefetch_reader;
 
     let chunk = spec.readlen() + 4 * spec.blocksize();
     let mut window: Vec<f32> = Vec::new();
@@ -401,7 +395,16 @@ fn decode_all(
         // single refill per loop can never grow the window past the band;
         // loop until the cap is reached or input ends).
         while !final_chunk && (stalled || (window.len() as u64) < (max_keep as u64)) {
-            refill_window(reader, &mut window, &mut read_buffer, chunk, &mut read_pos, &mut final_chunk, initial_base)?;
+            // Queue the read, then block on its data. The queue is one deep:
+            // the read issued at the end of this loop iteration overlaps with
+            // the decode+write below.
+            if pf.outstanding_reads() == 0 {
+                pf.prefetch(chunk);
+            }
+            refill_take(&mut pf, &mut window, chunk, &mut read_pos, &mut final_chunk, initial_base)?;
+            if !final_chunk {
+                pf.prefetch(chunk);
+            }
         }
 
         let t_d0 = std::time::Instant::now();
@@ -426,7 +429,7 @@ fn decode_all(
             if std::env::var_os("LD_TRACE_KEEP").is_some() {
                 ld_decode::teeprintln!("KEEP RESEEK-BACK need={consumed} base={base} -> {new_base}");
             }
-            reader.seek_samples(new_base)?;
+            pf.seek_samples(new_base)?;
             window.clear();
             base = new_base;
             read_pos = new_base;
@@ -497,7 +500,7 @@ fn decode_all(
             .saturating_sub(decode_rewind(&spec))
             .div_euclid(blocksize)
             * blocksize;
-        keep_window(reader, &mut window, head, &mut base, &mut read_pos)?;
+        keep_window(&mut pf, &mut window, head, &mut base, &mut read_pos)?;
         stalled = fields.is_empty() && consumed == last_consumed;
         last_consumed = consumed;
     }

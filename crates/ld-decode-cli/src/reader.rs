@@ -263,7 +263,7 @@ impl SampleSource for PackedSource {
 
 /// Wraps a boxed [`SampleSource`], forwarding reads and seeks.
 pub struct DecodeReader {
-    source: Box<dyn SampleSource>,
+    pub(crate) source: Box<dyn SampleSource>,
     eof: bool,
 }
 
@@ -688,6 +688,19 @@ impl SampleSource for LdfSource {
             }
             remaining -= n as u64;
         }
+        Ok(())
+    }
+}
+
+
+/// No-op source used only for Send assertions in tests/prefetch wiring.
+pub struct NullSource;
+
+impl SampleSource for NullSource {
+    fn read(&mut self, _out: &mut [f32]) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+    fn seek_samples(&mut self, _sample: u64) -> anyhow::Result<()> {
         Ok(())
     }
 }
