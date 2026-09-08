@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::decode::demodblock::VideoChannels;
+use crate::decode::dropouts;
 use rayon::prelude::*;
 
 use crate::optimized::{
@@ -156,6 +157,10 @@ pub(crate) struct Field {
     pub out_scale: f64,
     /// The TBC picture (u16) once downscaled.
     pub dspicture: Vec<u16>,
+    /// Dropout detection result, computed as a side task during downscale and
+    /// consumed by buildmetadata (dropouts are pure over the field's decoded
+    /// data, so precomputing them early is observationally identical).
+    pub dropouts_cached: Option<(Vec<usize>, Vec<usize>, Vec<usize>)>,
     /// The raw (f32) downscaled luma.
     /// Downscaled interleaved int16 audio for the .pcm output.
     pub dsaudio: Vec<i16>,
@@ -431,6 +436,7 @@ impl Field {
             linecode: vec![None; 3],
             out_scale: 0.0,
             dspicture: Vec::new(),
+            dropouts_cached: None,
             dsaudio: Vec::new(),
             efmout: Vec::new(),
             lt: Timings::default(),
@@ -1823,19 +1829,37 @@ impl Field {
             }
         }
         let t1 = std::time::Instant::now();
-        scale_field_sinc(
-            channel_data,
-            &mut dsout,
-            &interpolated_pixel_locs,
-            &wowfactors,
-            sinc_lut(),
-            SincScaleParams {
-                lineoffset: self.lineoffset,
-                outwidth,
-                wow_level_adjust_smoothing: self.spec.wow_level_adjust_smoothing,
-                level_adjust_threshold: 15.0,
+        // Dropout detection is a pure function of this field's decoded data,
+        // so run it as a parallel side task while the sinc rescale occupies
+        // the main thread. Result identical to the serial computation.
+        let dod = self.spec.do_dod && std::env::var_os("LD_NO_DOD_PRE").is_none();
+        let ((), dropouts) = rayon::join(
+            || {
+                scale_field_sinc(
+                    channel_data,
+                    &mut dsout,
+                    &interpolated_pixel_locs,
+                    &wowfactors,
+                    sinc_lut(),
+                    SincScaleParams {
+                        lineoffset: self.lineoffset,
+                        outwidth,
+                        wow_level_adjust_smoothing: self.spec.wow_level_adjust_smoothing,
+                        level_adjust_threshold: 15.0,
+                    },
+                );
+            },
+            || {
+                if dod {
+                    Some(dropouts::detect_dropouts(self))
+                } else {
+                    None
+                }
             },
         );
+        if dod {
+            self.dropouts_cached = dropouts;
+        }
         let t_sinc = t1.elapsed().as_nanos() as u64;
 
         let t2 = std::time::Instant::now();

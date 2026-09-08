@@ -1332,7 +1332,13 @@ impl Decoder {
 
         if self.spec.do_dod {
             let t_dod0 = std::time::Instant::now();
-            let (lines, starts, ends) = dropouts::detect_dropouts(field);
+            // Dropouts were already computed as a side task during downscale
+            // (pure over the field's data); fall back to a synchronous call
+            // only if downscale never ran for this field.
+            let (lines, starts, ends) = field
+                .dropouts_cached
+                .clone()
+                .unwrap_or_else(|| dropouts::detect_dropouts(field));
             self.dbg.meta_dod = t_dod0.elapsed().as_nanos() as u64;
             if !lines.is_empty() {
                 fi.drop_outs = Some(DropOuts {

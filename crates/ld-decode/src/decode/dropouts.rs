@@ -31,10 +31,13 @@ fn std_f32(values: &[f32]) -> f64 {
 /// Port of `dropout_detect_demod`: a per-sample error map over the demodulated
 /// window.
 fn dropout_detect_demod(field: &Field) -> Vec<bool> {
+    let sub = std::env::var_os("LD_SUBTIME2").is_some();
+    let s0 = std::time::Instant::now();
     let spec = &field.spec;
 
     let rfhpf = &field.data.rfhpf;
     let rfstd = std_f32(rfhpf);
+    let s_std = s0.elapsed().as_nanos() as u64;
 
     // Combined pass: the original builds an `iserr_rf1` flag vector and then
     // copies it `rotdelay` samples later (same contents, shifts only), so we
@@ -62,6 +65,7 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
         }
     });
 
+    let s_p1 = s0.elapsed().as_nanos() as u64;
     // Build sets of min/max valid levels.
     let iretohz = |ire: f64| field.levels.iretohz(ire);
     let demod = &field.data.video.demod;
@@ -95,6 +99,7 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
         }
     }
 
+    let s_vm = s0.elapsed().as_nanos() as u64;
     // Absurd fluctuations in pre-deemp demod can only be caused by dropouts.
     let demod_raw = &field.data.video.demod_raw;
     let freq_hz_half = spec.freq_hz_half as f32;
@@ -118,6 +123,7 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
         }
     });
 
+    let s_p2 = s0.elapsed().as_nanos() as u64;
     // Filter out dropouts outside the actual field.
     let lo = field.linelocs.get(field.lineoffset + 1).copied().unwrap_or(0.0) as usize;
     let hi = field
@@ -132,6 +138,9 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
         iserr[i] = false;
     }
 
+    if sub {
+        eprintln!("SUBTIME2 std={:.3} p1={:.3} vmin={:.3} p2={:.3} ms", s_std as f64 / 1e6, s_p1 as f64 / 1e6, s_vm as f64 / 1e6, s_p2 as f64 / 1e6);
+    }
     iserr
 }
 
@@ -238,7 +247,9 @@ fn dropout_errlist_to_tbc(field: &Field, errlist: &[(f64, f64)]) -> Vec<(usize, 
 /// Port of `dropout_detect`: returns (fieldLine, startx, endx) arrays, with
 /// `fieldLine` 0-based like the JSON output.
 pub(crate) fn detect_dropouts(field: &Field) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let s5 = std::time::Instant::now();
     let iserr = dropout_detect_demod(field);
+    let s_demod = s5.elapsed().as_nanos() as u64;
     let errmap: Vec<usize> = iserr
         .iter()
         .enumerate()
@@ -259,6 +270,9 @@ pub(crate) fn detect_dropouts(field: &Field) -> (Vec<usize>, Vec<usize>, Vec<usi
         }
     }
 
+    if std::env::var_os("LD_SUBTIME2").is_some() {
+        eprintln!("SUBTIME2 errmap+list={:.3} ms", (s5.elapsed().as_nanos() as u64 - s_demod) as f64 / 1e6);
+    }
     (rv_lines, rv_starts, rv_ends)
 }
 
