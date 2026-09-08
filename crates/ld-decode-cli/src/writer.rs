@@ -3,7 +3,7 @@
 //! valid document on disk (same scheme as the tape-decode CLI).
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,12 +25,12 @@ const REFERENCE_VERSION: &str = "release:7.3.0";
 const FIELDS_OPEN: &[u8] = b"{\"fields\":[";
 
 pub struct DecodeWriter {
-    outfile_video: File,
-    outfile_audio: Option<File>,
-    outfile_efm: Option<File>,
+    outfile_video: BufWriter<File>,
+    outfile_audio: Option<BufWriter<File>>,
+    outfile_efm: Option<BufWriter<File>>,
     /// Debug dump of the EFM samples fed to the PLL (mirrors ld-decode's
     /// --preEFM `.prefm` output). Only created when LD_DUMP_PREFM is set.
-    outfile_pre_efm: Option<File>,
+    outfile_pre_efm: Option<BufWriter<File>>,
     json_file: Option<File>,
     /// Byte offset of the array-closing `]` in the JSON file.
     /// Buffered per-field JSON entries. The reference keeps every `fi` dict
@@ -95,11 +95,16 @@ impl DecodeWriter {
             chunk.extend_from_slice(b"]}\r\n");
             json.write_all(&chunk)?;
         }
+        // 8MB OS-bypass buffers: each field's luma/audio/efm payload is
+        // written as one or two large sequential writes; without buffering
+        // every field pays several unbuffered file writes (~1-2ms on HDD,
+        // measurable on the serial tail).
+        const WBUF: usize = 8 * 1024 * 1024;
         Ok(Self {
-            outfile_video: luma,
-            outfile_audio: audio,
-            outfile_efm: efm,
-            outfile_pre_efm: pre_efm,
+            outfile_video: BufWriter::with_capacity(WBUF, luma),
+            outfile_audio: audio.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
+            outfile_efm: efm.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
+            outfile_pre_efm: pre_efm.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
             json_file: json,
             json_entries: Vec::new(),
             field_count: 0,
@@ -172,6 +177,17 @@ impl DecodeWriter {
     }
 
     pub fn close(&mut self, metadata: Option<DecoderMetadata>) -> Result<()> {
+        // Flush the buffered writers before the process drops them.
+        self.outfile_video.flush()?;
+        if let Some(a) = self.outfile_audio.as_mut() {
+            a.flush()?;
+        }
+        if let Some(e) = self.outfile_efm.as_mut() {
+            e.flush()?;
+        }
+        if let Some(pe) = self.outfile_pre_efm.as_mut() {
+            pe.flush()?;
+        }
         let field_count = self.field_count;
         let elapsed = match (self.first_field_write, self.last_field_write) {
             (Some(first), Some(last)) => last.duration_since(first).as_secs_f64(),

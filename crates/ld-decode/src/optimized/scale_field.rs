@@ -160,14 +160,20 @@ pub(crate) fn scale_field_sinc(
             // four samples at a time so the four independent f64 accumulator
             // chains interleave (each sample's math is unchanged — the same
             // 16 products in the same order, one f64 chain per sample).
+            // All indices are in-bounds by construction (pass 1 clamps the
+            // coords into the interior and the weights window is fixed-size),
+            // so the unchecked loads only skip redundant bounds checks in the
+            // hot gather; the arithmetic and results are unchanged.
             let mut j = 0;
             while j + 4 <= n {
                 let mut r = [0.0f64; 4];
-                for t in 0..SINC_TAP_COUNT {
-                    r[0] += f64::from(buf[starts[j] + t] * weights[j][t]);
-                    r[1] += f64::from(buf[starts[j + 1] + t] * weights[j + 1][t]);
-                    r[2] += f64::from(buf[starts[j + 2] + t] * weights[j + 2][t]);
-                    r[3] += f64::from(buf[starts[j + 3] + t] * weights[j + 3][t]);
+                unsafe {
+                    for t in 0..SINC_TAP_COUNT {
+                        r[0] += f64::from(*buf.get_unchecked(starts[j] + t) * weights[j][t]);
+                        r[1] += f64::from(*buf.get_unchecked(starts[j + 1] + t) * weights[j + 1][t]);
+                        r[2] += f64::from(*buf.get_unchecked(starts[j + 2] + t) * weights[j + 2][t]);
+                        r[3] += f64::from(*buf.get_unchecked(starts[j + 3] + t) * weights[j + 3][t]);
+                    }
                 }
                 for k in 0..4 {
                     out[j + k] = (adjusts[j + k] * r[k]) as f32;
@@ -175,13 +181,13 @@ pub(crate) fn scale_field_sinc(
                 j += 4;
             }
             for j in j..n {
-                let win = &buf[starts[j]..starts[j] + SINC_TAP_COUNT];
-                let w = &weights[j];
                 // numba types `result = 0.0` as float64 so the accumulator is
                 // f64 while each product is computed in f32.
                 let mut result = 0.0f64;
-                for t in 0..SINC_TAP_COUNT {
-                    result += f64::from(win[t] * w[t]);
+                unsafe {
+                    for t in 0..SINC_TAP_COUNT {
+                        result += f64::from(*buf.get_unchecked(starts[j] + t) * weights[j][t]);
+                    }
                 }
 
                 // The final level_adjust * result multiply happens in f64,
