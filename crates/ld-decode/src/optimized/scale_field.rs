@@ -113,11 +113,18 @@ pub(crate) fn scale_field_sinc(
         .enumerate()
         .for_each(|(ci, out)| {
             let base = dsout_start + ci * chunk;
-            for (j, slot) in out.iter_mut().enumerate() {
+            // Pass 1: resolve every output sample's LUT row pair and source
+            // window into an explicit gather list. Pure index/float math, no
+            // memory-bound gather yet — runs wide.
+            let mut starts = [0usize; 4096];
+            let mut weights = [[0.0f32; SINC_TAP_COUNT]; 4096];
+            let mut adjusts = [0.0f64; 4096];
+            let n = out.len();
+            for (j, _) in out.iter_mut().enumerate().take(n) {
                 let i = base + j;
                 // Compensates for the amplitude/frequency shift caused by FM
                 // demodulation under varying playback speed.
-                let level_adjust = level_adjusts[i];
+                adjusts[j] = level_adjusts[i];
 
                 // Reconstruct the waveform at the proper fractional sample
                 // position, undoing wow-induced timing variations. Clamp into
@@ -142,16 +149,36 @@ pub(crate) fn scale_field_sinc(
                 // arithmetic as the original two-slice version.
                 let row = &sinc_lut[phase_start * SINC_TAP_COUNT..(phase_start + 2) * SINC_TAP_COUNT];
 
-                let start = coord_int - half_taps_m1;
-                // Blend the two LUT rows first (independent f32 ops, then
-                // vectorizable), numba types `result = 0.0` as float64 so the
-                // accumulator is f64 while each product is computed in f32.
-                let mut w = [0.0f32; SINC_TAP_COUNT];
+                starts[j] = coord_int - half_taps_m1;
+                let w = &mut weights[j];
                 for t in 0..SINC_TAP_COUNT {
                     let ws = row[t];
                     w[t] = ws + alpha * (row[SINC_TAP_COUNT + t] - ws);
                 }
-                let win = &buf[start..start + SINC_TAP_COUNT];
+            }
+            // Pass 2: gather + f64 accumulate per output sample, processed
+            // four samples at a time so the four independent f64 accumulator
+            // chains interleave (each sample's math is unchanged — the same
+            // 16 products in the same order, one f64 chain per sample).
+            let mut j = 0;
+            while j + 4 <= n {
+                let mut r = [0.0f64; 4];
+                for t in 0..SINC_TAP_COUNT {
+                    r[0] += f64::from(buf[starts[j] + t] * weights[j][t]);
+                    r[1] += f64::from(buf[starts[j + 1] + t] * weights[j + 1][t]);
+                    r[2] += f64::from(buf[starts[j + 2] + t] * weights[j + 2][t]);
+                    r[3] += f64::from(buf[starts[j + 3] + t] * weights[j + 3][t]);
+                }
+                for k in 0..4 {
+                    out[j + k] = (adjusts[j + k] * r[k]) as f32;
+                }
+                j += 4;
+            }
+            for j in j..n {
+                let win = &buf[starts[j]..starts[j] + SINC_TAP_COUNT];
+                let w = &weights[j];
+                // numba types `result = 0.0` as float64 so the accumulator is
+                // f64 while each product is computed in f32.
                 let mut result = 0.0f64;
                 for t in 0..SINC_TAP_COUNT {
                     result += f64::from(win[t] * w[t]);
@@ -159,7 +186,7 @@ pub(crate) fn scale_field_sinc(
 
                 // The final level_adjust * result multiply happens in f64,
                 // then the value is rounded to f32 on the store.
-                *slot = (level_adjust * result) as f32;
+                out[j] = (adjusts[j] * result) as f32;
             }
         });
 }
