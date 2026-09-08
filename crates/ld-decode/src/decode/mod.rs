@@ -1462,15 +1462,16 @@ impl Decoder {
             }
         }
 
-        let fp = self.prevfield.clone();
         let t_v2 = std::time::Instant::now();
         // Reuse the metrics computed in the decode loop for this same field;
         // only the fp-dependent line-19 metrics differ, and neither wSNR nor
-        // bPSNR read those.
+        // bPSNR read those. Borrow the previous field instead of cloning it
+        // (the clone was a multi-megabyte memcpy of demod + dspicture).
+        let fp = self.prevfield.as_ref();
         let metrics = self
             .cached_vits
             .take()
-            .unwrap_or_else(|| vits::compute_vits_metrics(&self.spec, field, fp.as_ref()));
+            .unwrap_or_else(|| vits::compute_vits_metrics(&self.spec, field, fp));
         self.dbg.meta_vits = t_v2.elapsed().as_nanos() as u64;
         fi.decode_faults = Some(decode_faults);
         fi.vits_metrics = Some(VitsMetrics {
