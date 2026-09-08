@@ -2049,14 +2049,17 @@ impl Field {
     }
 
     fn calc_burstmedian(&self, _spec: &DecoderSpec) -> f64 {
-        let mut burstlevel = Vec::new();
-        for l in 11..264 {
-            burstlevel.push(self.get_burstlevel(l, None));
-        }
+        // Each line's burst level is an independent pure gather+RMS, so the
+        // 253 slice computations run in parallel; the median below sorts the
+        // same 253 values either way, keeping the result bit-identical.
+        let burstlevel: Vec<f64> = (11..264)
+            .into_par_iter()
+            .map(|l| self.get_burstlevel(l, None))
+            .collect();
         let median = if burstlevel.is_empty() {
             0.0
         } else {
-            median_f64_(&mut burstlevel)
+            median_f64_(&mut burstlevel.clone())
         };
         median / self.levels.hz_ire
     }
