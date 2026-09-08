@@ -2193,29 +2193,33 @@ impl Field {
 
     /// Port of `compute_burst_offsets`.
     fn compute_burst_offsets(&mut self, linelocs: &[f64]) -> (bool, HashMap<usize, f64>) {
-        let mut rising_sum = 0usize;
-        let mut adjs: HashMap<usize, f64> = HashMap::new();
-
-        for l in 0..266 {
-            let mut prev_phaseadjust = self.phase_adjust_median;
-            if prev_phaseadjust == 0.0 {
-                if let Some(prev) = &self.prevfield {
-                    prev_phaseadjust = prev.phase_adjust_median;
-                }
+        // prev_phaseadjust is the same for every line, resolved once here.
+        let mut prev_phaseadjust = self.phase_adjust_median;
+        if prev_phaseadjust == 0.0 {
+            if let Some(prev) = &self.prevfield {
+                prev_phaseadjust = prev.phase_adjust_median;
             }
-
-            let (rising, phase_adjust) = self.compute_line_bursts(linelocs, l, prev_phaseadjust);
-            if let Some(p) = std::env::var_os("LD_DUMP_CLB") {
-                use std::io::Write;
-                let filter = std::env::var("LD_DUMP_CLB_RL").unwrap_or_default();
-                if filter.is_empty()
-                    || filter.split(',').any(|s| s.parse::<u64>().ok() == Some(self.readloc))
+        }
+        // Each line's burst analysis is an independent pure read over the
+        // demodulated data, so the 266 per-line computations run in parallel;
+        // the fold below applies them in line order, keeping `rising_sum`,
+        // the adjs map and the dump output identical to the serial loop.
+        let per_line: Vec<(Option<bool>, f64)> = (0..266)
+            .into_par_iter()
+            .map(|l| self.compute_line_bursts(linelocs, l, prev_phaseadjust))
+            .collect();
+        if std::env::var_os("LD_DUMP_CLB").is_some() {
+            use std::io::Write;
+            let filter = std::env::var("LD_DUMP_CLB_RL").unwrap_or_default();
+            if filter.is_empty()
+                || filter.split(',').any(|s| s.parse::<u64>().ok() == Some(self.readloc))
+            {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::env::var_os("LD_DUMP_CLB").unwrap())
                 {
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&p)
-                    {
+                    for (l, (rising, phase_adjust)) in per_line.iter().enumerate() {
                         let _ = writeln!(
                             f,
                             "# rl={} l={} rising={:?} pa={:.9} prev={:.9}",
@@ -2224,6 +2228,10 @@ impl Field {
                     }
                 }
             }
+        }
+        let mut rising_sum = 0usize;
+        let mut adjs: HashMap<usize, f64> = HashMap::new();
+        for (l, (rising, phase_adjust)) in per_line.into_iter().enumerate() {
             let Some(rising) = rising else {
                 continue;
             };
