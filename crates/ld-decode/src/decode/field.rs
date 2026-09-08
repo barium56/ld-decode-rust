@@ -1528,92 +1528,83 @@ impl Field {
         let mut linelocs2 = self.linelocs1.clone();
         let demod_05 = &self.data.video.demod_05;
 
-        for i in 0..self.linelocs1.len() {
-            // skip VSYNC lines (they handle pulses differently)
-            if inrange(i as f64, 3.0, 6.0) {
-                self.linebad[i] = true;
-                continue;
-            }
-
-            // refine beginning of hsync
-            let ll1 = (f64::from(self.linelocs1[i]) - self.spec.freq) as usize;
-            let target = self.levels.iretohz(self.levels.vsync_ire / 2.0);
-            let zc = calczc(
-                demod_05,
-                ll1,
-                target,
-                0,
-                (self.spec.freq * 2.0) as usize,
-                false,
-            );
-
-            if let Some(p) = std::env::var_os("LD_DUMP_ZC") {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-                    let _ = writeln!(f, "# readloc={} do_retry={}", self.readloc, 1);
-                    let _ = writeln!(f, "{} ll1={} target={:.17} zc={:?}", i, ll1, target, zc);
+        // Each line's hsync refinement is an independent pure read over the
+        // demodulated data, so per-line results (linebad flag + optional
+        // refined location) are computed in parallel and applied afterwards
+        // in line order — identical outcome to the serial loop.
+        let per_line: Vec<(bool, Option<f64>)> = (0..self.linelocs1.len())
+            .into_par_iter()
+            .map(|i| {
+                // skip VSYNC lines (they handle pulses differently)
+                if inrange(i as f64, 3.0, 6.0) {
+                    return (true, None);
                 }
-            }
 
-            if let (Some(zc), false) = (zc, self.linebad[i]) {
-                linelocs2[i] = zc;
+                // refine beginning of hsync
+                let ll1 = (f64::from(self.linelocs1[i]) - self.spec.freq) as usize;
+                let target = self.levels.iretohz(self.levels.vsync_ire / 2.0);
+                let zc = calczc(
+                    demod_05,
+                    ll1,
+                    target,
+                    0,
+                    (self.spec.freq * 2.0) as usize,
+                    false,
+                );
 
-                // The hsync area, burst, and porches should not leave
-                // -50 to 30 IRE.
-                let hsync_start = (zc - self.spec.freq * 0.75) as usize;
-                let hsync_end = (zc + self.spec.freq * 8.0) as usize;
-                if hsync_end <= demod_05.len() {
-                    let hsync_area = &demod_05[hsync_start..hsync_end];
-                    let min_h = hsync_area.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max_h = hsync_area.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    if f64::from(min_h) < self.levels.iretohz(-55.0) || f64::from(max_h) > self.levels.iretohz(30.0) {
-                        self.linebad[i] = true;
-                        linelocs2[i] = self.linelocs1[i];
+                if let (Some(zc), false) = (zc, self.linebad[i]) {
+                    // The hsync area, burst, and porches should not leave
+                    // -50 to 30 IRE.
+                    let hsync_start = (zc - self.spec.freq * 0.75) as usize;
+                    let hsync_end = (zc + self.spec.freq * 8.0) as usize;
+                    if hsync_end <= demod_05.len() {
+                        let hsync_area = &demod_05[hsync_start..hsync_end];
+                        let min_h = hsync_area.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max_h = hsync_area.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        if f64::from(min_h) < self.levels.iretohz(-55.0) || f64::from(max_h) > self.levels.iretohz(30.0) {
+                            (true, Some(self.linelocs1[i]))
+                        } else {
+                            let porch_start = (zc + self.spec.freq * 8.0) as usize;
+                            let porch_end = (zc + self.spec.freq * 9.0) as usize;
+                            let sync_start = (zc + self.spec.freq * 1.0) as usize;
+                            let sync_end = (zc + self.spec.freq * 2.5) as usize;
+                            // Python's nb_median (numba np.median) computes the
+                            // median in f32 but returns float64; the average then
+                            // happens in f64.
+                            let porch_level =
+                                f64::from(median_f32(&mut demod_05[porch_start..porch_end].to_vec()));
+                            let sync_level =
+                                f64::from(median_f32(&mut demod_05[sync_start..sync_end].to_vec()));
+
+                            let zc2 = calczc(
+                                demod_05,
+                                ll1,
+                                (porch_level + sync_level) / 2.0,
+                                0,
+                                400,
+                                false,
+                            );
+
+                            match zc2 {
+                                Some(zc2) if (zc2 - zc).abs() < self.spec.freq / 2.0 => (false, Some(zc2)),
+                                _ => (true, None),
+                            }
+                        }
                     } else {
-                        let porch_start = (zc + self.spec.freq * 8.0) as usize;
-                        let porch_end = (zc + self.spec.freq * 9.0) as usize;
-                        let sync_start = (zc + self.spec.freq * 1.0) as usize;
-                        let sync_end = (zc + self.spec.freq * 2.5) as usize;
-                        // Python's nb_median (numba np.median) computes the
-                        // median in f32 but returns float64; the average then
-                        // happens in f64.
-                        let porch_level =
-                            f64::from(median_f32(&mut demod_05[porch_start..porch_end].to_vec()));
-                        let sync_level =
-                            f64::from(median_f32(&mut demod_05[sync_start..sync_end].to_vec()));
-
-                        let zc2 = calczc(
-                            demod_05,
-                            ll1,
-                            (porch_level + sync_level) / 2.0,
-                            0,
-                            400,
-                            false,
-                        );
-
-                        if let Some(p) = std::env::var_os("LD_DUMP_ZC2") {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-                                let _ = writeln!(f, "{} zc={:.17} porch={:.9} sync={:.9} zc2={:?}", i, zc, porch_level, sync_level, zc2);
-                            }
-                        }
-
-                        match zc2 {
-                            Some(zc2) if (zc2 - zc).abs() < self.spec.freq / 2.0 => {
-                                linelocs2[i] = zc2;
-                            }
-                            _ => {
-                                self.linebad[i] = true;
-                            }
-                        }
+                        (true, None)
                     }
                 } else {
-                    self.linebad[i] = true;
+                    (true, None)
                 }
-            } else {
-                self.linebad[i] = true;
-            }
+            })
+            .collect();
 
+        // Serial apply (order matters for the final linebad/linelocs2 state).
+        for (i, (bad, refined)) in per_line.into_iter().enumerate() {
+            self.linebad[i] = bad;
+            if let Some(zc) = refined {
+                linelocs2[i] = zc;
+            }
             if self.linebad[i] {
                 linelocs2[i] = self.linelocs1[i];
             }
