@@ -155,6 +155,14 @@ impl DbWriter {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("creating database {}", path.display()))?;
+        // Durability pragmas the reference does not need to match: the db is
+        // derived data (a full decode regenerates it), so WAL + NORMAL sync
+        // trade crash-safety for removing the per-transaction fsync cost that
+        // otherwise dominates the per-field write time.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .with_context(|| "setting WAL journal mode".to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .with_context(|| "setting synchronous=NORMAL".to_string())?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("initialising database {}", path.display()))?;
         Ok(Self {
