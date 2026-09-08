@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/ld-decode",
+    "crates/ld-decode-cli",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+debug = 2
+strip = "none"

@@ -1,0 +1,349 @@
+//! Output writer: the `.tbc` picture file plus the `.tbc.json` sidecar,
+//! rewritten incrementally after every field so the JSON is always a complete,
+//! valid document on disk (same scheme as the tape-decode CLI).
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use ld_decode::{DecoderMetadata, FieldInfoEntry, LumaOutput, WriteableField};
+use serde::Serialize;
+
+use crate::db::DbWriter;
+
+/// The ld-decode version this port replicates bit-for-bit. The reference
+/// release build reports `release:7.3.0`, which is parsed (mirroring
+/// `build_json` in the reference) into `gitBranch=release` / `gitCommit=7.3.0`
+/// in the `.tbc.json` `videoParameters`.
+const REFERENCE_VERSION: &str = "release:7.3.0";
+
+/// Opening of the JSON sidecar. During the decode only the fields array is
+/// written (`{"fields":[ ... ]}\r\n`); the reference emits the
+/// `pcmAudioParameters` / `videoParameters` header only at close time (see
+/// `close`), so it is prepended then via an in-place rewrite of this file.
+const FIELDS_OPEN: &[u8] = b"{\"fields\":[";
+
+pub struct DecodeWriter {
+    outfile_video: File,
+    outfile_audio: Option<File>,
+    outfile_efm: Option<File>,
+    /// Debug dump of the EFM samples fed to the PLL (mirrors ld-decode's
+    /// --preEFM `.prefm` output). Only created when LD_DUMP_PREFM is set.
+    outfile_pre_efm: Option<File>,
+    json_file: Option<File>,
+    /// Byte offset of the array-closing `]` in the JSON file.
+    /// Buffered per-field JSON entries. The reference keeps every `fi` dict
+    /// in memory and dumps the array only at close time; rust must do the
+    /// same so the filler aliasing (below) can be resolved before writing.
+    json_entries: Vec<FieldInfoEntry>,
+    field_count: usize,
+    first_field_write: Option<Instant>,
+    last_field_write: Option<Instant>,
+    /// SQLite metadata sidecar (`<out>.tbc.db`), written per field.
+    db: Option<DbWriter>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PcmAudioParameters {
+    bits: usize,
+    is_little_endian: bool,
+    is_signed: bool,
+    sample_rate: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoParameters {
+    number_of_sequential_fields: usize,
+    os_info: String,
+    version: String,
+    git_branch: String,
+    git_commit: String,
+    system: String,
+    field_width: usize,
+    sample_rate: f64,
+    black_16b_ire: f64,
+    white_16b_ire: f64,
+    blanking_16b_ire: f64,
+    field_height: usize,
+    colour_burst_start: i64,
+    colour_burst_end: i64,
+    active_video_start: i64,
+    active_video_end: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TbcMetadata {
+    pcm_audio_parameters: PcmAudioParameters,
+    video_parameters: VideoParameters,
+}
+
+impl DecodeWriter {
+    pub fn new(
+        luma: File,
+        audio: Option<File>,
+        efm: Option<File>,
+        pre_efm: Option<File>,
+        json: Option<File>,
+        db: Option<DbWriter>,
+    ) -> Result<Self> {
+        if let Some(mut json) = json.as_ref() {
+            let mut chunk = FIELDS_OPEN.to_vec();
+            chunk.extend_from_slice(b"]}\r\n");
+            json.write_all(&chunk)?;
+        }
+        Ok(Self {
+            outfile_video: luma,
+            outfile_audio: audio,
+            outfile_efm: efm,
+            outfile_pre_efm: pre_efm,
+            json_file: json,
+            json_entries: Vec::new(),
+            field_count: 0,
+            first_field_write: None,
+            last_field_write: None,
+            db,
+        })
+    }
+
+    pub fn write_writeable(
+        &mut self,
+        field: &WriteableField,
+        metadata: Option<&DecoderMetadata>,
+    ) -> Result<()> {
+        // field_id for the database is the 0-based index of this field among
+        // those written (the reference's `fields_written`, pre-increment).
+        let field_id = self.field_count;
+        if let (Some(db), Some(metadata)) = (self.db.as_mut(), metadata) {
+            db.write_field(&field.info, metadata, field_id)?;
+        }
+
+        let luma = field.luma();
+        match luma {
+            LumaOutput::Encoded(values) => write_u16_le(&mut self.outfile_video, values)?,
+            LumaOutput::Raw(values) => write_f32_slice(&mut self.outfile_video, values)?,
+        }
+
+        if let Some(audio_file) = self.outfile_audio.as_mut() {
+            if !field.audio.is_empty() {
+                write_i16_slice(audio_file, &field.audio)?;
+            }
+        }
+        if let Some(efm_file) = self.outfile_efm.as_mut() {
+            if !field.efm.is_empty() {
+                let mut bytes = Vec::with_capacity(field.efm.len());
+                for v in &field.efm {
+                    bytes.push(*v as u8);
+                }
+                efm_file.write_all(&bytes)?;
+            }
+        }
+        if let Some(pre_efm_file) = self.outfile_pre_efm.as_mut() {
+            if !field.efm_raw.is_empty() {
+                write_i16_slice(pre_efm_file, &field.efm_raw)?;
+            }
+        }
+
+        let now = Instant::now();
+        let start = self.first_field_write.get_or_insert(now);
+        self.last_field_write = Some(now);
+        self.field_count += 1;
+
+        if self.json_file.is_some() {
+            self.json_entries.push(field.info.clone());
+        }
+
+        const LOG_INTERVAL: usize = 500;
+        let field_num = self.field_count;
+        tracing::debug!("Written field {field_num}");
+        if field_num.is_multiple_of(LOG_INTERVAL) {
+            let elapsed = now.duration_since(*start).as_secs_f64();
+            let fps = if elapsed > 0.0 {
+                field_num as f64 / (elapsed * 2.0)
+            } else {
+                0.0
+            };
+            tracing::info!("Decoded {} fields so far in {:.3}s ({:.2} FPS)", field_num, elapsed, fps);
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self, metadata: Option<DecoderMetadata>) -> Result<()> {
+        let field_count = self.field_count;
+        let elapsed = match (self.first_field_write, self.last_field_write) {
+            (Some(first), Some(last)) => last.duration_since(first).as_secs_f64(),
+            _ => 0.0,
+        };
+        let fps = if elapsed > 0.0 {
+            field_count as f64 / (elapsed * 2.0)
+        } else {
+            0.0
+        };
+        tracing::info!(
+            "Decode finished: {} fields in {:.3}s ({:.2} FPS)",
+            field_count,
+            elapsed,
+            fps
+        );
+
+        if let (Some(json_file), Some(metadata)) = (self.json_file.as_mut(), metadata) {
+            // The `videoParameters` are only known once decoding is done (the
+            // ire levels and field height come from the last decoded field, and
+            // `numberOfSequentialFields` from the final count), so the header is
+            // emitted here by rewriting the whole file, mirroring the
+            // reference, whose `build_json` also writes the header only at
+            // close time.
+            //
+            // Python aliases the stored `fi` dict: a filler field's writeout
+            // re-processes the stored field's efm through the shared PLL and
+            // overwrites `efmTValues`/`audioSamples`/`ac3Symbols` in the *same*
+            // dict that was appended when the field was first written. Every
+            // json entry for a duplicated fileLoc (filler) must therefore show
+            // the last writeout's values.
+            let mut loc_to_last: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::new();
+            for (i, e) in self.json_entries.iter().enumerate() {
+                loc_to_last.insert(e.file_loc, i);
+            }
+            for i in 0..self.json_entries.len() {
+                if let Some(&last) = loc_to_last.get(&self.json_entries[i].file_loc) {
+                    if last != i {
+                        let last = self.json_entries[last].clone();
+                        self.json_entries[i].efm_t_values = last.efm_t_values;
+                        self.json_entries[i].audio_samples = last.audio_samples;
+                        self.json_entries[i].ac3_symbols = last.ac3_symbols;
+                    }
+                }
+            }
+
+            let mut chunk = Vec::new();
+            append_header(&mut chunk, &metadata, field_count)?;
+            for (i, e) in self.json_entries.iter().enumerate() {
+                if i > 0 {
+                    chunk.push(b',');
+                }
+                serde_json::to_writer(&mut chunk, e)?;
+            }
+            chunk.extend_from_slice(b"]}\r\n");
+
+            json_file
+                .seek(SeekFrom::Start(0))
+                .with_context(|| "json: seek to start")?;
+            json_file
+                .write_all(&chunk)
+                .with_context(|| "json: write header+fields")?;
+            json_file
+                .set_len(chunk.len() as u64)
+                .with_context(|| "json: set_len")?;
+        }
+        Ok(())
+    }
+}
+
+/// Append the reference layout: `"pcmAudioParameters":{...},"videoParameters":{...},"fields":[`
+/// (everything of `TbcMetadata` except its trailing `}`) to `chunk`.
+fn append_header(
+    chunk: &mut Vec<u8>,
+    metadata: &DecoderMetadata,
+    field_count: usize,
+) -> Result<()> {
+    // Mirror the reference `build_json` version parsing: `release:7.3.0`
+    // splits into branch `release` / commit `7.3.0`.
+    let (git_branch, git_commit) = match REFERENCE_VERSION.split_once(':') {
+        Some((b, c)) => (b.to_string(), c.to_string()),
+        None => (String::new(), String::new()),
+    };
+    let tbc = TbcMetadata {
+        pcm_audio_parameters: PcmAudioParameters {
+            bits: 16,
+            is_little_endian: true,
+            is_signed: true,
+            sample_rate: 44100,
+        },
+        video_parameters: VideoParameters {
+            number_of_sequential_fields: field_count,
+            os_info: platform_info(),
+            version: REFERENCE_VERSION.to_string(),
+            git_branch,
+            git_commit,
+            system: metadata.system.to_string(),
+            field_width: metadata.field_width,
+            sample_rate: metadata.sample_rate,
+            black_16b_ire: metadata.black_16b_ire,
+            white_16b_ire: metadata.white_16b_ire,
+            blanking_16b_ire: metadata.blanking_16b_ire,
+            field_height: metadata.field_height,
+            colour_burst_start: metadata.colour_burst_start,
+            colour_burst_end: metadata.colour_burst_end,
+            active_video_start: metadata.active_video_start,
+            active_video_end: metadata.active_video_end,
+        },
+    };
+    let bytes = serde_json::to_vec(&tbc)?;
+    chunk.extend_from_slice(&bytes[..bytes.len() - 1]);
+    chunk.extend_from_slice(b",\"fields\":[");
+    Ok(())
+}
+
+/// Port of Python's `f'{platform.system()}:{platform.release()}:{platform.version()}'`.
+/// Best-effort: on Windows the release/version come from `ver`; elsewhere only
+/// the OS name is available from `std::env::consts`.
+fn platform_info() -> String {
+    let os = match std::env::consts::OS {
+        "windows" => "Windows",
+        "macos" => "Darwin",
+        "linux" => "Linux",
+        other => other,
+    };
+    if std::env::consts::OS == "windows" {
+        if let Ok(out) = std::process::Command::new("cmd").args(["/c", "ver"]).output() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                // e.g. "Microsoft Windows [Version 10.0.19045]"
+                if let Some(v) = s
+                    .split('[')
+                    .nth(1)
+                    .and_then(|x| x.split(']').next())
+                    .and_then(|x| x.trim().strip_prefix("Version "))
+                {
+                    // platform.version() reports major.minor.build (no UBR).
+                    let v3 = v.split('.').take(3).collect::<Vec<_>>().join(".");
+                    let release = v3.split('.').next().unwrap_or(v3.as_str());
+                    return format!("{os}:{release}:{v3}");
+                }
+            }
+        }
+    }
+    os.to_string()
+}
+
+fn write_u16_le(file: &mut dyn Write, values: &[u16]) -> Result<()> {
+    // One write per field, not per sample: a per-element write_all is a
+    // syscall per pixel and dominates the whole decode.
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn write_f32_slice(file: &mut dyn Write, values: &[f32]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn write_i16_slice(file: &mut dyn Write, values: &[i16]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    file.write_all(&bytes)?;
+    Ok(())
+}

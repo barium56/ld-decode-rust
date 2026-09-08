@@ -1,0 +1,21 @@
+[package]
+name = "ld-decode-cli"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "ld-decode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ld-decode = { path = "../ld-decode" }
+claxon = "0.4"
+ogg = "0.9"
+rusqlite = { version = "0.40.2", features = ["bundled"] }

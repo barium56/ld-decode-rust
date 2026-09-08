@@ -1,0 +1,19 @@
+[package]
+name = "ld-decode"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Rust port of the ld-decode Laserdisc RF decoder (NTSC)"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+anyhow = "1"
+num-traits = "0.2"
+rayon = "1"
+realfft = "3"
+rustfft = "6"
+sci-rs = "0.4"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
