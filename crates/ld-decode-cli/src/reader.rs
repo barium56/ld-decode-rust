@@ -89,6 +89,12 @@ pub trait SampleSource: Send {
     fn read(&mut self, out: &mut [f32]) -> Result<usize>;
     /// Seek to absolute sample `sample`.
     fn seek_samples(&mut self, sample: u64) -> Result<()>;
+    /// Whether `seek_samples` is a cheap in-file seek (raw captures) rather
+    /// than a decoder restart (streamed FLAC/ldf). The window manager uses
+    /// this to pick the rewind-band size; it never changes the sample stream.
+    fn is_seekable(&self) -> bool {
+        false
+    }
 }
 
 /// Fixed-width raw samples.
@@ -109,6 +115,10 @@ impl RawSource {
 }
 
 impl SampleSource for RawSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let want = out.len() * self.bytes_per_sample;
         let mut buf = vec![0u8; want];
@@ -215,6 +225,10 @@ impl PackedSource {
 }
 
 impl SampleSource for PackedSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let mut written = 0usize;
         // Serve any leftover samples from a non-aligned seek first.
@@ -265,11 +279,19 @@ impl SampleSource for PackedSource {
 pub struct DecodeReader {
     pub(crate) source: Box<dyn SampleSource>,
     eof: bool,
+    /// Cached `source.is_seekable()` (cheap in-file seek vs decoder restart).
+    seekable: bool,
 }
 
 impl DecodeReader {
     pub fn new(source: Box<dyn SampleSource>) -> Self {
-        Self { source, eof: false }
+        let seekable = source.is_seekable();
+        Self { source, eof: false, seekable }
+    }
+
+    /// Whether `seek_samples` is a cheap in-file seek (raw file backends).
+    pub fn is_seekable(&self) -> bool {
+        self.seekable
     }
 
     pub fn read(&mut self, out: &mut [f32]) -> Result<usize> {

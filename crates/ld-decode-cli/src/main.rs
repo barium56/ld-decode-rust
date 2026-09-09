@@ -250,7 +250,8 @@ fn main() -> Result<()> {
     };
 
     let max_frames = args.length;
-    decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base)?;
+    let seekable = reader.is_seekable();
+    decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base, seekable)?;
     Ok(())
 }
 
@@ -296,13 +297,17 @@ fn refill_take(
 }
 
 /// Drop the head of the window so it starts at `keep`, re-seeking the reader if
-/// the window was fully drained.
+/// the window was fully drained. The drop is logical: the head is recorded as
+/// a skip offset and the buffer is only compacted (memmoved) when the dead
+/// prefix exceeds a quarter of the buffer, so a steady-state field loop never
+/// memmoves the ~8M-sample window per field.
 fn keep_window(
     reader: &mut prefetch::PrefetchReader,
     window: &mut Vec<f32>,
     keep: u64,
     base: &mut u64,
     read_pos: &mut u64,
+    skip: &mut usize,
 ) -> Result<()> {
     if std::env::var_os("LD_TRACE_KEEP").is_some() {
         ld_decode::teeprintln!("KEEP keep={keep} base={} read_pos={} wlen={}", *base, *read_pos, window.len());
@@ -312,8 +317,9 @@ fn keep_window(
         reader.seek_samples(keep)?;
         *read_pos = keep;
         window.clear();
+        *skip = 0;
     } else if keep > *base {
-        window.drain(..(keep - *base) as usize);
+        *skip += (keep - *base) as usize;
     } else {
         // `keep <= base`: the decoder has not consumed anything below `base`
         // (the head is `consumed - margin - rewind_band`, and the rewind band
@@ -325,6 +331,13 @@ fn keep_window(
         // keeps the needed data in the window.
     }
     *base = keep.max(*base);
+    // Amortized compaction: only memmove when the dead prefix is large
+    // relative to the live tail (cost amortizes to a few percent of a
+    // per-field drain). Nothing above `base` is ever read again.
+    if *skip > 0 && *skip * 4 >= window.len() - *skip {
+        window.drain(..*skip);
+        *skip = 0;
+    }
     Ok(())
 }
 
@@ -356,6 +369,7 @@ fn decode_all(
     mut decoder: Decoder,
     max_frames: Option<u64>,
     initial_base: u64,
+    seekable: bool,
 ) -> Result<()> {
     // Overlap the blocking sample reads with the decode: wrap the reader in
     // the prefetch worker. All reads are served FIFO by one thread, so the
@@ -383,12 +397,25 @@ fn decode_all(
     // ≈ 3.8M samples); otherwise the band alone exceeds the cap, refills
     // stop, the window end never advances, and the decode stalls on
     // NeedData forever (the read position must keep up with `consumed`).
-    let max_keep =
-        decode_rewind(&spec) + spec.readlen() as u64 + 130 * spec.blocksize() as u64;
+    // For seekable raw input the band only needs to cover MTF/AGC redo
+    // (~1-2 fields): a larger rewind falls back to the cheap in-file
+    // RESEEK-BACK path. A smaller band shrinks the sliding window, which
+    // keeps trim/refill memcpy traffic off the wall clock. Streamed FLAC/ldf
+    // keeps the full 24-field band (a backward seek restarts the decoder).
+    let rewind_band = if seekable {
+        2 * spec.bytes_per_field() as u64 + 4 * spec.blocksize() as u64
+    } else {
+        decode_rewind(&spec)
+    };
+    let max_keep = rewind_band + spec.readlen() as u64 + 130 * spec.blocksize() as u64;
 
     let mut fields_written = 0usize;
     let mut last_consumed = 0u64;
     let mut stalled = false;
+    // Logical head of the window: `window[skip..]` is the live data starting
+    // at sample `base`. Trims only advance `skip`; the buffer is compacted
+    // lazily in `keep_window` (amortized O(1) memmove per field).
+    let mut skip: usize = 0;
     let t_start = std::time::Instant::now();
     loop {
         // Refill while the window is below the target so the read-ahead cannot
@@ -402,26 +429,27 @@ fn decode_all(
         // Refill to the cap (the trim eats one chunk per iteration, so a
         // single refill per loop can never grow the window past the band;
         // loop until the cap is reached or input ends).
-        while !final_chunk && (stalled || (window.len() as u64) < (max_keep as u64)) {
-            // Queue the read, then block on its data. The queue is one deep:
-            // the read issued at the end of this loop iteration overlaps with
-            // the decode+write below.
-            if pf.outstanding_reads() == 0 {
+        // Live window length (excluding the compacted-away prefix).
+        let live_len = window.len() - skip;
+        while !final_chunk && (stalled || ((window.len() - skip) as u64) < (max_keep as u64)) {
+            // Queue the read, then block on its data. The queue is two deep:
+            // the reads issued here overlap with the decode+write below, so
+            // the main thread's take() rarely waits on disk (the refills are
+            // pure I/O and FIFO-ordered, so the sample stream is identical to
+            // the synchronous path).
+            while pf.outstanding_reads() < 2 {
                 pf.prefetch(chunk);
             }
             refill_take(&mut pf, &mut window, chunk, &mut read_pos, &mut final_chunk, initial_base)?;
-            if !final_chunk {
-                pf.prefetch(chunk);
-            }
         }
 
         let t_d0 = std::time::Instant::now();
-        let (consumed, fields) = decoder.decode(&window, base, final_chunk)?;
+        let (consumed, fields) = decoder.decode(&window[skip..], base, final_chunk)?;
         if std::env::var_os("LD_TIMING").is_some() {
-            ld_decode::teeprintln!("DEC us={} fields={} consumed={} wlen={}", t_d0.elapsed().as_micros(), fields.len(), consumed, window.len());
+            ld_decode::teeprintln!("DEC us={} fields={} consumed={} wlen={}", t_d0.elapsed().as_micros(), fields.len(), consumed, live_len);
         }
         if std::env::var_os("LD_TRACE_KEEP").is_some() {
-            ld_decode::teeprintln!("DEC consumed={consumed} fields={} base={} wlen={}", fields.len(), base, window.len());
+            ld_decode::teeprintln!("DEC consumed={consumed} fields={} base={} wlen={}", fields.len(), base, live_len);
         }
         // A NeedData below the retained window (MTF/AGC redo rewound further
         // back than the rewind band; python's 40M-sample reader always serves
@@ -439,6 +467,7 @@ fn decode_all(
             }
             pf.seek_samples(new_base)?;
             window.clear();
+            skip = 0;
             base = new_base;
             read_pos = new_base;
             stalled = false;
@@ -460,7 +489,7 @@ fn decode_all(
             break;
         }
         if std::env::var_os("LD_PROG").is_some() && fields_written % 100 == 0 {
-            ld_decode::teeprintln!("PROG fields={} wall={:.1}s u64={} wlen={}", fields_written, t_start.elapsed().as_secs_f64(), consumed, window.len());
+            ld_decode::teeprintln!("PROG fields={} wall={:.1}s u64={} wlen={}", fields_written, t_start.elapsed().as_secs_f64(), consumed, live_len);
         }
         if max_fields.is_some_and(|m| fields_written >= m) {
             break;
@@ -471,7 +500,7 @@ fn decode_all(
             // most one field, so keep calling it until it reports EOF (no
             // fields produced and the read position stops advancing).
             loop {
-                let (consumed, fields) = decoder.decode(&window, base, true)?;
+                let (consumed, fields) = decoder.decode(&window[skip..], base, true)?;
                 let metadata = decoder.metadata();
                 for field in &fields {
                     writer.write_writeable(field, metadata.as_ref())?;
@@ -505,10 +534,10 @@ fn decode_all(
             .div_euclid(blocksize)
             * blocksize;
         let head = keep_from
-            .saturating_sub(decode_rewind(&spec))
+            .saturating_sub(rewind_band)
             .div_euclid(blocksize)
             * blocksize;
-        keep_window(&mut pf, &mut window, head, &mut base, &mut read_pos)?;
+        keep_window(&mut pf, &mut window, head, &mut base, &mut read_pos, &mut skip)?;
         stalled = fields.is_empty() && consumed == last_consumed;
         last_consumed = consumed;
     }
