@@ -1,6 +1,7 @@
 //! ld-decode command line interface: decode raw RF Laserdisc captures (NTSC)
 //! to a `.tbc` picture plus `.tbc.json` sidecar.
 
+mod async_db;
 mod db;
 mod prefetch;
 mod reader;
@@ -201,7 +202,7 @@ fn main() -> Result<()> {
     });
     // SQLite metadata sidecar, created fresh every run (like the reference,
     // which unlinks any pre-existing `<out>.tbc.db`).
-    let db = db::DbWriter::create(std::path::Path::new(&format!("{outfile}.tbc.db")))?;
+    let db = async_db::AsyncDbWriter::create(std::path::Path::new(&format!("{outfile}.tbc.db")))?;
     let mut writer = DecodeWriter::new(luma, audio, efm, pre_efm, Some(json), Some(db))?;
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);

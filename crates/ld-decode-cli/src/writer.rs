@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use ld_decode::{DecoderMetadata, FieldInfoEntry, LumaOutput, WriteableField};
 use serde::Serialize;
 
-use crate::db::DbWriter;
+use crate::async_db::AsyncDbWriter;
 
 /// The ld-decode version this port replicates bit-for-bit. The reference
 /// release build reports `release:7.3.0`, which is parsed (mirroring
@@ -42,8 +42,9 @@ pub struct DecodeWriter {
     field_count: usize,
     first_field_write: Option<Instant>,
     last_field_write: Option<Instant>,
-    /// SQLite metadata sidecar (`<out>.tbc.db`), written per field.
-    db: Option<DbWriter>,
+    /// SQLite metadata sidecar (`<out>.tbc.db`), written per field on a
+    /// background thread (the db is derived data, off the critical path).
+    db: Option<AsyncDbWriter>,
 }
 
 #[derive(Clone, Serialize)]
@@ -90,7 +91,7 @@ impl DecodeWriter {
         efm: Option<File>,
         pre_efm: Option<File>,
         json: Option<File>,
-        db: Option<DbWriter>,
+        db: Option<AsyncDbWriter>,
     ) -> Result<Self> {
         if let Some(mut json) = json.as_ref() {
             let mut chunk = FIELDS_OPEN.to_vec();
@@ -125,8 +126,8 @@ impl DecodeWriter {
         // field_id for the database is the 0-based index of this field among
         // those written (the reference's `fields_written`, pre-increment).
         let field_id = self.field_count;
-        if let (Some(db), Some(metadata)) = (self.db.as_mut(), metadata) {
-            db.write_field(&field.info, metadata, field_id)?;
+        if let (Some(db), Some(metadata)) = (&self.db, metadata) {
+            db.write_field(&field.info, metadata, field_id);
         }
 
         let luma = field.luma();
@@ -193,6 +194,10 @@ impl DecodeWriter {
         }
         if let Some(pe) = self.outfile_pre_efm.as_mut() {
             pe.flush()?;
+        }
+        // Drain + join the background .tbc.db worker before reporting FPS.
+        if let Some(db) = self.db.as_mut() {
+            db.finish()?;
         }
         let field_count = self.field_count;
         let elapsed = match (self.first_field_write, self.last_field_write) {
