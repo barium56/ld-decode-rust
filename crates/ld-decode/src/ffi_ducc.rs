@@ -112,6 +112,43 @@ mod tests {
         }
     }
 
+    // PERF PROBE: measure plan-cache reuse for the pipeline sizes.
+    #[test]
+    fn bench_plan_reuse() {
+        use std::time::Instant;
+        let n = 32768usize;
+        let x: Vec<Complex64> = (0..n)
+            .map(|i| {
+                let t = (i as f64) * 0.618033988749895;
+                Complex64::new(t.fract() - 0.5, (t * 1.7).fract() - 0.5)
+            })
+            .collect();
+        let t0 = Instant::now();
+        let _ = fft(&x);
+        let _ = ifft(&x);
+        eprintln!("PERF first fft+ifft (cold): {:?}", t0.elapsed());
+        let iters = 200;
+        let mut sink = 0.0f64;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let f = fft(&x);
+            let b = ifft(&f);
+            sink += b[1].re;
+        }
+        eprintln!("PERF fft+ifft n=32768: {:?}/pair, sink {:.6}", t0.elapsed() / iters, sink);
+        let xr: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5).collect();
+        let t0 = Instant::now();
+        let _ = rfft(&xr);
+        eprintln!("PERF first rfft (cold): {:?}", t0.elapsed());
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let h = rfft(&xr);
+            let b = irfft(&h, n);
+            sink += b[1];
+        }
+        eprintln!("PERF rfft+irfft n=32768: {:?}/pair, sink {:.6}", t0.elapsed() / iters, sink);
+    }
+
     // TEMP probe: real linked lib vs scipy at all pipeline sizes.
     #[test]
     fn probe_sizes_vs_scipy() {

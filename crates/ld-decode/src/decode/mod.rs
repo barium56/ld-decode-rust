@@ -928,21 +928,21 @@ impl Decoder {
         // Pre-sized FieldData; the per-block assembly below fills it. Under
         // the async-prefetch schedule the window blocks are already cached,
         // so this buffer is only produced once per field (reassigned from
-        // the assembled `raw` inside the !reached_eof block).
+        // the assembled `raw` inside the !reached_eof block). The placeholder
+        // starts empty: it is unconditionally replaced by the assembled `raw`
+        // before `Field::new` consumes it (or dropped on the EOF early return),
+        // so pre-reserving ~35MB here was a pure wasted alloc+zero per field.
         let mut rawdecode = FieldData {
-            input: Vec::with_capacity(numblocks_read * per_block),
+            input: Vec::new(),
             video: VideoChannels {
-                demod: Vec::with_capacity(numblocks_read * per_block),
-                demod_raw: Vec::with_capacity(numblocks_read * per_block),
-                demod_05: Vec::with_capacity(numblocks_read * per_block),
-                demod_burst: Vec::with_capacity(numblocks_read * per_block),
-                audio: [
-                    Vec::with_capacity(numblocks_read * audiob),
-                    Vec::with_capacity(numblocks_read * audiob),
-                ],
-                efm: Vec::with_capacity(numblocks_read * per_block),
+                demod: Vec::new(),
+                demod_raw: Vec::new(),
+                demod_05: Vec::new(),
+                demod_burst: Vec::new(),
+                audio: [Vec::new(), Vec::new()],
+                efm: Vec::new(),
             },
-            rfhpf: Vec::with_capacity(numblocks_read * per_block),
+            rfhpf: Vec::new(),
             audio: [Vec::new(), Vec::new()],
             efm: Vec::new(),
             startloc: block_begin as u64,
@@ -1071,6 +1071,90 @@ impl Decoder {
             // windows only move forward and redo flushes everything anyway).
             self.prune_cache();
             self.dbg.asm_insert = t_asm0.elapsed().as_nanos() as u64;
+
+            // Early prefetch spawn: plan + filter against the cache right now
+            // (the window blocks above are already inserted, so the plan here
+            // is byte-for-byte the one the old end-of-function spawn made) and
+            // start the background demod immediately so it overlaps the whole
+            // serial tail (assembly, process, metadata, downscale, writeout)
+            // instead of only the short remainder after assembly. Results are
+            // still folded into the cache at the top of the next
+            // `decode_field` in the same order, so every field observes an
+            // identical cache; `LD_NO_ASYNC_PREFETCH` forces the inline path
+            // at the old location (also used when there is nothing to prefetch).
+            {
+                let t_pf0 = std::time::Instant::now();
+                let plan = self.prefetch_plan(data_start, data.len(), start);
+                let prefetch: Vec<(u64, usize)> = plan
+                    .into_iter()
+                    .filter(|(bnum, _)| !self.demod_cache.contains_key(bnum))
+                    .collect();
+                let async_ok = !prefetch.is_empty()
+                    && std::env::var_os("LD_NO_ASYNC_PREFETCH").is_none();
+                if async_ok {
+                    // The worker owns copies of its input slices, so it never
+                    // races the caller's window buffer; it only computes and
+                    // sends, never touches the cache.
+                    let blocklen = spec.blocklen;
+                    let freq = spec.freq;
+                    let freq_half = spec.freq_half;
+                    let freq_hz = spec.freq_hz;
+                    let spec_arc = Arc::clone(&self.spec);
+                    let levels = self.levels;
+                    let inputs: Vec<(u64, Vec<f32>)> = prefetch
+                        .iter()
+                        .map(|&(bnum, off)| {
+                            (bnum, data[off..off + blocklen].to_vec())
+                        })
+                        .collect();
+                    let f_mtf = mtf;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let spawn = |f: Box<dyn FnOnce() + Send + 'static>| match &self.pf_pool {
+                        Some(pool) => pool.spawn(f),
+                        None => rayon::spawn(f),
+                    };
+                    spawn(Box::new(move || {
+                        let dspec = DemodSpecRef::with_plans(
+                            freq,
+                            freq_half,
+                            freq_hz,
+                            blocklen,
+                            &spec_arc.filters,
+                            &levels,
+                        );
+                        let mtf_pow = if f_mtf != 0.0 {
+                            Some(compute_mtf_pow(&spec_arc.filters.mtf, f_mtf))
+                        } else {
+                            None
+                        };
+                        let results: Vec<(u64, BlockDecode)> = inputs
+                            .into_par_iter()
+                            .map(|(bnum, buf)| {
+                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref(), spec_arc.delays.video_rot))
+                            })
+                            .collect();
+                        let _ = tx.send(results);
+                    }));
+                    self.pending_prefetch = Some(PendingPrefetch { mtf, recv: rx });
+                } else {
+                    let computed: Vec<BlockDecode> = prefetch
+                        .par_iter()
+                        .map(|&(_, off)| {
+                            let pf_pow = if mtf != 0.0 {
+                                Some(compute_mtf_pow(&spec.filters.mtf, mtf))
+                            } else {
+                                None
+                            };
+                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref(), spec.delays.video_rot)
+                        })
+                        .collect();
+                    for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
+                        self.cache_insert(bnum, mtf, bd);
+                    }
+                    self.prune_cache();
+                }
+                self.dbg.prefetch = t_pf0.elapsed().as_nanos() as u64;
+            }
             // Serial-schedule assembly (a straight ~140MB/field copy at DRAM
             // bandwidth — parallel scattering cannot beat the memory ceiling,
             // and an async variant measured neutral-to-negative because the
@@ -1183,12 +1267,15 @@ impl Decoder {
             raw.efm = std::mem::take(&mut raw.video.efm);
             rawdecode = raw;
 
-            // Prefetch the next `prefetch_blocks` at the current MTF (Python's
-            // `doread(toread_prefetch, MTF, prefetch=True)`), stopping at EOF
-            // just like the loader returning short. Python's range starts at
-            // `end // blocksize` — the *last* window block (skipped as cached)
-            // — so it reaches one block fewer on the far end than starting
-            // just past the window would.
+            // Prefetch bookkeeping was moved to the top of `decode_field`
+            // (right after the window blocks are resolved): the plan depends
+            // only on the cache state after that resolution, which is already
+            // final here, so spawning the background demod at that earlier
+            // point produces the same blocks at the same MTF — it just gives
+            // them the whole serial tail (instead of only the short remainder
+            // of it) to overlap with. The results are still folded into the
+            // cache at the top of the next `decode_field`, in the same order.
+            self.dbg.prefetch = 0;
             if let Some(p) = std::env::var_os("LD_DUMP_CACHEPROG") {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
@@ -1197,86 +1284,8 @@ impl Decoder {
             }
             // Same treatment for the prefetch range: collect the uncached
             // block numbers first (stopping at EOF exactly like the serial
-            // loop). Demodulation normally runs on the rayon pool in the
-            // background while this field's serial tail (process, metadata,
-            // downscale, writeout) executes, and the results are folded into
-            // the cache at the top of the next `decode_field` — same insert
-            // order/content as the serial schedule, so every field observes an
-            // identical cache. `LD_NO_ASYNC_PREFETCH` forces the old inline
-            // path (also used whenever there is nothing to prefetch).
-            {
-                let t_pf0 = std::time::Instant::now();
-                let plan = self.prefetch_plan(data_start, data.len(), start);
-                let prefetch: Vec<(u64, usize)> = plan
-                    .into_iter()
-                    .filter(|(bnum, _)| !self.demod_cache.contains_key(bnum))
-                    .collect();
-                let async_ok = !prefetch.is_empty()
-                    && std::env::var_os("LD_NO_ASYNC_PREFETCH").is_none();
-                if async_ok {
-                    // The worker owns copies of its input slices, so it never
-                    // races the caller's window buffer; it only computes and
-                    // sends, never touches the cache.
-                    let blocklen = spec.blocklen;
-                    let freq = spec.freq;
-                    let freq_half = spec.freq_half;
-                    let freq_hz = spec.freq_hz;
-                    let spec_arc = Arc::clone(&self.spec);
-                    let levels = self.levels;
-                    let inputs: Vec<(u64, Vec<f32>)> = prefetch
-                        .iter()
-                        .map(|&(bnum, off)| {
-                            (bnum, data[off..off + blocklen].to_vec())
-                        })
-                        .collect();
-                    let f_mtf = mtf;
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let spawn = |f: Box<dyn FnOnce() + Send + 'static>| match &self.pf_pool {
-                        Some(pool) => pool.spawn(f),
-                        None => rayon::spawn(f),
-                    };
-                    spawn(Box::new(move || {
-                        let dspec = DemodSpecRef::with_plans(
-                            freq,
-                            freq_half,
-                            freq_hz,
-                            blocklen,
-                            &spec_arc.filters,
-                            &levels,
-                        );
-                        let mtf_pow = if f_mtf != 0.0 {
-                            Some(compute_mtf_pow(&spec_arc.filters.mtf, f_mtf))
-                        } else {
-                            None
-                        };
-                        let results: Vec<(u64, BlockDecode)> = inputs
-                            .into_par_iter()
-                            .map(|(bnum, buf)| {
-                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref(), spec_arc.delays.video_rot))
-                            })
-                            .collect();
-                        let _ = tx.send(results);
-                    }));
-                    self.pending_prefetch = Some(PendingPrefetch { mtf, recv: rx });
-                } else {
-                    let computed: Vec<BlockDecode> = prefetch
-                        .par_iter()
-                        .map(|&(_, off)| {
-                            let pf_pow = if mtf != 0.0 {
-                                Some(compute_mtf_pow(&spec.filters.mtf, mtf))
-                            } else {
-                                None
-                            };
-                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref(), spec.delays.video_rot)
-                        })
-                        .collect();
-                    for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
-                        self.cache_insert(bnum, mtf, bd);
-                    }
-                    self.prune_cache();
-                }
-                self.dbg.prefetch = t_pf0.elapsed().as_nanos() as u64;
-            }
+            // loop). Prefetch demod itself now spawns right after the window
+            // cache insertion above; see the note there.
             if let Some(p) = std::env::var_os("LD_DUMP_CACHEPROG") {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
