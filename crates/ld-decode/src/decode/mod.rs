@@ -124,9 +124,9 @@ pub struct DecoderMetadata {
 #[derive(Clone)]
 pub enum LumaOutput {
     /// 16-bit encoded picture (the normal TBC output).
-    Encoded(Vec<u16>),
+    Encoded(Arc<Vec<u16>>),
     /// Raw pre-encoding luma.
-    Raw(Vec<f32>),
+    Raw(Arc<Vec<f32>>),
 }
 
 impl LumaOutput {
@@ -554,7 +554,7 @@ impl Decoder {
                     // downscale(final_=true) already encoded the luma into
                     // field.dspicture with the same levels; reuse it instead of
                     // recomputing the identical 1M-sample conversion.
-                    picture = Some(LumaOutput::Encoded(field.dspicture.clone()));
+                    picture = Some(LumaOutput::Encoded(Arc::new(field.dspicture.clone())));
                     self.metadata = Some(MetadataFieldState {
                         out_scale: field.out_scale,
                         outlinecount: field.outlinecount,
@@ -723,7 +723,7 @@ impl Decoder {
         self.prevfield = Some(field.to_prevfield());
         t_meta += t_m0.elapsed().as_nanos() as u64;
         let idx = usize::from(field.is_first_field());
-        let luma = picture.unwrap_or(LumaOutput::Encoded(Vec::new()));
+        let luma = picture.unwrap_or_else(|| LumaOutput::Encoded(Arc::new(Vec::new())));
         let mut wf = WriteableField::new(fi, luma);
         wf.audio = std::mem::take(&mut field.dsaudio);
         wf.efm_raw = std::mem::take(&mut field.efmout);
