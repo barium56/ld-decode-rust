@@ -111,8 +111,15 @@ pub(crate) struct FieldData {
     pub video: VideoChannels,
     pub rfhpf: Vec<f32>,
     /// Stage-2 filtered analog audio, [left, right] (after `audio_phase2`);
-    /// f64 like Python's fast-path result.
+    /// f64 like Python's fast-path result. Filled lazily from `audio_pend`
+    /// right before the audio downscale consumes it.
     pub audio: [Vec<f64>; 2],
+    /// Background `audio_phase2` job for this field (spawned right after
+    /// assembly so it overlaps the serial `process`/wow/sinc path). The cell
+    /// carries `Ok(audio2)` or `Err(())` on worker panic; `downscale` waits
+    /// for it before the audio resample. `OnceLock` keeps `Field` `Sync` so
+    /// the existing `rayon::join`/`par_iter` borrows stay legal.
+    pub audio_pend: Option<Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>>>,
     /// EFM equalised signal (i16), for the .efm output.
     pub efm: Vec<i16>,
     pub startloc: u64,
@@ -1904,6 +1911,32 @@ impl Field {
         // Analog audio: resample the stage-2 audio to the output rate.
         let t3 = std::time::Instant::now();
         if audio_freq != 0.0 {
+            // Join the background audio_phase2 job (spawned right after
+            // assembly). By this point the wow/sinc work has long since
+            // covered its runtime, so the wait is instant. On a worker panic
+            // (Err) fall back to the inline call so the output is still
+            // produced identically.
+            if let Some(cell) = self.data.audio_pend.take() {
+                let mut guard = 0usize;
+                let res = loop {
+                    if let Some(r) = cell.get() {
+                        break r.clone();
+                    }
+                    guard += 1;
+                    if guard % 64 == 0 {
+                        std::thread::yield_now();
+                    }
+                };
+                match res {
+                    Ok(audio2) => self.data.audio = audio2,
+                    Err(()) => {
+                        self.data.audio = crate::decode::audio::audio_phase2(
+                            &self.spec,
+                            &self.data.video.audio,
+                        );
+                    }
+                }
+            }
             let linecount = self.linecount.unwrap_or(self.outlinecount);
             let (dsaudio, _next) = crate::decode::audio::downscale_audio(
                 &self.spec,

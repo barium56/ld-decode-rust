@@ -944,6 +944,7 @@ impl Decoder {
             },
             rfhpf: Vec::new(),
             audio: [Vec::new(), Vec::new()],
+            audio_pend: None,
             efm: Vec::new(),
             startloc: block_begin as u64,
         };
@@ -1175,6 +1176,7 @@ impl Decoder {
                 },
                 rfhpf: Vec::with_capacity(numblocks_read * per_block),
                 audio: [Vec::new(), Vec::new()],
+                audio_pend: None,
                 efm: Vec::new(),
                 startloc: block_begin as u64,
             };
@@ -1260,10 +1262,26 @@ impl Decoder {
                 write_one(k)
             });
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
+            // Stage-2 audio filter is a pure function of the assembled stage-1
+            // audio, and its only consumer (`downscale_audio`) sits at the far
+            // end of the serial tail. Spawn it now so it overlaps `process`,
+            // wow and sinc instead of blocking the tail; `downscale` receives
+            // the result before reading it (same bytes as the inline call).
             let t_ph0 = std::time::Instant::now();
-            let phase2 = audio_phase2(&spec, &raw.video.audio);
+            let ph2_audio0 = raw.video.audio[0].clone();
+            let ph2_audio1 = raw.video.audio[1].clone();
+            let ph2_spec = Arc::clone(&self.spec);
+            let ph2_cell: Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>> =
+                Arc::new(std::sync::OnceLock::new());
+            let ph2_cell2 = Arc::clone(&ph2_cell);
+            rayon::spawn(move || {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    audio_phase2(&ph2_spec, &[ph2_audio0, ph2_audio1])
+                }));
+                let _ = ph2_cell2.set(res.map_err(|_| ()));
+            });
             self.dbg.phase2 = t_ph0.elapsed().as_nanos() as u64;
-            raw.audio = phase2;
+            raw.audio_pend = Some(ph2_cell);
             raw.efm = std::mem::take(&mut raw.video.efm);
             rawdecode = raw;
 
