@@ -9,6 +9,13 @@ mod writer;
 use std::fs::File;
 use std::sync::Arc;
 
+// The decode pipeline churns through hundreds of MB of transient FFT/scatter
+// buffers per field; the Windows heap serializes large alloc/free bursts from
+// the rayon workers. mimalloc handles that pattern much better. Pure allocator
+// swap - arithmetic is untouched.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use ld_decode::{ColorSystem, DecodeRequest, Decoder, DecoderSpec, BLOCKSIZE};
