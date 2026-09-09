@@ -185,10 +185,13 @@ impl DbWriter {
         field_id: usize,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // Everything except `number_of_sequential_fields` in the capture row
+        // (and the whole pcm row) is constant for the whole decode, so the
+        // UPDATE pair only runs on the first field; the sequential-field
+        // count is refreshed per field (it grows as the decode proceeds).
         let capture_id = match self.capture_id {
             Some(id) => {
-                update_capture(&tx, id, metadata)?;
-                update_pcm(&tx, id)?;
+                update_sequential_fields(&tx, id, metadata)?;
                 id
             }
             None => {
@@ -360,6 +363,19 @@ fn insert_capture(tx: &rusqlite::Transaction<'_>, m: &DecoderMetadata) -> Result
             ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// Per-field refresh of the one non-constant capture column.
+fn update_sequential_fields(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    m: &DecoderMetadata,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE capture SET number_of_sequential_fields=?1 WHERE capture_id = ?2",
+        params![m.number_of_sequential_fields as i64, id],
+    )?;
+    Ok(())
 }
 
 fn update_capture(tx: &rusqlite::Transaction<'_>, id: i64, m: &DecoderMetadata) -> Result<()> {
