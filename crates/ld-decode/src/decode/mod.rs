@@ -20,7 +20,7 @@ mod field;
 mod vits;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -35,6 +35,34 @@ use efm_pll::EfmPll;
 use field::{Field, FieldData, PrevField};
 
 pub(crate) use demodblock::{compute_mtf_pow, demod_block_cpu, DemodSpecRef};
+
+/// Memoized `MTF ** mtf_level`. Pure function of the (immutable) mtf filter
+/// and the scalar mtf, keyed by mtf's f64 bits. mtf is near-constant in
+/// steady state (constant for thousands of fields), so this turns the ~ms
+/// serial complex-pow per prefetch spawn into a hash lookup. Values are
+/// identical, only the timeline moves. Bounded to a few entries: when mtf
+/// moves, the old spectrum is never needed again (redo flushes the demod
+/// cache).
+fn mtf_pow_memo_get(
+    memo: &Mutex<HashMap<u64, Arc<Vec<Complex64>>>>,
+    mtf_filter: &[Complex64],
+    f_mtf: f64,
+) -> Option<Arc<Vec<Complex64>>> {
+    if f_mtf == 0.0 {
+        return None;
+    }
+    let key = f_mtf.to_bits();
+    let mut m = memo.lock().unwrap();
+    if let Some(p) = m.get(&key) {
+        return Some(Arc::clone(p));
+    }
+    if m.len() >= 4 {
+        m.clear();
+    }
+    let p = Arc::new(compute_mtf_pow(mtf_filter, f_mtf));
+    m.insert(key, Arc::clone(&p));
+    Some(p)
+}
 
 /// Size of one FFT demodulation block (matches `BLOCKSIZE` in core.py).
 pub const BLOCKSIZE: usize = 32 * 1024;
@@ -284,6 +312,13 @@ pub struct Decoder {
     /// dropouts, audio phase 2) join-block behind the long prefetch tasks;
     /// a dedicated pool lets both run concurrently.
     pf_pool: Option<rayon::ThreadPool>,
+    /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
+    /// slowly-varying scalar — constant for thousands of fields in steady
+    /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
+    /// so the ~ms serial complex-pow per prefetch spawn becomes a hash
+    /// lookup. Pure memoization: values are identical, only the timeline
+    /// moves. Bounded to the last few distinct mtf values.
+    mtf_pow_memo: Arc<Mutex<HashMap<u64, Arc<Vec<Complex64>>>>>,
     /// Two most recent check_mtf levels, oldest first. Python starts the next
     /// field's decode thread *before* the current field's checkMTF runs, so a
     /// field is demodulated with a level that lags our serial loop by one
@@ -376,6 +411,7 @@ impl Decoder {
                 ),
             },
             mtf_hist: VecDeque::from([1.0, 1.0]),
+            mtf_pow_memo: Arc::new(Mutex::new(HashMap::new())),
             pending_prefetch: None,
             metadata: None,
             output_lines,
@@ -1109,6 +1145,7 @@ impl Decoder {
                         })
                         .collect();
                     let f_mtf = mtf;
+                    let memo = Arc::clone(&self.mtf_pow_memo);
                     let (tx, rx) = std::sync::mpsc::channel();
                     let spawn = |f: Box<dyn FnOnce() + Send + 'static>| match &self.pf_pool {
                         Some(pool) => pool.spawn(f),
@@ -1128,30 +1165,22 @@ impl Decoder {
                             &spec_arc.filters,
                             &levels,
                         );
-                        let mtf_pow = if f_mtf != 0.0 {
-                            Some(compute_mtf_pow(&spec_arc.filters.mtf, f_mtf))
-                        } else {
-                            None
-                        };
+                        let mtf_pow = mtf_pow_memo_get(&memo, &spec_arc.filters.mtf, f_mtf);
                         let results: Vec<(u64, BlockDecode)> = inputs
                             .into_par_iter()
                             .map(|(bnum, buf)| {
-                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref(), spec_arc.delays.video_rot))
+                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot))
                             })
                             .collect();
                         let _ = tx.send(results);
                     }));
                     self.pending_prefetch = Some(PendingPrefetch { mtf, recv: rx });
                 } else {
+                    let pf_pow = mtf_pow_memo_get(&self.mtf_pow_memo, &spec.filters.mtf, mtf);
                     let computed: Vec<BlockDecode> = prefetch
                         .par_iter()
                         .map(|&(_, off)| {
-                            let pf_pow = if mtf != 0.0 {
-                                Some(compute_mtf_pow(&spec.filters.mtf, mtf))
-                            } else {
-                                None
-                            };
-                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref(), spec.delays.video_rot)
+                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref().map(|v| v.as_slice()), spec.delays.video_rot)
                         })
                         .collect();
                     for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
