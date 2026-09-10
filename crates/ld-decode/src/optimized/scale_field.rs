@@ -120,8 +120,80 @@ pub(crate) fn scale_field_sinc(
             // (f32 weight blend, f32 product, f64 accumulate chain) is exactly
             // the original two-pass version.
             let n = out.len();
-            for (j, o) in out.iter_mut().enumerate().take(n) {
-                let i = base + j;
+            // 4 independent per-sample accumulators (samples j..j+3 interleave
+            // their 16-tap f64 chains) — every sample keeps its exact serial
+            // arithmetic order, so the output is bit-identical to the fully
+            // serial loop; the lanes only overlap in execution.
+            let mut j = 0usize;
+            while j + 4 <= n {
+                let mut r0 = 0.0f64;
+                let mut r1 = 0.0f64;
+                let mut r2 = 0.0f64;
+                let mut r3 = 0.0f64;
+                let mut coord = [0.0f32; 4];
+                let mut start = [0usize; 4];
+                let mut alpha = [0.0f32; 4];
+                let mut rowoff = [0usize; 4];
+                unsafe {
+                    for (k, i) in (base + j..base + j + 4).enumerate() {
+                        // Compensates for the amplitude/frequency shift caused
+                        // by FM demodulation under varying playback speed.
+                        let adjust = *level_adjusts.get_unchecked(i);
+
+                        // Reconstruct the waveform at the proper fractional
+                        // sample position, undoing wow-induced timing
+                        // variations. Clamp into the interior so the 16-tap
+                        // window stays in bounds; valid fields never reach the
+                        // edge, and the Python original raised there (which
+                        // its caller turned into a dropped field).
+                        coord[k] = (*interpolated_pixel_locs.get_unchecked(i) as f32)
+                            .max(half_taps_m1 as f32)
+                            .min((buf.len() - SINC_TAP_COUNT - half_taps_m1) as f32);
+                        let coord_int = coord[k] as usize;
+                        let frac = coord[k] - coord_int as f32;
+
+                        // Fractional phase: Python (numba) linearly
+                        // interpolates between the two adjacent LUT phase
+                        // rows, with `alpha` computed in f32.
+                        let phase_pos = frac * SINC_PHASE_COUNT as f32;
+                        let phase_start = phase_pos as usize;
+                        alpha[k] = phase_pos - phase_start as f32;
+                        // The two adjacent phase rows are contiguous in the LUT.
+                        rowoff[k] = phase_start * SINC_TAP_COUNT;
+                        start[k] = coord_int - half_taps_m1;
+                    }
+                    for t in 0..SINC_TAP_COUNT {
+                        // Lane k: blend the t-th weight of its row pair, f32
+                        // product with buf, widen, add to lane k's own f64
+                        // chain (exact per-sample order preserved).
+                        let ws0 = *sinc_lut.get_unchecked(rowoff[0] + t);
+                        let w0 = ws0 + alpha[0] * (*sinc_lut.get_unchecked(rowoff[0] + SINC_TAP_COUNT + t) - ws0);
+                        r0 += f64::from(*buf.get_unchecked(start[0] + t) * w0);
+
+                        let ws1 = *sinc_lut.get_unchecked(rowoff[1] + t);
+                        let w1 = ws1 + alpha[1] * (*sinc_lut.get_unchecked(rowoff[1] + SINC_TAP_COUNT + t) - ws1);
+                        r1 += f64::from(*buf.get_unchecked(start[1] + t) * w1);
+
+                        let ws2 = *sinc_lut.get_unchecked(rowoff[2] + t);
+                        let w2 = ws2 + alpha[2] * (*sinc_lut.get_unchecked(rowoff[2] + SINC_TAP_COUNT + t) - ws2);
+                        r2 += f64::from(*buf.get_unchecked(start[2] + t) * w2);
+
+                        let ws3 = *sinc_lut.get_unchecked(rowoff[3] + t);
+                        let w3 = ws3 + alpha[3] * (*sinc_lut.get_unchecked(rowoff[3] + SINC_TAP_COUNT + t) - ws3);
+                        r3 += f64::from(*buf.get_unchecked(start[3] + t) * w3);
+                    }
+                    // The final level_adjust * result multiply happens in f64
+                    // and rounds to f32 on the store.
+                    *out.get_unchecked_mut(j) = (*level_adjusts.get_unchecked(base + j) * r0) as f32;
+                    *out.get_unchecked_mut(j + 1) = (*level_adjusts.get_unchecked(base + j + 1) * r1) as f32;
+                    *out.get_unchecked_mut(j + 2) = (*level_adjusts.get_unchecked(base + j + 2) * r2) as f32;
+                    *out.get_unchecked_mut(j + 3) = (*level_adjusts.get_unchecked(base + j + 3) * r3) as f32;
+                }
+                j += 4;
+            }
+            for o in out.iter_mut().skip(j) {
+                let jj = (o as *const f32).offset_from(out.as_ptr()) as usize;
+                let i = base + jj;
                 // Compensates for the amplitude/frequency shift caused by FM
                 // demodulation under varying playback speed.
                 let adjust = level_adjusts[i];
