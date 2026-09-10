@@ -1114,6 +1114,11 @@ impl Decoder {
                         Some(pool) => pool.spawn(f),
                         None => rayon::spawn(f),
                     };
+                    // The worker computes `MTF ** mtf_level` (16k complex pow,
+                    // ~4ms of CPU) itself instead of waiting for the serial
+                    // tail's closure to get there first — same value, same
+                    // inputs, so the result is identical; only the timeline
+                    // moves.
                     spawn(Box::new(move || {
                         let dspec = DemodSpecRef::with_plans(
                             freq,
