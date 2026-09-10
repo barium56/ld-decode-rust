@@ -191,8 +191,7 @@ pub(crate) fn scale_field_sinc(
                 }
                 j += 4;
             }
-            for o in out.iter_mut().skip(j) {
-                let jj = (o as *const f32).offset_from(out.as_ptr()) as usize;
+            for jj in j..n {
                 let i = base + jj;
                 // Compensates for the amplitude/frequency shift caused by FM
                 // demodulation under varying playback speed.
@@ -232,7 +231,7 @@ pub(crate) fn scale_field_sinc(
                         result += f64::from(*buf.get_unchecked(start + t) * w);
                     }
                 }
-                *o = (adjust * result) as f32;
+                out[jj] = (adjust * result) as f32;
             }
         });
 }
