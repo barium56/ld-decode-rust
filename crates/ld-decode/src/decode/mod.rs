@@ -1279,21 +1279,66 @@ impl Decoder {
                 SendPtr(p_rfhpf as *mut ()),
                 SendPtr(p_input as *mut ()),
             ];
-            let write_one = |k: usize| unsafe {
-                match k {
-                    0 => write_par_concat(&mut *(send_ptrs[0].0 as *mut Vec<f32>), &parts_demod),
-                    1 => write_par_concat(&mut *(send_ptrs[1].0 as *mut Vec<f32>), &parts_demod_raw),
-                    2 => write_par_concat(&mut *(send_ptrs[2].0 as *mut Vec<f32>), &parts_demod_05),
-                    3 => write_par_concat(&mut *(send_ptrs[3].0 as *mut Vec<f32>), &parts_demod_burst),
-                    4 => write_par_concat(&mut *(send_ptrs[4].0 as *mut Vec<f32>), &parts_audio0),
-                    5 => write_par_concat(&mut *(send_ptrs[5].0 as *mut Vec<f32>), &parts_audio1),
-                    6 => write_par_concat(&mut *(send_ptrs[6].0 as *mut Vec<i16>), &parts_efm),
-                    7 => write_par_concat(&mut *(send_ptrs[7].0 as *mut Vec<f32>), &parts_rfhpf),
-                    _ => write_par_concat(&mut *(send_ptrs[8].0 as *mut Vec<f32>), &parts_input),
-                }
-            };
-            (0..9usize).into_par_iter().for_each(|k| {
-                write_one(k)
+            // One flat job list over all (channel, block) copies instead of
+            // 9 nested par_iters: ~800 rayon join pairs per field cost more
+            // wall time than the copies themselves, and each nested level
+            // paid a full `resize` zero-fill of its fresh tail before the
+            // copies overwrote it. A single par_iter over the flattened
+            // jobs gives the scheduler one join tree; every destination
+            // range stays disjoint, so the assembled bytes are identical to
+            // the per-channel extends.
+            struct Job {
+                dst: *mut u8,
+                src: *const u8,
+                nbytes: usize,
+            }
+            unsafe impl Send for Job {}
+            unsafe impl Sync for Job {}
+            // Destination vecs, raw pointers, and their element sizes in the
+            // fixed channel order used below.
+            let dsts: [*mut (); 9] = [
+                send_ptrs[0].0, send_ptrs[1].0, send_ptrs[2].0,
+                send_ptrs[3].0, send_ptrs[4].0, send_ptrs[5].0,
+                send_ptrs[6].0, send_ptrs[7].0, send_ptrs[8].0,
+            ];
+            let mut all_jobs: Vec<Job> = Vec::with_capacity(9 * numblocks_read);
+            // Grow each destination vec once (no zero-fill), then enqueue one
+            // job per (channel, part) with its final byte address.
+            macro_rules! enqueue_chan {
+                ($chan:expr, $dst:expr, $parts:expr, $esz:expr) => {{
+                    let total: usize = $parts.iter().map(|p| p.len()).sum();
+                    let v = unsafe { &mut *($dst as *mut Vec<_>) };
+                    v.reserve(total);
+                    let old_len = v.len();
+                    unsafe { v.set_len(old_len + total) };
+                    let base = unsafe { (v.as_mut_ptr() as *mut u8).add(old_len * $esz) };
+                    let mut off = 0usize;
+                    for p in $parts.iter() {
+                        all_jobs.push(Job {
+                            dst: unsafe { base.add(off * $esz) },
+                            src: p.as_ptr() as *const u8,
+                            nbytes: p.len() * $esz,
+                        });
+                        off += p.len();
+                    }
+                }};
+            }
+            let f32sz = std::mem::size_of::<f32>();
+            let i16sz = std::mem::size_of::<i16>();
+            let dst0 = dsts[0]; let dst1 = dsts[1]; let dst2 = dsts[2]; let dst3 = dsts[3];
+            let dst4 = dsts[4]; let dst5 = dsts[5]; let dst6 = dsts[6]; let dst7 = dsts[7];
+            let dst8 = dsts[8];
+            enqueue_chan!(0, dst0, parts_demod, f32sz);
+            enqueue_chan!(1, dst1, parts_demod_raw, f32sz);
+            enqueue_chan!(2, dst2, parts_demod_05, f32sz);
+            enqueue_chan!(3, dst3, parts_demod_burst, f32sz);
+            enqueue_chan!(4, dst4, parts_audio0, f32sz);
+            enqueue_chan!(5, dst5, parts_audio1, f32sz);
+            enqueue_chan!(6, dst6, parts_efm, i16sz);
+            enqueue_chan!(7, dst7, parts_rfhpf, f32sz);
+            enqueue_chan!(8, dst8, parts_input, f32sz);
+            all_jobs.into_par_iter().for_each(|job| unsafe {
+                std::ptr::copy_nonoverlapping(job.src, job.dst, job.nbytes);
             });
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
             // Stage-2 audio filter is a pure function of the assembled stage-1
@@ -1791,13 +1836,16 @@ fn decode_bcd(bcd: i64) -> Result<i64, ()> {
 /// per-part copies spread across the rayon pool. The destination layout is
 /// identical to sequential `extend_from_slice` calls in `parts` order; only
 /// the copy parallelism differs, so the produced bytes are the same.
-fn write_par_concat<T: Copy + Default + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
+fn write_par_concat<T: Copy + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
     let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
     let total: usize = lens.iter().sum();
-    dst.resize(dst.len() + total, T::default());
-    // Split the fresh tail into one &mut slice per part (disjoint by
-    // construction), then copy each part in parallel.
-    let start = dst.len() - total;
+    // Grow without the zero-fill: every byte of the fresh tail is overwritten
+    // by the copy below, so skipping `resize`'s memset halves the memory
+    // traffic of the ~12.8MB/field assembly (identical bytes written).
+    dst.reserve(total);
+    let old_len = dst.len();
+    unsafe { dst.set_len(old_len + total) };
+    let start = old_len;
     let mut slices: Vec<&mut [T]> = Vec::with_capacity(parts.len());
     let mut rest = &mut dst[start..];
     for &l in &lens {
