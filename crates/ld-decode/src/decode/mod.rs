@@ -311,7 +311,7 @@ pub struct Decoder {
     /// pool and the main thread's later `par_iter` stages (downscale,
     /// dropouts, audio phase 2) join-block behind the long prefetch tasks;
     /// a dedicated pool lets both run concurrently.
-    pf_pool: Option<rayon::ThreadPool>,
+    pf_pool: Option<Arc<rayon::ThreadPool>>,
     /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
     /// slowly-varying scalar — constant for thousands of fields in steady
     /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
@@ -391,10 +391,12 @@ impl Decoder {
                 .filter(|&n| n > 0)
             {
                 Some(n) => Some(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(n)
-                        .build()
-                        .expect("failed to build prefetch pool"),
+                    Arc::new(
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(n)
+                            .build()
+                            .expect("failed to build prefetch pool"),
+                    ),
                 ),
                 None if std::env::var("LD_PF_POOL")
                     .ok()
@@ -404,10 +406,12 @@ impl Decoder {
                     None
                 }
                 None => Some(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(rayon::current_num_threads())
-                        .build()
-                        .expect("failed to build prefetch pool"),
+                    Arc::new(
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(rayon::current_num_threads())
+                            .build()
+                            .expect("failed to build prefetch pool"),
+                    ),
                 ),
             },
             mtf_hist: VecDeque::from([1.0, 1.0]),
@@ -1147,16 +1151,16 @@ impl Decoder {
                     let f_mtf = mtf;
                     let memo = Arc::clone(&self.mtf_pow_memo);
                     let (tx, rx) = std::sync::mpsc::channel();
-                    let spawn = |f: Box<dyn FnOnce() + Send + 'static>| match &self.pf_pool {
-                        Some(pool) => pool.spawn(f),
-                        None => rayon::spawn(f),
-                    };
-                    // The worker computes `MTF ** mtf_level` (16k complex pow,
-                    // ~4ms of CPU) itself instead of waiting for the serial
-                    // tail's closure to get there first — same value, same
-                    // inputs, so the result is identical; only the timeline
-                    // moves.
-                    spawn(Box::new(move || {
+                    // `install` (not just `spawn`) sets the thread-local pool
+                    // so the inner par_iter dispatches onto the dedicated
+                    // prefetch pool instead of the global one, where it would
+                    // fight the serial tail's own parallel sections (sinc,
+                    // wow, assembly) for the same 10 threads. The worker body
+                    // uses a plain batched `collect` + one channel send — the
+                    // per-block `for_each_with` streaming shape is what
+                    // triggered rayon's unbounded steal-chain stack overflow
+                    // here, so it must stay batched.
+                    let worker = move || {
                         let dspec = DemodSpecRef::with_plans(
                             freq,
                             freq_half,
@@ -1173,7 +1177,14 @@ impl Decoder {
                             })
                             .collect();
                         let _ = tx.send(results);
-                    }));
+                    };
+                    if let Some(pool) = self.pf_pool.clone() {
+                        let p2 = Arc::clone(&pool);
+                        let runner = move || p2.install(worker);
+                        pool.spawn(runner)
+                    } else {
+                        rayon::spawn(worker)
+                    }
                     self.pending_prefetch = Some(PendingPrefetch { mtf, recv: rx });
                 } else {
                     let pf_pow = mtf_pow_memo_get(&self.mtf_pow_memo, &spec.filters.mtf, mtf);
