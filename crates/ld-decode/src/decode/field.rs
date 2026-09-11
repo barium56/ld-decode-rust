@@ -193,6 +193,38 @@ fn inrange(a: f64, mi: f64, ma: f64) -> bool {
     a >= mi && a <= ma
 }
 
+/// Which readlocs the `LD_DUMP_LLSTAGES` dump is limited to. Defaults to the
+/// two long-standing s16 probe fields; `LD_DUMP_LLSTAGES_RL` overrides with a
+/// comma-separated list.
+/// Readloc of the field currently being processed by the hsync refinement, for
+/// the free zero-crossing helpers that have no access to the field.
+static CUR_READLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `LD_DUMP_ZC2_RAW` honouring an optional `LD_DUMP_ZC_RL` readloc filter.
+fn zc2_dump_ok() -> bool {
+    if std::env::var_os("LD_DUMP_ZC2_RAW").is_none() {
+        return false;
+    }
+    let rl = CUR_READLOC.load(std::sync::atomic::Ordering::Relaxed);
+    match std::env::var("LD_DUMP_ZC_RL") {
+        Ok(f) if !f.trim().is_empty() => f
+            .split(',')
+            .any(|s| s.trim().parse::<u64>().ok() == Some(rl)),
+        _ => true,
+    }
+}
+
+fn llstages_ok(readloc: u64) -> bool {
+    if let Ok(f) = std::env::var("LD_DUMP_LLSTAGES_RL") {
+        if !f.trim().is_empty() {
+            return f
+                .split(',')
+                .any(|s| s.trim().parse::<u64>().ok() == Some(readloc));
+        }
+    }
+    readloc == 1334631232 || readloc == 1341417600
+}
+
 // ---------------------------------------------------------------------------
 // Zero-crossing and pulse detection (utils.calczc / findpulses)
 // ---------------------------------------------------------------------------
@@ -267,8 +299,9 @@ pub(crate) fn calczc_do_f32(
     let a = data[x - 1] - target;
     let b = data[x] - target;
 
-    if let Some(p) = std::env::var_os("LD_DUMP_ZC2_RAW") {
+    if zc2_dump_ok() {
         use std::io::Write;
+        let p = std::env::var_os("LD_DUMP_ZC2_RAW").unwrap();
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
             let _ = writeln!(f, "x={} a={:.17} b={:.17} target={:.17} d0={:.9} d1={:.9}", x, a, b, target, data[x - 1], data[x]);
         }
@@ -697,6 +730,9 @@ impl Field {
                     f64::from(a) + diff * frac
                 };
                 self.levels.ire0 = f64::from(v as f32);
+                // Python assigns a `np.float32` to `DecoderParams["ire0"]` here,
+                // which makes all later `iretohz` arithmetic float32.
+                self.levels.prec = crate::spec::LEVELS_IRE0_F32;
                 return self.getpulses(false);
             }
             return pulses;
@@ -1535,6 +1571,7 @@ impl Field {
                 }
             }
         }
+        CUR_READLOC.store(self.readloc, std::sync::atomic::Ordering::Relaxed);
         let mut linelocs2 = self.linelocs1.clone();
         let demod_05 = &self.data.video.demod_05;
 
@@ -2465,7 +2502,7 @@ impl Field {
         self.linelocs1 = linelocs1;
         self.linebad = linebad;
         self.nextfieldoffset = nextfieldoffset;
-        if self.readloc == 1334631232 || self.readloc == 1341417600 {
+        if llstages_ok(self.readloc) {
             if let Some(p) = std::env::var_os("LD_DUMP_LLSTAGES") {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
@@ -2477,7 +2514,7 @@ impl Field {
 
         self.linebad = self.compute_deriv_error(&self.linelocs1, &self.linebad);
         self.linelocs2 = self.refine_linelocs_hsync(&spec);
-        if self.readloc == 1334631232 || self.readloc == 1341417600 {
+        if llstages_ok(self.readloc) {
             if let Some(p) = std::env::var_os("LD_DUMP_LLSTAGES") {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {

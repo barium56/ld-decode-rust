@@ -688,6 +688,12 @@ impl Decoder {
                                 self.levels.ire0 = ire0_hz;
                                 self.levels.hz_ire = hz_ire;
                                 self.levels.vsync_ire = vsync_ire;
+                                // `detectLevels` divides float32 medians by a
+                                // float64 `adj`, so the values it returns are
+                                // float64 and the Python scalars become plain
+                                // float64 again (not the float32 np scalars
+                                // installed by the sync recalibration).
+                                self.levels.prec = crate::spec::LEVELS_F64;
                             }
                         }
                     }

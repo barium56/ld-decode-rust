@@ -970,7 +970,23 @@ pub(crate) struct CalibLevels {
     pub ire0: f64,
     pub hz_ire: f64,
     pub vsync_ire: f64,
+    /// Precision of the Python reference's `DecoderParams` scalars.
+    ///
+    /// `ire0`/`hz_ire`/`vsync_ire` start out as plain Python numbers (float64
+    /// arithmetic), but the sync recalibration assigns `np.percentile(...)` of a
+    /// float32 array to `ire0`, which makes it a NumPy `float32` scalar. Under
+    /// NEP 50 a Python float is a *weak* scalar, so any arithmetic mixing it
+    /// with that `np.float32` is performed in float32. The AGC path goes
+    /// further and replaces all three with `np.float32` scalars.
+    pub prec: u8,
 }
+
+/// `CalibLevels::prec` values.
+pub(crate) const LEVELS_F64: u8 = 0;
+/// `ire0` is an `np.float32` (sync recalibration); `hz_ire` is unchanged.
+pub(crate) const LEVELS_IRE0_F32: u8 = 1;
+/// All three are `np.float32` scalars (AGC relock).
+pub(crate) const LEVELS_ALL_F32: u8 = 2;
 
 impl CalibLevels {
     pub fn defaults() -> Self {
@@ -978,13 +994,28 @@ impl CalibLevels {
             ire0: SYS_IRE0 as f64,
             hz_ire: SYS_HZ_IRE as f64,
             vsync_ire: SYS_VSYNC_IRE as f64,
+            prec: LEVELS_F64,
         }
     }
 
+    /// `ire0 + hz_ire * ire` exactly as the Python reference evaluates it for
+    /// the current level precision.
     pub fn iretohz(&self, ire: f64) -> f64 {
-        self.ire0 + self.hz_ire * ire
+        match self.prec {
+            LEVELS_F64 => self.ire0 + self.hz_ire * ire,
+            LEVELS_IRE0_F32 => {
+                // `np.float32 + python_float`: the product is float64 in Python
+                // and demoted to float32, then added in float32.
+                f64::from((self.ire0 as f32) + ((self.hz_ire * ire) as f32))
+            }
+            _ => {
+                // `np.float32 + np.float32 * python_float`: all in float32.
+                f64::from((self.ire0 as f32) + ((self.hz_ire as f32) * (ire as f32)))
+            }
+        }
     }
 
+    /// `(hz - ire0) / hz_ire`.
     pub fn hztoire(&self, hz: f64) -> f64 {
         (hz - self.ire0) / self.hz_ire
     }
