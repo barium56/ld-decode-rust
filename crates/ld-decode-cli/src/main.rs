@@ -2,6 +2,7 @@
 //! to a `.tbc` picture plus `.tbc.json` sidecar.
 
 mod async_db;
+mod async_writer;
 mod db;
 mod prefetch;
 mod reader;
@@ -203,7 +204,17 @@ fn main() -> Result<()> {
     // SQLite metadata sidecar, created fresh every run (like the reference,
     // which unlinks any pre-existing `<out>.tbc.db`).
     let db = async_db::AsyncDbWriter::create(std::path::Path::new(&format!("{outfile}.tbc.db")))?;
-    let mut writer = DecodeWriter::new(luma, audio, efm, pre_efm, Some(json), Some(db))?;
+    // The writer's per-field file writes run on a dedicated thread (FIFO, so
+    // the byte stream is identical to the inline loop) and overlap the decode
+    // serial tail instead of extending it.
+    let mut writer = async_writer::AsyncDecodeWriter::new(DecodeWriter::new(
+        luma,
+        audio,
+        efm,
+        pre_efm,
+        Some(json),
+        Some(db),
+    )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
     if args.disable_analog_audio {
@@ -364,7 +375,7 @@ fn setup_start(
 
 fn decode_all(
     reader: &mut DecodeReader,
-    writer: &mut DecodeWriter,
+    writer: &mut async_writer::AsyncDecodeWriter,
     spec: Arc<DecoderSpec>,
     mut decoder: Decoder,
     max_frames: Option<u64>,
@@ -477,7 +488,7 @@ fn decode_all(
         let metadata = decoder.metadata();
         let t_w0 = std::time::Instant::now();
         for field in &fields {
-            writer.write_writeable(field, metadata.as_ref())?;
+            writer.write_writeable(field.clone(), metadata.as_ref())?;
         }
         if std::env::var_os("LD_TIMING").is_some() {
             ld_decode::teeprintln!("WRITE fields={} us={}", fields.len(), t_w0.elapsed().as_micros());
@@ -503,7 +514,7 @@ fn decode_all(
                 let (consumed, fields) = decoder.decode(&window[skip..], base, true)?;
                 let metadata = decoder.metadata();
                 for field in &fields {
-                    writer.write_writeable(field, metadata.as_ref())?;
+                    writer.write_writeable(field.clone(), metadata.as_ref())?;
                 }
                 fields_written += fields.len();
                 if decoder.lead_out() {
