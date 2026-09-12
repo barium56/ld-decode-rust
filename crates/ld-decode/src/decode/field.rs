@@ -1579,25 +1579,37 @@ impl Field {
         // demodulated data, so per-line results (linebad flag + optional
         // refined location) are computed in parallel and applied afterwards
         // in line order — identical outcome to the serial loop.
-        let per_line: Vec<(bool, Option<f64>)> = (0..self.linelocs1.len())
+        // Python passes `iretohz(...)` straight into `calczc`; when `ire0` is an
+        // `np.float32` scalar (NEP 50) the numba `calczc_do` therefore runs its
+        // subtraction, interpolation and comparison in float32.
+        let target0 = self.levels.iretohz(self.levels.vsync_ire / 2.0);
+        let target_is_f32 = self.levels.prec != crate::spec::LEVELS_F64;
+
+        // (bad, refined, ll1, zc, (porch, sync), zc2) — the trailing fields are
+        // only kept for the LD_DUMP_ZC*/LD_DUMP_CLB debug dumps.
+        type LineResult = (bool, Option<f64>, usize, Option<f64>, Option<(f64, f64)>, Option<f64>);
+        let per_line: Vec<LineResult> = (0..self.linelocs1.len())
             .into_par_iter()
             .map(|i| {
                 // skip VSYNC lines (they handle pulses differently)
                 if inrange(i as f64, 3.0, 6.0) {
-                    return (true, None);
+                    return (true, None, usize::MAX, None, None, None);
                 }
 
                 // refine beginning of hsync
                 let ll1 = (f64::from(self.linelocs1[i]) - self.spec.freq) as usize;
-                let target = self.levels.iretohz(self.levels.vsync_ire / 2.0);
-                let zc = calczc(
-                    demod_05,
-                    ll1,
-                    target,
-                    0,
-                    (self.spec.freq * 2.0) as usize,
-                    false,
-                );
+                let zc = if target_is_f32 {
+                    calczc_do_f32(demod_05, ll1, target0 as f32, 0, (self.spec.freq * 2.0) as usize)
+                } else {
+                    calczc(
+                        demod_05,
+                        ll1,
+                        target0,
+                        0,
+                        (self.spec.freq * 2.0) as usize,
+                        false,
+                    )
+                };
 
                 if let (Some(zc), false) = (zc, self.linebad[i]) {
                     // The hsync area, burst, and porches should not leave
@@ -1609,7 +1621,7 @@ impl Field {
                         let min_h = hsync_area.iter().cloned().fold(f32::INFINITY, f32::min);
                         let max_h = hsync_area.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         if f64::from(min_h) < self.levels.iretohz(-55.0) || f64::from(max_h) > self.levels.iretohz(30.0) {
-                            (true, Some(self.linelocs1[i]))
+                            (true, Some(self.linelocs1[i]), ll1, Some(zc), None, None)
                         } else {
                             let porch_start = (zc + self.spec.freq * 8.0) as usize;
                             let porch_end = (zc + self.spec.freq * 9.0) as usize;
@@ -1633,21 +1645,86 @@ impl Field {
                             );
 
                             match zc2 {
-                                Some(zc2) if (zc2 - zc).abs() < self.spec.freq / 2.0 => (false, Some(zc2)),
-                                _ => (true, None),
+                                Some(zc2) if (zc2 - zc).abs() < self.spec.freq / 2.0 => {
+                                    (false, Some(zc2), ll1, Some(zc), Some((porch_level, sync_level)), Some(zc2))
+                                }
+                                _ => (true, None, ll1, Some(zc), Some((porch_level, sync_level)), zc2),
                             }
                         }
                     } else {
-                        (true, None)
+                        (true, None, ll1, Some(zc), None, None)
                     }
                 } else {
-                    (true, None)
+                    (true, None, ll1, zc, None, None)
                 }
             })
             .collect();
 
+        // Debug dumps mirroring the Python reference's LD_DUMP_ZC / ZC2 / ZC2_RAW.
+        if std::env::var_os("LD_DUMP_ZC").is_some()
+            || std::env::var_os("LD_DUMP_ZC2").is_some()
+            || std::env::var_os("LD_DUMP_ZC2_RAW").is_some()
+        {
+            use std::io::Write;
+            let filter = std::env::var("LD_DUMP_ZC_RL").unwrap_or_default();
+            if filter.is_empty()
+                || filter.split(',').any(|s| s.parse::<u64>().ok() == Some(self.readloc))
+            {
+                let fmt = |v: Option<f64>| match v {
+                    Some(x) => format!("{}", x),
+                    None => "None".to_string(),
+                };
+                if let Some(p) = std::env::var_os("LD_DUMP_ZC") {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                        for (i, (_b, _r, ll1, zc, _ps, _z2)) in per_line.iter().enumerate() {
+                            if *ll1 == usize::MAX {
+                                continue;
+                            }
+                            let _ = writeln!(f, "# readloc={} do_retry=1", self.readloc);
+                            let _ = writeln!(f, "{} ll1={} target={:.17} zc={}", i, ll1, target0, fmt(*zc));
+                        }
+                    }
+                }
+                if let Some(p) = std::env::var_os("LD_DUMP_ZC2_RAW") {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                        for (_b, _r, _ll1, _zc, ps, _z2) in per_line.iter() {
+                            if let Some((porch, sync)) = ps {
+                                let _ = writeln!(f, "target={:.17} porch={:.9} sync={:.9} tp=float ts=float tt=float", (porch + sync) / 2.0, porch, sync);
+                            }
+                        }
+                    }
+                }
+                if let Some(p) = std::env::var_os("LD_DUMP_ZC2") {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                        for (i, (_b, _r, _ll1, zc, ps, z2)) in per_line.iter().enumerate() {
+                            if let Some((porch, sync)) = ps {
+                                let _ = writeln!(f, "{} zc={:.17} porch={:.9} sync={:.9} zc2={}", i, zc.unwrap(), porch, sync, fmt(*z2));
+                            }
+                        }
+                    }
+                }
+                if let Some(p) = std::env::var_os("LD_DUMP_PORCH_SLICE") {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                        for (i, (_b, _r, _ll1, zc, ps, _z2)) in per_line.iter().enumerate() {
+                            if let (Some(zc), Some((porch, sync))) = (zc, ps) {
+                                let ps0 = (*zc + self.spec.freq * 8.0) as usize;
+                                let pe0 = (*zc + self.spec.freq * 9.0) as usize;
+                                let ss0 = (*zc + self.spec.freq * 1.0) as usize;
+                                let se0 = (*zc + self.spec.freq * 2.5) as usize;
+                                let _ = writeln!(f, "# line={} porch={}..{} sync={}..{} porch_med={:.9} sync_med={:.9} len={} startloc={} bs={} bnum0={} k0={}", i, ps0, pe0, ss0, se0, porch, sync, demod_05.len(), self.data.startloc, self.spec.blocksize, (self.data.startloc + ps0 as u64) / self.spec.blocksize as u64, (self.data.startloc + ps0 as u64) % self.spec.blocksize as u64);
+                                let pv: Vec<String> = demod_05[ps0..pe0].iter().map(|v| format!("{:08x}", v.to_bits())).collect();
+                                let _ = writeln!(f, "porch {}", pv.join(" "));
+                                let sv: Vec<String> = demod_05[ss0..se0].iter().map(|v| format!("{:08x}", v.to_bits())).collect();
+                                let _ = writeln!(f, "sync {}", sv.join(" "));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Serial apply (order matters for the final linebad/linelocs2 state).
-        for (i, (bad, refined)) in per_line.into_iter().enumerate() {
+        for (i, (bad, refined, _ll1, _zc, _ps, _z2)) in per_line.into_iter().enumerate() {
             self.linebad[i] = bad;
             if let Some(zc) = refined {
                 linelocs2[i] = zc;
