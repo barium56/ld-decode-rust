@@ -233,6 +233,7 @@ pub(crate) fn demod_block_cpu(
     cut: bool,
     mtf_pow: Option<&[Complex64]>,
     rotdelay: i64,
+    block_no: u64,
 ) -> BlockDecode {
     let blocklen = spec.blocklen;
 
@@ -242,7 +243,27 @@ pub(crate) fn demod_block_cpu(
     let pipe_dir = std::env::var_os("LD_DUMP_PIPE").map(|p| p.to_string_lossy().into_owned());
     use std::sync::atomic::{AtomicUsize, Ordering};
     static PIPE_SEQ: AtomicUsize = AtomicUsize::new(0);
-    let dump: Option<usize> = pipe_dir.as_ref().map(|_| PIPE_SEQ.fetch_add(1, Ordering::SeqCst));
+    // `LD_DUMP_PIPE_BLOCK` restricts the dump to a comma-separated list of block
+    // numbers, so only the blocks under investigation are written instead of the
+    // whole capture's worth of stage files.
+    let dump: Option<usize> = match pipe_dir.as_ref() {
+        Some(_) => {
+            let want = std::env::var("LD_DUMP_PIPE_BLOCK").ok();
+            let wanted = |b: u64| match want.as_deref() {
+                None | Some("") => true,
+                Some(list) => list
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .any(|x| x == b),
+            };
+            if wanted(block_no) {
+                Some(PIPE_SEQ.fetch_add(1, Ordering::SeqCst))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     if let Some(s) = dump {
         let dir = pipe_dir.as_deref().unwrap();
         let pfx = format!("s{}_", s);

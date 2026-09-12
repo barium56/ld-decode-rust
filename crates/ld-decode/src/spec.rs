@@ -88,20 +88,39 @@ fn firwin(numtaps: usize, cutoff: &[f64], pass_zero: bool) -> Vec<f64> {
 
     let alpha = 0.5 * (numtaps - 1) as f64;
     let mut h = vec![0.0f64; numtaps];
+    // scipy accumulates each band with two separate array ops
+    // (`h += right*sinc(...)` then `h -= left*sinc(...)`), so each gets its own
+    // rounding; folding them into one expression shifts every tap by an ulp.
     for pair in bands.chunks(2) {
         let (left, right) = (pair[0], pair[1]);
         for (i, m) in (0..numtaps).map(|n| (n, n as f64 - alpha)) {
-            h[i] += right * np_sinc(right * m) - left * np_sinc(left * m);
+            h[i] += right * np_sinc(right * m);
+            h[i] -= left * np_sinc(left * m);
         }
     }
 
-    // Hamming window, fftbins=False.
+    // Hamming window, fftbins=False:
+    // `scipy.signal.windows.hamming` -> `general_hamming(M, 0.54, sym=True)` ->
+    // `general_cosine(M, [0.54, 1.0 - 0.54])`, which evaluates
+    // `np.cos(k*fac)` for k = 0,1 over `fac = np.linspace(-pi, pi, M)` and sums
+    // the terms into a zeros array. The second coefficient is the *rounded*
+    // `1.0 - 0.54` (not the literal 0.46) and the linspace argument is built as
+    // `i*(step) + start` with the endpoint overwritten, so both details matter.
+    let a1 = 1.0 - 0.54;
+    let step = (PI - (-PI)) / (numtaps - 1) as f64;
     for (i, value) in h.iter_mut().enumerate() {
-        let win = 0.54 - 0.46 * (TAU * i as f64 / (numtaps - 1) as f64).cos();
+        let fac = if i == numtaps - 1 {
+            PI
+        } else {
+            i as f64 * step + (-PI)
+        };
+        // k = 0 term: 0.54 * cos(0.0) == 0.54 exactly; then += a1 * cos(fac).
+        let win = 0.54 + a1 * fac.cos();
         *value *= win;
     }
 
-    // Scale for unit gain at the first passband's centre.
+    // Scale for unit gain at the first passband's centre. numpy's `sum` uses
+    // pairwise summation, so the port has to use the same reduction order.
     let (left, right) = (bands[0], bands[1]);
     let scale_frequency = if left == 0.0 {
         0.0
@@ -110,12 +129,13 @@ fn firwin(numtaps: usize, cutoff: &[f64], pass_zero: bool) -> Vec<f64> {
     } else {
         0.5 * (left + right)
     };
-    let s: f64 = (0..numtaps)
+    let prod: Vec<f64> = (0..numtaps)
         .map(|n| {
             let m = n as f64 - alpha;
             h[n] * (PI * m * scale_frequency).cos()
         })
-        .sum();
+        .collect();
+    let s = crate::decode::pairwise_sum_f64(&prod);
     for value in &mut h {
         *value /= s;
     }
@@ -330,11 +350,16 @@ fn gen_bpf_supergauss(
     let freq = freq_high - freq_low;
     let centerfreq = (freq_high + freq_low) / 2.0;
     let log2_half = (2.0f64.ln() / 2.0).powf(1.0 / (2.0 * order as f64));
+    // numpy's `linspace(0, nyquist, n)` builds `i * (delta/div) + start`.
+    let step = nyquist_hz / (half - 1) as f64;
     let mut sg: Vec<f64> = (0..half)
         .map(|i| {
-            let x = i as f64 * nyquist_hz / (half - 1) as f64;
+            let x = i as f64 * step;
             let arg = 2.0 * (x - centerfreq) * log2_half / freq;
-            (-2.0 * arg.powi(2 * order as i32)).exp()
+            // `np.power(arg, 2*order)` evaluates the C library `pow` with a
+            // float exponent; `powi` would use repeated squaring and differ by
+            // ulps across the whole band.
+            (-2.0 * arg.powf(2.0 * order as f64)).exp()
         })
         .collect();
     sg.pop(); // [:-1]
@@ -1403,6 +1428,23 @@ fn compute_fefm(freq_hz: f64, blocklen: usize) -> Vec<Complex64> {
     }
     // self.Filters["Fefm"] *= gen_bpf_supergauss(20000, 1600000, 60, 20000000, blocklen)
     let bpf = gen_bpf_supergauss(20000.0, 1600000.0, 60, 20000000.0, blocklen);
+    if let Some(dir) = std::env::var_os("LD_DUMP_GD") {
+        use std::io::Write;
+        let d = dir.to_string_lossy().into_owned();
+        let mut wf = |name: &str, v: &[f64]| {
+            if let Ok(mut f) = std::fs::File::create(format!("{}{}", d, name)) {
+                let mut out = Vec::with_capacity(v.len() * 8);
+                for x in v {
+                    out.extend_from_slice(&x.to_ne_bytes());
+                }
+                let _ = f.write_all(&out);
+            }
+        };
+        wf("fefm_amp.bin", &bin_amp);
+        wf("fefm_phase.bin", &bin_phase);
+        wf("fefm_bpf.bin", &bpf);
+        wf("fefm_coeffs8.bin", &coeffs.iter().flat_map(|c| [c.re, c.im]).collect::<Vec<f64>>());
+    }
     for (v, &b) in coeffs.iter_mut().zip(&bpf) {
         *v *= b;
     }
@@ -1646,6 +1688,19 @@ fn compute_filters(
         w("_gd.bin", &fvideo_gd);
         w("_f05.bin", &f0_5_fft);
         w("_fburst.bin", &fburst_fft);
+        // Raw FIR taps (f64) of the two FIR-derived video filters.
+        let wf = |name: &str, v: &[f64]| {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::File::create(format!("{}{}", d, name)) {
+                let mut out = Vec::with_capacity(v.len() * 8);
+                for x in v {
+                    out.extend_from_slice(&x.to_ne_bytes());
+                }
+                let _ = f.write_all(&out);
+            }
+        };
+        wf("_f05_taps.bin", &f05_taps);
+        wf("_fburst_taps.bin", &fburst_taps);
     }
     // The three post-demod filters are kept as full-spectrum f64; their FIR
     // delays are applied as time-domain rolls in the demod (like the Python
@@ -1703,6 +1758,23 @@ fn build_groupdelay_equalizer(
         })
         .collect();
 
+    // Optional stage dump (`LD_DUMP_GD=<dir>`) used to pin arithmetic-order
+    // differences against the numpy reference.
+    let gd_dump = std::env::var_os("LD_DUMP_GD").map(|d| d.to_string_lossy().into_owned());
+    let dump_f64 = |name: &str, v: &[f64]| {
+        if let Some(dir) = gd_dump.as_deref() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::File::create(format!("{}{}", dir, name)) {
+                let mut out = Vec::with_capacity(v.len() * 8);
+                for x in v {
+                    out.extend_from_slice(&x.to_ne_bytes());
+                }
+                let _ = f.write_all(&out);
+            }
+        }
+    };
+    dump_f64("gd_binfreq.bin", &binfreq);
+
     // np.interp(binfreq, gd_f, gd_t)
     let interp = |x: f64| -> f64 {
         if x <= gd_f[0] {
@@ -1716,23 +1788,50 @@ fn build_groupdelay_equalizer(
                 .expect("interp upper bound");
             let (f0, f1) = (gd_f[idx - 1], gd_f[idx]);
             let (t0, t1) = (gd_t[idx - 1], gd_t[idx]);
-            t0 + (t1 - t0) * ((x - f0) / (f1 - f0))
+            // numpy's compiled `interp` evaluates `slope*(x - xp[j]) + fp[j]`
+            // with `slope = (fp[j+1] - fp[j]) / (xp[j+1] - xp[j])`; forming the
+            // fraction first instead rounds differently.
+            let slope = (t1 - t0) / (f1 - f0);
+            slope * (x - f0) + t0
         }
     };
     let target: Vec<f64> = binfreq.iter().map(|&f| interp(f)).collect();
+    dump_f64("gd_target.bin", &target);
 
     // Unwrap the LPF phase, then group delay = -d(phase)/d(omega).
+    //
+    // numpy's `unwrap` is not a running "delta -= round(delta/2pi)*2pi" loop:
+    // it corrects the *differences* and lets them accumulate onto the original
+    // samples, so the roundings land in different places. Ported literally:
+    //   dd = diff(p)
+    //   ddmod = mod(dd + pi, 2pi) - pi;  ddmod[(ddmod == -pi) & (dd > 0)] = pi
+    //   ph = where(|dd| < pi, 0, ddmod - dd)
+    //   up[0] = p[0];  up[1:] = p[1:] + cumsum(ph)
     let phase: Vec<f64> = {
         let raw: Vec<f64> = lpf_fft
             .iter()
             .map(|v| crate::spec::ucrt_atan2::call(v.im, v.re))
             .collect();
-        let mut unwrapped = vec![0.0f64; raw.len()];
-        unwrapped[0] = raw[0];
-        for i in 1..raw.len() {
-            let mut delta = raw[i] - raw[i - 1];
-            delta -= (delta / TAU).round() * TAU;
-            unwrapped[i] = unwrapped[i - 1] + delta;
+        let n = raw.len();
+        let mut ph = vec![0.0f64; n - 1];
+        for i in 0..n - 1 {
+            let dd = raw[i + 1] - raw[i];
+            if dd.abs() >= PI {
+                // np.mod(dd + pi, 2pi) - pi, with numpy's floor-modulo.
+                let x = dd + PI;
+                let mut m = x - (x / TAU).floor() * TAU;
+                m -= PI;
+                if m == -PI && dd > 0.0 {
+                    m = PI;
+                }
+                ph[i] = m - dd;
+            }
+        }
+        let mut unwrapped = raw.clone();
+        let mut acc = 0.0f64;
+        for i in 0..n - 1 {
+            acc += ph[i];
+            unwrapped[i + 1] = raw[i + 1] + acc;
         }
         unwrapped
     };
@@ -1750,8 +1849,10 @@ fn build_groupdelay_equalizer(
         })
         .collect();
 
+    dump_f64("gd_phase.bin", &phase);
     let bin_hz = fs / blocklen as f64;
     let lpf_gd: Vec<f64> = gradient.iter().map(|&g| -g / (TAU * bin_hz)).collect();
+    dump_f64("gd_lpf_gd.bin", &lpf_gd);
 
     let i05 = binfreq
         .iter()
@@ -1790,6 +1891,8 @@ fn build_groupdelay_equalizer(
         acc += r;
         dphi[i] = -TAU * acc * bin_hz;
     }
+    dump_f64("gd_residual.bin", &residual);
+    dump_f64("gd_dphi.bin", &dphi);
 
     let mut eq = vec![Complex64::new(1.0, 0.0); blocklen];
     for (i, &p) in dphi.iter().enumerate() {
@@ -1870,7 +1973,7 @@ fn compute_delays(
     fakesignal[6000..6005].fill(0.0);
 
     let demodspec = DemodSpecRef::new(freq, freq_half, freq_hz, blocklen, filters, &levels);
-    let fakedecode = demod_block_cpu(&fakesignal, 0.0, &demodspec, false, None, 0);
+    let fakedecode = demod_block_cpu(&fakesignal, 0.0, &demodspec, false, None, 0, u64::MAX);
 
     let vdemod = &fakedecode.video.demod;
     let vdemod_raw = &fakedecode.video.demod_raw;

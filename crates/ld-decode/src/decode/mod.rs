@@ -35,6 +35,7 @@ use efm_pll::EfmPll;
 use field::{Field, FieldData, PrevField};
 
 pub(crate) use demodblock::{compute_mtf_pow, demod_block_cpu, DemodSpecRef};
+pub(crate) use vits::pairwise_sum_f64;
 
 /// Memoized `MTF ** mtf_level`. Pure function of the (immutable) mtf filter
 /// and the scalar mtf, keyed by mtf's f64 bits. mtf is near-constant in
@@ -1096,7 +1097,7 @@ impl Decoder {
             let t_demod0 = std::time::Instant::now();
             let computed: Vec<BlockDecode> = missing
                 .par_iter()
-                .map(|&(_, off)| {
+                .map(|&(bnum, off)| {
                     let pow = mtf_pow.get_or_init(|| {
                         if mtf != 0.0 {
                             Some(compute_mtf_pow(&spec.filters.mtf, mtf))
@@ -1104,7 +1105,7 @@ impl Decoder {
                             None
                         }
                     });
-                    demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pow.as_deref(), spec.delays.video_rot)
+                    demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pow.as_deref(), spec.delays.video_rot, bnum)
                 })
                 .collect();
             self.dbg.demod = t_demod0.elapsed().as_nanos() as u64;
@@ -1179,7 +1180,7 @@ impl Decoder {
                         let results: Vec<(u64, BlockDecode)> = inputs
                             .into_par_iter()
                             .map(|(bnum, buf)| {
-                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot))
+                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot, bnum))
                             })
                             .collect();
                         let _ = tx.send(results);
@@ -1196,8 +1197,8 @@ impl Decoder {
                     let pf_pow = mtf_pow_memo_get(&self.mtf_pow_memo, &spec.filters.mtf, mtf);
                     let computed: Vec<BlockDecode> = prefetch
                         .par_iter()
-                        .map(|&(_, off)| {
-                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref().map(|v| v.as_slice()), spec.delays.video_rot)
+                        .map(|&(bnum, off)| {
+                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref().map(|v| v.as_slice()), spec.delays.video_rot, bnum)
                         })
                         .collect();
                     for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
