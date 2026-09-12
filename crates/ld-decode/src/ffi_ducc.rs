@@ -149,6 +149,58 @@ mod tests {
         eprintln!("PERF rfft+irfft n=32768: {:?}/pair, sink {:.6}", t0.elapsed() / iters, sink);
     }
 
+    // PERF PROBE: does the global plan cache (a single Mutex around a 10-entry
+    // array) serialise concurrent FFT calls across worker threads?
+    #[test]
+    fn bench_fft_thread_scaling() {
+        use std::time::Instant;
+        const N: usize = 32768;
+        let xr: Vec<f64> = (0..N).map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5).collect();
+        let xc: Vec<Complex64> = (0..N)
+            .map(|i| Complex64::new(xr[i], xr[(i + 1) % N]))
+            .collect();
+        let iters = 100usize;
+        let work = |xr: &[f64], xc: &[Complex64], iters: usize| -> f64 {
+            let mut sink = 0.0f64;
+            for _ in 0..iters {
+                let h = rfft(xr);
+                let b = irfft(&h, N);
+                sink += b[1];
+                let f = fft(xc);
+                let c = ifft(&f);
+                sink += c[1].re;
+            }
+            sink
+        };
+        let s = work(&xr, &xc, 20);
+        let t0 = Instant::now();
+        let s1 = work(&xr, &xc, iters);
+        let single = t0.elapsed().as_secs_f64();
+        eprintln!("PERF 1 thread: {:.3} ms/iter, sink {:.6}", single * 1000.0 / iters as f64, s1 + s);
+
+        for threads in [4usize, 8, 12] {
+            let t0 = Instant::now();
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    let xr = xr.clone();
+                    let xc = xc.clone();
+                    std::thread::spawn(move || work(&xr, &xc, iters))
+                })
+                .collect();
+            let mut tot = 0.0f64;
+            for h in hs {
+                tot += h.join().unwrap();
+            }
+            let par = t0.elapsed().as_secs_f64();
+            eprintln!(
+                "PERF {threads} threads: {:.3} ms/iter/thread, sink {:.6}, scaling {:.2}x",
+                par * 1000.0 / iters as f64,
+                tot,
+                single * threads as f64 / par
+            );
+        }
+    }
+
     // TEMP probe: real linked lib vs scipy at all pipeline sizes.
     #[test]
     fn probe_sizes_vs_scipy() {

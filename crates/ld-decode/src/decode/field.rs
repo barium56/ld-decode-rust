@@ -2568,7 +2568,10 @@ impl Field {
     /// Port of `Field.process` + the NTSC additions from `FieldNTSC.process`.
     pub fn process(&mut self) -> Result<()> {
         let spec = self.spec.clone();
+        let pt = std::env::var_os("LD_PROCTIME").is_some();
+        let t_pt0 = std::time::Instant::now();
         let (linelocs1, linebad, nextfieldoffset) = self.compute_linelocs(&spec);
+        let t_ll = t_pt0.elapsed().as_nanos() as u64;
         if linelocs1.is_empty() {
             self.nextfieldoffset = match nextfieldoffset {
                 Some(v) => Some(v),
@@ -2589,8 +2592,10 @@ impl Field {
             }
         }
 
+        let t_a = std::time::Instant::now();
         self.linebad = self.compute_deriv_error(&self.linelocs1, &self.linebad);
         self.linelocs2 = self.refine_linelocs_hsync(&spec);
+        let t_hsync = t_a.elapsed().as_nanos() as u64;
         if llstages_ok(self.readloc) {
             if let Some(p) = std::env::var_os("LD_DUMP_LLSTAGES") {
                 use std::io::Write;
@@ -2610,16 +2615,22 @@ impl Field {
             return Ok(());
         }
 
+        let t_a = std::time::Instant::now();
         self.linecode = [
             self.decodephillipscode(&spec, 16 + self.lineoffset),
             self.decodephillipscode(&spec, 17 + self.lineoffset),
             self.decodephillipscode(&spec, 18 + self.lineoffset),
         ]
         .to_vec();
+        let t_ph = t_a.elapsed().as_nanos() as u64;
 
         let linelocs2 = self.linelocs2.clone();
+        let t_a = std::time::Instant::now();
         let linelocs3 = self.refine_linelocs_burst(&spec, &linelocs2);
+        let t_burst = t_a.elapsed().as_nanos() as u64;
+        let t_a = std::time::Instant::now();
         let linelocs4 = self.fix_badlines(&spec, &linelocs3, Some(&linelocs2));
+        let t_fix = t_a.elapsed().as_nanos() as u64;
         if self.readloc == 1334631232 {
             if let Some(p) = std::env::var_os("LD_DUMP_LLFINAL") {
                 use std::io::Write;
@@ -2629,13 +2640,28 @@ impl Field {
                 }
             }
         }
+        let t_a = std::time::Instant::now();
         self.burstmedian = self.calc_burstmedian(&spec);
+        let t_bmed = t_a.elapsed().as_nanos() as u64;
 
         // Subcarrier phase offset in degrees, calibrated for correct NTSC
         // burst phase (~147 deg) at the output.
         let fsc_phase_deg = 117.25;
         let shift_samples = (fsc_phase_deg / 360.0) / self.spec.sys_fsc_mhz * self.spec.freq;
         self.linelocs = linelocs4.iter().map(|&v| v - shift_samples).collect();
+
+        if pt {
+            let ms = |n: u64| n as f64 / 1e6;
+            eprintln!(
+                "PROCTIME ll={:.3} hsync={:.3} ph={:.3} burst={:.3} fix={:.3} bmed={:.3} ms",
+                ms(t_ll),
+                ms(t_hsync),
+                ms(t_ph),
+                ms(t_burst),
+                ms(t_fix),
+                ms(t_bmed)
+            );
+        }
 
         Ok(())
     }
