@@ -1495,15 +1495,26 @@ impl Decoder {
             return Ok(FieldOutcome::Done(None, None));
         }
 
-        self.dbg.df_new = t_df0.elapsed().as_nanos() as u64
-            - self.dbg.pf_fold
-            - self.dbg.demod
-            - self.dbg.asm_insert
-            - self.dbg.df_resolve
-            - self.dbg.df_plan
-            - self.dbg.asm_extend
-            - self.dbg.phase2
-            - self.dbg.proc;
+        {
+            // The subtracted counters come from `self.dbg`, which a redo can
+            // re-enter, so this difference can go negative. Saturate: the
+            // wrapping version printed a meaningless 1.8e19 ms in the timing
+            // line (and tripped an overflow panic in checked builds).
+            let mut rest = t_df0.elapsed().as_nanos() as u64;
+            for part in [
+                self.dbg.pf_fold,
+                self.dbg.demod,
+                self.dbg.asm_insert,
+                self.dbg.df_resolve,
+                self.dbg.df_plan,
+                self.dbg.asm_extend,
+                self.dbg.phase2,
+                self.dbg.proc,
+            ] {
+                rest = rest.saturating_sub(part);
+            }
+            self.dbg.df_new = rest;
+        }
         let mut field = Field::new(
             self.spec.clone(),
             self.levels,
