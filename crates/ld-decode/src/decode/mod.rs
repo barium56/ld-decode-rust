@@ -1433,10 +1433,19 @@ impl Decoder {
             enqueue_chan!(6, dst6, parts_efm, i16sz);
             enqueue_chan!(7, dst7, parts_rfhpf, f32sz);
             enqueue_chan!(8, dst8, parts_input, f32sz);
+            // Measured on the side pool (6 threads instead of the global 3):
+            // the scatter itself drops 2.15 -> 1.72 ms, but the extra memory
+            // traffic slows the concurrent prefetch demod enough that the
+            // exposed wait grows 1.21 -> 3.51 ms. Net loss, so it stays on the
+            // global pool.
             all_jobs.into_par_iter().for_each(|job| unsafe {
                 std::ptr::copy_nonoverlapping(job.src, job.dst, job.nbytes);
             });
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
+            // `df_rest` subtracts the assembly stages, so the aggregate must
+            // actually be set: it was left at 0, which silently folded
+            // `asm_extend` into the "unattributed" bucket.
+            self.dbg.asm_ = self.dbg.asm_insert + self.dbg.asm_extend;
             // Stage-2 audio filter is a pure function of the assembled stage-1
             // audio, and its only consumer (`downscale_audio`) sits at the far
             // end of the serial tail. Spawn it now so it overlaps `process`,
