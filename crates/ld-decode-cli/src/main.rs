@@ -76,17 +76,19 @@ struct Args {
     /// Disable analog audio decoding
     #[arg(long, alias = "disable-analogue-audio")]
     disable_analog_audio: bool,
-    /// Number of worker threads for demodulation (default: cores, capped at 8)
+    /// Number of demodulation worker threads (default: 3/4 of the cores). The
+    /// serial tail's parallel sections get a quarter of this; `LD_PF_POOL`
+    /// overrides the split.
     #[arg(long, short = 'j', default_value_t = default_threads())]
     threads: usize,
 }
 
-/// Default worker count: the workload is memory-bandwidth-bound, so more than
-/// 8 threads rarely helps (hyperthreading usually makes it worse); matching
-/// ld-decode's conservative default keeps other machines safe too.
+/// Default demod thread count: three quarters of the logical cores. The demod
+/// pool and the serial tail's data-parallel sections overlap, so the split
+/// between them matters more than the total; 3:1 measured fastest on this box.
 fn default_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
+        .map(|n| (n.get() / 4 * 3).max(2))
         .unwrap_or(4)
 }
 

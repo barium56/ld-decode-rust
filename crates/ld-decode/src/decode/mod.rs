@@ -326,6 +326,12 @@ pub struct Decoder {
     /// dropouts, audio phase 2) join-block behind the long prefetch tasks;
     /// a dedicated pool lets both run concurrently.
     pf_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Small pool for the serial tail's side computations (dropout detection,
+    /// stage-2 audio). These are pure, self-contained jobs whose results are
+    /// only needed a few stages later, so running them here keeps the *global*
+    /// pool free for the tail's own data-parallel sections (the sinc gather),
+    /// which otherwise lose half their threads to the side work.
+    side_pool: Arc<rayon::ThreadPool>,
     /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
     /// slowly-varying scalar — constant for thousands of fields in steady
     /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
@@ -430,12 +436,18 @@ impl Decoder {
                 None => Some(
                     Arc::new(
                         rayon::ThreadPoolBuilder::new()
-                            .num_threads(rayon::current_num_threads())
+                            .num_threads(crate::demod_threads())
                             .build()
                             .expect("failed to build prefetch pool"),
                     ),
                 ),
             },
+            side_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads((crate::demod_threads() / 8).clamp(2, 4))
+                    .build()
+                    .expect("failed to build side pool"),
+            ),
             mtf_hist: VecDeque::from([1.0, 1.0]),
             mtf_pow_memo: Arc::new(Mutex::new(HashMap::new())),
             pending_prefetch: None,
@@ -612,6 +624,7 @@ impl Decoder {
                         true,
                         self.analog_audio_freq,
                         audio_offset,
+                        &self.side_pool,
                     )?;
                     // downscale(final_=true) already encoded the luma into
                     // field.dspicture with the same levels; reuse it instead of

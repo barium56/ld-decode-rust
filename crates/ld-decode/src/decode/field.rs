@@ -1902,6 +1902,7 @@ impl Field {
         final_: bool,
         audio_freq: f64,
         audio_offset: f64,
+        side_pool: &rayon::ThreadPool,
     ) -> Result<Vec<f32>> {
         let sub = std::env::var_os("LD_SUBTIME").is_some();
         let t0 = std::time::Instant::now();
@@ -1969,7 +1970,11 @@ impl Field {
         std::thread::scope(|sc| {
             let dod_handle = if dod {
                 let field_ref: &Field = self;
-                Some(sc.spawn(move || dropouts::detect_dropouts(field_ref)))
+                // Inside the side pool: the detector's own par_chunks then use
+                // the side pool's threads (its `current_num_threads` stride),
+                // instead of stealing the global pool's workers from the sinc
+                // gather running below on this thread.
+                Some(sc.spawn(move || side_pool.install(|| dropouts::detect_dropouts(field_ref))))
             } else {
                 None
             };
@@ -2363,10 +2368,21 @@ impl Field {
         // demodulated data, so the 266 per-line computations run in parallel;
         // the fold below applies them in line order, keeping `rising_sum`,
         // the adjs map and the dump output identical to the serial loop.
-        let per_line: Vec<(Option<bool>, f64)> = (0..266)
-            .into_par_iter()
-            .map(|l| self.compute_line_bursts(linelocs, l, prev_phaseadjust))
-            .collect();
+        // Coarse chunks on purpose: 266 tiny rayon tasks cost more in wakeups
+        // and scheduler traffic than the per-line work itself (measured ~0.5 ms
+        // slower than a straight serial loop). 24 lines per task keeps the pool
+        // busy with a handful of long-enough jobs.
+        const BURST_CHUNK: usize = 24;
+        let mut per_line: Vec<(Option<bool>, f64)> = vec![(None, 0.0); 266];
+        per_line
+            .par_chunks_mut(BURST_CHUNK)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                for (i, slot) in chunk.iter_mut().enumerate() {
+                    let l = ci * BURST_CHUNK + i;
+                    *slot = self.compute_line_bursts(linelocs, l, prev_phaseadjust);
+                }
+            });
         if std::env::var_os("LD_DUMP_CLB").is_some() {
             use std::io::Write;
             let filter = std::env::var("LD_DUMP_CLB_RL").unwrap_or_default();
