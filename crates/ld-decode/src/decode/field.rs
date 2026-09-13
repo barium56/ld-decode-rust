@@ -1819,61 +1819,74 @@ impl Field {
         let outline_offset = (self.lineoffset + 1) * self.outlinelen;
 
         let k = self.spec.wow_interpolation_method.spline_degree();
+        let _subt = std::env::var_os("LD_SUBTIME").is_some();
+        let _ts0 = std::time::Instant::now();
         let (t, c) = make_interp_spline_scaled(&expected_linelocs, &actual_linelocs, k)?;
+        let _t_spline = _ts0.elapsed().as_nanos() as u64;
         let nt = t.len() - k - 1;
 
         let eval_count = outsamples + outline_offset;
 
         // x is strictly increasing (i * outscale), so every knot span is
-        // precomputable in one amortized-O(n) serial pass; the per-point
-        // spline arithmetic is then independent and runs in parallel. Same
-        // arithmetic as the serial loop, bit-for-bit.
-        let xs: Vec<f64> = (0..eval_count).map(|i| i as f64 * outscale).collect();
-        let mut spans = vec![k; eval_count];
+        // precomputable; the per-point spline arithmetic is then independent
+        // and runs in parallel. Same arithmetic as the serial loop,
+        // bit-for-bit: the chunk-start spans are seeded with a sequential
+        // monotone scan (O(nt + chunks) work), then each chunk re-runs exactly
+        // the serial rule starting from its own seed.
+        let chunk = 16384usize;
+        let n_chunks = eval_count.div_ceil(chunk);
+        // Sequential seed pass over the chunk starts: the span rule is
+        // monotone in x and x is increasing, so a single forward scan over the
+        // ~15 chunk starts costs O(nt) and gives each chunk its own starting
+        // span. Each chunk then re-runs the serial rule verbatim, producing
+        // identical spans (and therefore identical spline values).
+        let mut seeds = vec![k; n_chunks];
         {
             let mut span = k;
-            for (sp, &x) in spans.iter_mut().zip(xs.iter()) {
-                if x <= t[k] {
-                    span = k;
-                } else if x >= t[nt] {
-                    span = nt - 1;
-                } else {
-                    while span + 1 < nt && x >= t[span + 1] {
-                        span += 1;
-                    }
-                }
-                *sp = span;
+            for (ci, seed) in seeds.iter_mut().enumerate() {
+                knot_span(&t, k, nt, ((ci * chunk) as f64) * outscale, &mut span);
+                *seed = span;
             }
         }
 
         let mut interpolated_pixel_locs = vec![0.0f64; eval_count];
         let mut wowfactors = vec![0.0f64; eval_count];
+        let _t_spans = _ts0.elapsed().as_nanos() as u64;
         {
-            let chunk = 16384usize;
-            let n_chunks = eval_count.div_ceil(chunk);
             let locs_out: Vec<&mut [f64]> = interpolated_pixel_locs.chunks_mut(chunk).collect();
             let wows_out: Vec<&mut [f64]> = wowfactors.chunks_mut(chunk).collect();
-            let spans_par: Vec<&[usize]> = spans.chunks(chunk).collect();
-            let xs_par: Vec<&[f64]> = xs.chunks(chunk).collect();
             locs_out
                 .into_par_iter()
                 .zip(wows_out)
-                .zip(spans_par)
-                .zip(xs_par)
+                .zip(seeds)
                 .enumerate()
-                .for_each(|(ci, (((locs, wows), sp), xsp))| {
+                .for_each(|(ci, ((locs, wows), seed))| {
                     let lo = ci * chunk;
+                    let mut span = seed;
                     for (k_i, (loc_slot, wow_slot)) in locs.iter_mut().zip(wows.iter_mut()).enumerate() {
-                        let i = lo + k_i;
+                        let x = (lo + k_i) as f64 * outscale;
+                        knot_span(&t, k, nt, x, &mut span);
                         let (loc, wow) = match k {
-                            1 => eval_spline_at::<1>(&t, &c, nt, sp[k_i], xsp[k_i]),
-                            2 => eval_spline_at::<2>(&t, &c, nt, sp[k_i], xsp[k_i]),
-                            _ => eval_spline_at::<3>(&t, &c, nt, sp[k_i], xsp[k_i]),
+                            1 => eval_spline_at::<1>(&t, &c, nt, span, x),
+                            2 => eval_spline_at::<2>(&t, &c, nt, span, x),
+                            _ => eval_spline_at::<3>(&t, &c, nt, span, x),
                         };
                         *loc_slot = loc;
                         *wow_slot = wow;
                     }
                 });
+        }
+
+        if _subt {
+            let t_end = _ts0.elapsed().as_nanos() as u64;
+            eprintln!(
+                "WOWSPLIT spline={:.3} spans={:.3} eval={:.3} n={} threads={}",
+                _t_spline as f64 / 1e6,
+                (_t_spans - _t_spline) as f64 / 1e6,
+                (t_end - _t_spans) as f64 / 1e6,
+                eval_count,
+                rayon::current_num_threads()
+            );
         }
 
         Ok((interpolated_pixel_locs, wowfactors))
@@ -1944,34 +1957,39 @@ impl Field {
             }
         }
         let t1 = std::time::Instant::now();
-        // Dropout detection is a pure function of this field's decoded data,
-        // so run it as a parallel side task while the sinc rescale occupies
-        // the main thread. Result identical to the serial computation.
+        // Dropout detection is a pure function of this field's decoded data, so
+        // it runs on its own OS thread while the sinc rescale uses the whole
+        // rayon pool. `rayon::join` was the earlier shape, but both branches
+        // shared one pool: the detector stole ~2 ms of pool time from the
+        // gather for no wall-time gain (the detector's result isn't needed
+        // until `buildmetadata`, several stages later). One thread spawn per
+        // field is ~40 us — far cheaper than the pool time it frees.
         let dod = self.spec.do_dod && std::env::var_os("LD_NO_DOD_PRE").is_none();
-        let ((), dropouts) = rayon::join(
-            || {
-                scale_field_sinc(
-                    channel_data,
-                    &mut dsout,
-                    &interpolated_pixel_locs,
-                    &wowfactors,
-                    sinc_lut(),
-                    SincScaleParams {
-                        lineoffset: self.lineoffset,
-                        outwidth,
-                        wow_level_adjust_smoothing: self.spec.wow_level_adjust_smoothing,
-                        level_adjust_threshold: 15.0,
-                    },
-                );
-            },
-            || {
-                if dod {
-                    Some(dropouts::detect_dropouts(self))
-                } else {
-                    None
-                }
-            },
-        );
+        let mut dropouts: Option<(Vec<usize>, Vec<usize>, Vec<usize>)> = None;
+        std::thread::scope(|sc| {
+            let dod_handle = if dod {
+                let field_ref: &Field = self;
+                Some(sc.spawn(move || dropouts::detect_dropouts(field_ref)))
+            } else {
+                None
+            };
+            scale_field_sinc(
+                channel_data,
+                &mut dsout,
+                &interpolated_pixel_locs,
+                &wowfactors,
+                sinc_lut(),
+                SincScaleParams {
+                    lineoffset: self.lineoffset,
+                    outwidth,
+                    wow_level_adjust_smoothing: self.spec.wow_level_adjust_smoothing,
+                    level_adjust_threshold: 15.0,
+                },
+            );
+            if let Some(handle) = dod_handle {
+                dropouts = Some(handle.join().expect("dropout detection panicked"));
+            }
+        });
         if dod {
             self.dropouts_cached = dropouts;
         }
@@ -2408,9 +2426,11 @@ impl Field {
 
     /// Port of `refine_linelocs_burst`.
     fn refine_linelocs_burst(&mut self, spec: &DecoderSpec, linelocs: &[f64]) -> Vec<f64> {
+        let _bt = std::time::Instant::now();
         let mut linelocs_adj = linelocs.to_vec();
 
         let (field14, adjs_new) = self.compute_burst_offsets(&linelocs_adj);
+        let _t_cbo = _bt.elapsed().as_nanos() as u64;
 
         for l in 1..266 {
             if !adjs_new.contains_key(&l) {
@@ -2432,6 +2452,7 @@ impl Field {
             }
         }
 
+        let _t_adj1 = _bt.elapsed().as_nanos() as u64;
         if !adjs.is_empty() {
             let mut adj_vals: Vec<f64> = adjs.values().copied().collect();
             // Python: np.median of the adj values; any NaN propagates.
@@ -2467,6 +2488,15 @@ impl Field {
             self.field_phase_id = 1;
         }
 
+        if std::env::var_os("LD_SUBTIME").is_some() {
+            let t_end = _bt.elapsed().as_nanos() as u64;
+            eprintln!(
+                "BURSTSPLIT cbo={:.3} adj1={:.3} apply={:.3} ms",
+                _t_cbo as f64 / 1e6,
+                (_t_adj1 - _t_cbo) as f64 / 1e6,
+                (t_end - _t_adj1) as f64 / 1e6
+            );
+        }
         linelocs_adj
     }
 
@@ -2734,6 +2764,25 @@ fn clb_findbursts(
 // ---------------------------------------------------------------------------
 // Small numeric helpers
 // ---------------------------------------------------------------------------
+
+/// Advance `span` to the knot span containing `x` using the serial rule of
+/// `computewow_scaled`: clamp to the valid range, otherwise walk forward while
+/// `x >= t[span + 1]` (the caller keeps `span` monotonically increasing, so the
+/// walk is amortized O(1) per point). Identical arithmetic to the original
+/// inline loop, so the resulting spans — and every spline value derived from
+/// them — are bit-for-bit the same.
+#[inline]
+fn knot_span(t: &[f64], k: usize, nt: usize, x: f64, span: &mut usize) {
+    if x <= t[k] {
+        *span = k;
+    } else if x >= t[nt] {
+        *span = nt - 1;
+    } else {
+        while *span + 1 < nt && x >= t[*span + 1] {
+            *span += 1;
+        }
+    }
+}
 
 fn diff(values: &[f64]) -> Vec<f64> {
     values.windows(2).map(|w| w[1] - w[0]).collect()

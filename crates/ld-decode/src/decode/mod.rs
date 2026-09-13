@@ -245,6 +245,19 @@ struct DbgTiming {
     df_rest: u64,
     meta_dod: u64,
     meta_vits: u64,
+    /// Window blocks demodulated in this field's own pass (cache misses).
+    missing_blocks: u64,
+    /// Blocks queued into the async prefetch for the next fields.
+    pf_blocks: u64,
+    /// Cumulative demod kernel calls and CPU nanoseconds at this field.
+    demod_calls: u64,
+    demod_cpu_ns: u64,
+    /// Time spent copying the prefetch input blocks out of the window.
+    pf_copy: u64,
+    /// Fine-grained splits of `df_rest`.
+    df_resolve: u64,
+    df_plan: u64,
+    df_new: u64,
 }
 
 /// An in-flight background prefetch demodulation (one per field). The window
@@ -359,6 +372,14 @@ impl Decoder {
                 df_rest: 0,
                 meta_dod: 0,
                 meta_vits: 0,
+                missing_blocks: 0,
+                pf_blocks: 0,
+                demod_calls: 0,
+                demod_cpu_ns: 0,
+                pf_copy: 0,
+                df_resolve: 0,
+                df_plan: 0,
+                df_new: 0,
             },
             levels: CalibLevels::defaults(),
             fdoffset,
@@ -809,8 +830,13 @@ impl Decoder {
             let rest = t_iter_total
                 .saturating_sub(df_total + t_down + t_vits + t_meta + t_out);
             let ms = |n: u64| n as f64 / 1e6;
+            let (dcalls, dns) = crate::decode::demodblock::demod_prof::snapshot();
+            let d_dcalls = dcalls.saturating_sub(self.dbg.demod_calls);
+            let d_dns = dns.saturating_sub(self.dbg.demod_cpu_ns);
+            self.dbg.demod_calls = dcalls;
+            self.dbg.demod_cpu_ns = dns;
             crate::teeprintln!(
-                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2}",
+                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2}",
                 self.fields_written,
                 ms(df_total),
                 ms(dbg.demod),
@@ -830,6 +856,14 @@ impl Decoder {
                 ms(t_out),
                 ms(rest),
                 ms(t_iter_total),
+                self.dbg.missing_blocks,
+                self.dbg.pf_blocks,
+                d_dcalls,
+                d_dns as f64 / 1e6,
+                ms(self.dbg.pf_copy),
+                ms(self.dbg.df_resolve),
+                ms(self.dbg.df_plan),
+                ms(self.dbg.df_new),
             );
         }
 
@@ -1095,6 +1129,7 @@ impl Decoder {
             // the serial tail. Same value, same call sites as before.
             let mtf_pow: OnceLock<Option<Vec<Complex64>>> = OnceLock::new();
             let t_demod0 = std::time::Instant::now();
+            self.dbg.missing_blocks = missing.len() as u64;
             let computed: Vec<BlockDecode> = missing
                 .par_iter()
                 .map(|&(bnum, off)| {
@@ -1119,6 +1154,10 @@ impl Decoder {
             // windows only move forward and redo flushes everything anyway).
             self.prune_cache();
             self.dbg.asm_insert = t_asm0.elapsed().as_nanos() as u64;
+            self.dbg.df_resolve = t_df0.elapsed().as_nanos() as u64
+                - self.dbg.pf_fold
+                - self.dbg.demod
+                - self.dbg.asm_insert;
 
             // Early prefetch spawn: plan + filter against the cache right now
             // (the window blocks above are already inserted, so the plan here
@@ -1137,6 +1176,7 @@ impl Decoder {
                     .into_iter()
                     .filter(|(bnum, _)| !self.demod_cache.contains_key(bnum))
                     .collect();
+                self.dbg.pf_blocks = prefetch.len() as u64;
                 let async_ok = !prefetch.is_empty()
                     && std::env::var_os("LD_NO_ASYNC_PREFETCH").is_none();
                 if async_ok {
@@ -1149,12 +1189,15 @@ impl Decoder {
                     let freq_hz = spec.freq_hz;
                     let spec_arc = Arc::clone(&self.spec);
                     let levels = self.levels;
+                    let t_pfc0 = std::time::Instant::now();
                     let inputs: Vec<(u64, Vec<f32>)> = prefetch
                         .iter()
                         .map(|&(bnum, off)| {
                             (bnum, data[off..off + blocklen].to_vec())
                         })
                         .collect();
+                    self.dbg.pf_copy = t_pfc0.elapsed().as_nanos() as u64;
+                    self.dbg.df_plan = t_pf0.elapsed().as_nanos() as u64;
                     let f_mtf = mtf;
                     let memo = Arc::clone(&self.mtf_pow_memo);
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -1417,6 +1460,15 @@ impl Decoder {
             return Ok(FieldOutcome::Done(None, None));
         }
 
+        self.dbg.df_new = t_df0.elapsed().as_nanos() as u64
+            - self.dbg.pf_fold
+            - self.dbg.demod
+            - self.dbg.asm_insert
+            - self.dbg.df_resolve
+            - self.dbg.df_plan
+            - self.dbg.asm_extend
+            - self.dbg.phase2
+            - self.dbg.proc;
         let mut field = Field::new(
             self.spec.clone(),
             self.levels,

@@ -61,22 +61,30 @@ pub(crate) fn scale_field_sinc(
 ) {
     assert_eq!(sinc_lut.len(), (SINC_PHASE_COUNT + 1) * SINC_TAP_COUNT);
     let level_adjust_threshold = params.level_adjust_threshold;
+    let subt = std::env::var_os("LD_SUBTIME").is_some();
+    let ts0 = std::time::Instant::now();
 
     // Average out unusual per-line spikes in wow: these indicate an hsync TBC
     // error rather than real playback-speed variation, so fall back to the
     // average wow to avoid a bright/dark line.
     let mut wow_copy = wowfactors.to_vec();
+    let _ta = std::time::Instant::now();
     let median = median_f64(&mut wow_copy);
+    let _t_med1 = _ta.elapsed().as_nanos() as u64;
     let mad = {
         let mut diffs: Vec<f64> = wow_copy.iter().map(|&w| (w - median).abs()).collect();
-        median_f64(&mut diffs)
+        let r = median_f64(&mut diffs);
+        r
     };
+    let _t_med2 = _ta.elapsed().as_nanos() as u64;
     let threshold = if mad > 0.0 {
         level_adjust_threshold * mad
     } else {
         0.001 // fallback for no variance
     };
 
+    // Serial on purpose: the work per element is one compare + select, and a
+    // rayon split/wake over ~240k elements costs more than it saves here.
     let mut level_adjusts: Vec<f64> = wowfactors
         .iter()
         .map(|&w| {
@@ -99,6 +107,15 @@ pub(crate) fn scale_field_sinc(
         }
     }
 
+    let t_adjust = ts0.elapsed().as_nanos() as u64;
+    if subt {
+        eprintln!(
+            "SINCPRE med1={:.3} med2={:.3} total={:.3} ms",
+            _t_med1 as f64 / 1e6,
+            (_t_med2 - _t_med1) as f64 / 1e6,
+            t_adjust as f64 / 1e6
+        );
+    }
     let half_taps_m1 = (SINC_TAP_COUNT / 2) - 1;
     let dsout_start = params.outwidth * (params.lineoffset + 1);
 
@@ -106,6 +123,7 @@ pub(crate) fn scale_field_sinc(
     // interpolation is parallelized across chunks of the output (the per
     // sample f32/f64 arithmetic is unchanged, keeping the output bit-identical
     // to the serial loop).
+    let dsout_len = dsout.len();
     let mut dsout = dsout;
     let chunk = 4096usize;
     dsout
@@ -234,6 +252,17 @@ pub(crate) fn scale_field_sinc(
                 out[jj] = (adjust * result) as f32;
             }
         });
+
+    if subt {
+        let t_gather = ts0.elapsed().as_nanos() as u64;
+        eprintln!(
+            "SINCSPLIT adjust={:.3} gather={:.3} n={} threads={}",
+            t_adjust as f64 / 1e6,
+            (t_gather - t_adjust) as f64 / 1e6,
+            dsout_len,
+            rayon::current_num_threads()
+        );
+    }
 }
 
 // ============================================================================

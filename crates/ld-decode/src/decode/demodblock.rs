@@ -226,6 +226,43 @@ pub(crate) fn compute_mtf_pow(mtf: &[Complex64], mtf_level: f64) -> Vec<Complex6
 /// pass (all blocks of a field share the same MTF); `None` skips the MTF
 /// multiply entirely (mtf 0, e.g. the synthetic delay measurement).
 #[allow(clippy::too_many_arguments)]
+/// Cheap always-on profiling counters for the demod kernel: total calls and
+/// total CPU nanoseconds spent inside them. Used by the LD_TIMING breakdown to
+/// tell how much demod work each field actually triggers.
+pub(crate) mod demod_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NANOS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn snapshot() -> (u64, u64) {
+        (
+            CALLS.load(Ordering::Relaxed),
+            NANOS.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) struct DemodProf(std::time::Instant);
+
+impl DemodProf {
+    #[inline]
+    pub(crate) fn start() -> Self {
+        let _ = demod_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DemodProf(std::time::Instant::now())
+    }
+}
+
+impl Drop for DemodProf {
+    #[inline]
+    fn drop(&mut self) {
+        demod_prof::NANOS.fetch_add(
+            self.0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 pub(crate) fn demod_block_cpu(
     data: &[f32],
     mtf_level: f64,
@@ -236,6 +273,7 @@ pub(crate) fn demod_block_cpu(
     block_no: u64,
 ) -> BlockDecode {
     let blocklen = spec.blocklen;
+    let _prof = DemodProf::start();
 
     // Stage-dump harness: every call dumps this block's intermediates and the
     // filters into $LD_DUMP_PIPE as s{n}_{stage}.bin (n = call sequence), so
