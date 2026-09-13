@@ -220,12 +220,34 @@ struct MetadataFieldState {
     outlinecount: usize,
 }
 
-enum FieldOutcome {
+enum AssembleOutcome {
     /// The window does not yet cover the next field; the value is the earliest
     /// absolute sample offset needed.
     NeedData(u64),
-    /// (field, offset to the next decode). Both None means end of input.
-    Done(Option<Field>, Option<f64>),
+    /// The input is exhausted.
+    Eof,
+    /// Window demodulated and assembled; `process()` has not run yet.
+    Field(AssembledField),
+}
+
+/// A field whose window is demodulated and assembled but not processed.
+///
+/// `process()` is the last step of a field's decode and the only one that
+/// consumes the *previous* field's post-`buildmetadata` snapshot (`prevfield`),
+/// so it is kept separable from the assembly: the driver can then run the next
+/// field's assembly while the previous field's tail work is still in flight.
+/// Everything the later accounting and the next-window offset need travels
+/// with the field.
+struct AssembledField {
+    field: Field,
+    /// Where the field's window was read from, for the next-offset arithmetic.
+    readloc: u64,
+    block_begin: u64,
+    /// `start` (f64), kept for the `LD_DBG_ALL` trace.
+    start: f64,
+    /// When the assembly began, so `finish_field` can close the per-field
+    /// timing window across the call boundary.
+    assemble_start: std::time::Instant,
 }
 
 
@@ -565,7 +587,7 @@ impl Decoder {
             } else {
                 (self.fdoffset_abs(), self.prevfield.clone())
             };
-            let outcome = self.decode_field(
+            let outcome = self.assemble_field(
                 data,
                 data_start,
                 final_chunk,
@@ -576,8 +598,12 @@ impl Decoder {
             )?;
 
             let (mut field, offset) = match outcome {
-                FieldOutcome::NeedData(needed) => return Ok((needed, output)),
-                FieldOutcome::Done(f, offset) => (f, offset),
+                AssembleOutcome::NeedData(needed) => return Ok((needed, output)),
+                AssembleOutcome::Eof => (None, None),
+                AssembleOutcome::Field(assembled) => {
+                    let (f, o) = self.finish_field(assembled)?;
+                    (Some(f), o)
+                }
             };
 
             if redo_flag {
@@ -958,7 +984,7 @@ impl Decoder {
 
     /// Demodulate and process one field starting at absolute sample offset
     /// `start`.
-    fn decode_field(
+    fn assemble_field(
         &mut self,
         data: &[f32],
         data_start: u64,
@@ -967,7 +993,7 @@ impl Decoder {
         prevfield: Option<PrevField>,
         redo: bool,
         mtf_level: f64,
-    ) -> Result<FieldOutcome> {
+    ) -> Result<AssembleOutcome> {
         let t_df0 = std::time::Instant::now();
         self.dbg.pf_fold = 0;
         let t_fold0 = std::time::Instant::now();
@@ -1016,7 +1042,7 @@ impl Decoder {
         let prefetch_blocks = (self.bytes_per_field * 4.0 / spec.blocksize as f64) as usize + 4;
         let needed_end = (first_block + numblocks_read + prefetch_blocks) as u64 * blocksize;
         if needed_end > data_start + data.len() as u64 && !final_chunk {
-            return Ok(FieldOutcome::NeedData(block_begin as u64));
+            return Ok(AssembleOutcome::NeedData(block_begin as u64));
         }
 
         let levels = self.levels;
@@ -1087,7 +1113,7 @@ impl Decoder {
             // caller to keep data from `block_begin` on (mirrors the
             // DemodCache being unable to serve the range, which would
             // otherwise stall the decode loop).
-            return Ok(FieldOutcome::NeedData(block_begin));
+            return Ok(AssembleOutcome::NeedData(block_begin));
         }
         if first_in_window as usize + numblocks_read * spec.blocksize > data.len() {
             // True end of input (the requested blocks extend past EOF), like
@@ -1501,7 +1527,7 @@ impl Decoder {
         }
 
         if reached_eof {
-            return Ok(FieldOutcome::Done(None, None));
+            return Ok(AssembleOutcome::Eof);
         }
 
         {
@@ -1524,7 +1550,7 @@ impl Decoder {
             }
             self.dbg.df_new = rest;
         }
-        let mut field = Field::new(
+        let field = Field::new(
             self.spec.clone(),
             self.levels,
             rawdecode,
@@ -1537,12 +1563,33 @@ impl Decoder {
             false,
             mtf_level,
         );
+        Ok(AssembleOutcome::Field(AssembledField {
+            field,
+            readloc,
+            block_begin,
+            start,
+            assemble_start: t_df0,
+        }))
+    }
+
+    /// Run `process()` on an assembled field and finish the per-field timing
+    /// and next-offset arithmetic. Split out of `assemble_field` so a caller
+    /// can overlap the two (see `AssembledField`); the sequence of state
+    /// changes is the same as when both ran back to back.
+    fn finish_field(&mut self, assembled: AssembledField) -> Result<(Field, Option<f64>)> {
+        let AssembledField {
+            mut field,
+            readloc,
+            block_begin,
+            start,
+            assemble_start,
+        } = assembled;
         let t_proc0 = std::time::Instant::now();
         field.process()?;
         self.dbg.proc = t_proc0.elapsed().as_nanos() as u64;
         let t_df_end = std::time::Instant::now();
         self.dbg.df_rest = (t_df_end
-            .duration_since(t_df0)
+            .duration_since(assemble_start)
             .as_nanos() as u64)
             .saturating_sub(
                 self.dbg.demod
@@ -1566,7 +1613,7 @@ impl Decoder {
                 start, field.valid, offset, field.nextfieldoffset, field.linelocs1.first().copied().unwrap_or(-1.0));
         }
 
-        Ok(FieldOutcome::Done(Some(field), offset))
+        Ok((field, offset))
     }
 
     /// The prefetch range for the field at absolute sample `start` (port of
