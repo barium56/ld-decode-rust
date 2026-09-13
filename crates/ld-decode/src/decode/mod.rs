@@ -444,7 +444,13 @@ impl Decoder {
             },
             side_pool: Arc::new(
                 rayon::ThreadPoolBuilder::new()
-                    .num_threads((crate::demod_threads() / 8).clamp(2, 4))
+                    .num_threads(
+                        std::env::var("LD_SIDE_POOL")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .filter(|&n| n > 0)
+                            .unwrap_or_else(|| (crate::demod_threads() / 2).clamp(2, 8)),
+                    )
                     .build()
                     .expect("failed to build side pool"),
             ),
@@ -624,6 +630,7 @@ impl Decoder {
                         true,
                         self.analog_audio_freq,
                         audio_offset,
+                        &self.side_pool,
                         &self.side_pool,
                     )?;
                     // downscale(final_=true) already encoded the luma into
