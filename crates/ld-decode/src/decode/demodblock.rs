@@ -115,29 +115,26 @@ pub(crate) fn unwrap_hilbert(hilbert: &[Complex64], freq_hz: f64) -> Vec<f64> {
         return out;
     }
     let scale = freq_hz / TAU;
-    // Stage 1: conjugate-product components. numba's jitted complex128
-    // multiply uses the plain 4-product formula (no FMA), NOT numpy's SIMD
-    // fmaddsub kernel. Verified bit-for-bit against numba 0.62 complex
-    // multiply on real data.
-    let mut pim = vec![0.0f64; len];
-    let mut pre = vec![0.0f64; len];
+    // Single pass: the conjugate-product components, the UCRT `atan2` and the
+    // wrap/normalise step are all per-index independent, so they are fused.
+    // The previous shape materialised `pre` and `pim` — two f64 arrays per
+    // call — only to consume them once, then walked `out` a second time to
+    // normalise. Arithmetic per element is unchanged:
+    //
+    // numba's jitted complex128 multiply uses the plain 4-product formula
+    // (no FMA), NOT numpy's SIMD fmaddsub kernel, and
+    // `d < 0 ? (d + TAU) * scale : d * scale` is the original
+    // `if d < 0 { d += TAU }; d * scale`. Verified bit-for-bit against numba
+    // 0.62 complex multiply on real data.
     for i in 1..len {
         let z = hilbert[i];
         let w = hilbert[i - 1];
         let (a, bb) = (z.re, z.im);
         let (c, dd) = (w.re, -w.im); // conj(w)
-        pre[i] = a * c - bb * dd;
-        pim[i] = a * dd + bb * c;
-    }
-    // Stage 2: one tight atan2 loop over the slice (same UCRT calls, same
-    // results, but no per-iteration closure state).
-    crate::spec::ucrt_atan2::call_slice(&mut out, &pim, &pre);
-    for i in 1..len {
-        let mut d = out[i];
-        if d < 0.0 {
-            d += TAU;
-        }
-        out[i] = d * scale;
+        let pre = a * c - bb * dd;
+        let pim = a * dd + bb * c;
+        let d = crate::spec::ucrt_atan2::call(pim, pre);
+        out[i] = if d < 0.0 { (d + TAU) * scale } else { d * scale };
     }
     out
 }
@@ -155,7 +152,56 @@ fn cut_block(data: &[f32], spec: &DemodSpecRef) -> Vec<f32> {
     }
 }
 
-fn cut_rfhpf(data: &[f32], spec: &DemodSpecRef, rotdelay: i64) -> Vec<f32> {
+/// The output range one channel keeps: `[blockcut : -blockcut_end]` when the
+/// caller asked for a cut, the whole array otherwise.
+fn kept_range(len: usize, spec: &DemodSpecRef, cut: bool) -> (usize, usize) {
+    if cut {
+        (
+            spec.blockcut.min(len),
+            len.saturating_sub(spec.blockcut_end),
+        )
+    } else {
+        (0, len)
+    }
+}
+
+/// `cut(roll(ifft(x).re as f32))` in a single pass.
+///
+/// `offset` is the `np.roll(..., -offset)` shift and `start..end` the kept
+/// slice. Rolling first and slicing afterwards visits exactly the source
+/// indices `(i + offset) % len`, so gathering them in one go is byte-identical
+/// to the old convert-everything / `rotate_left` / copy-the-middle chain, with
+/// two passes over a 32768-element buffer per channel removed.
+fn rolled_f32_range(data: &[Complex64], offset: usize, start: usize, end: usize) -> Vec<f32> {
+    let len = data.len();
+    if len == 0 || start >= end {
+        return Vec::new();
+    }
+    let off = offset % len;
+    let mut out = Vec::with_capacity(end.min(len) - start);
+    for i in start..end.min(len) {
+        let s = i + off;
+        // `i < len` and `off < len`, so one conditional subtract suffices.
+        let s = if s >= len { s - len } else { s };
+        out.push(data[s].re as f32);
+    }
+    out
+}
+
+/// `cut(demod.astype(f32))` for the raw channel, built at the kept range only.
+fn f32_at_range(demod: &[f64], spec: &DemodSpecRef, cut: bool) -> Vec<f32> {
+    let (start, end) = kept_range(demod.len(), spec, cut);
+    if start >= end {
+        return Vec::new();
+    }
+    demod[start..end].iter().map(|&v| v as f32).collect()
+}
+
+/// `cut_rfhpf`, taken straight off the complex inverse-FFT output: `.re` and
+/// the f32 cast are the same value the old chain (complex -> f64 Vec -> f32
+/// Vec -> cut) produced, with two arrays' worth of traffic removed. The slice
+/// arithmetic is unchanged, including the negative-index stop.
+fn cut_rfhpf(data: &[Complex64], spec: &DemodSpecRef, rotdelay: i64) -> Vec<f32> {
     let len = data.len() as i64;
     let start_raw = spec.blockcut as i64 - rotdelay;
     // Python slice stop = -blockcut_end - rotdelay (negative index).
@@ -169,7 +215,10 @@ fn cut_rfhpf(data: &[f32], spec: &DemodSpecRef, rotdelay: i64) -> Vec<f32> {
     if start >= stop {
         Vec::new()
     } else {
-        data[start as usize..stop as usize].to_vec()
+        data[start as usize..stop as usize]
+            .iter()
+            .map(|v| v.re as f32)
+            .collect()
     }
 }
 
@@ -445,16 +494,15 @@ pub(crate) fn demod_block_cpu(
     }
     st.mark(2);
     let rfhpf_full = ffi_ducc::ifft(&rfhpf_spec);
-    let rfhpf_f64: Vec<f64> = rfhpf_full.iter().map(|v| v.re).collect();
     if let Some(s) = dump {
+        let rfhpf_f64: Vec<f64> = rfhpf_full.iter().map(|v| v.re).collect();
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_rfhpf.bin", s),
             &pipe_f64(&rfhpf_f64),
         );
     }
-    let rfhpf_f32: Vec<f32> = rfhpf_f64.iter().map(|&v| v as f32).collect();
-    let rfhpf = cut_rfhpf(&rfhpf_f32, spec, rotdelay);
+    let rfhpf = cut_rfhpf(&rfhpf_full, spec, rotdelay);
     st.mark(3);
 
     // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
@@ -593,7 +641,7 @@ pub(crate) fn demod_block_cpu(
 
     let mut video = VideoChannels {
         demod: Vec::new(),
-        demod_raw: demod.iter().map(|&v| v as f32).collect(),
+        demod_raw: f32_at_range(&demod, spec, cut),
         demod_05: Vec::new(),
         demod_burst: Vec::new(),
         audio,
@@ -606,11 +654,10 @@ pub(crate) fn demod_block_cpu(
     // holds the filtered spectrum (no per-channel clone of `demod_fft`), and
     // the ifft output is converted straight to f32; identical arithmetic.
     let mut ch_scratch: Vec<Complex64> = Vec::with_capacity(demod_fft.len());
+    let (cstart, cend) = kept_range(demod_fft.len(), spec, cut);
     for (i, filter) in spec.filters.fvideo.iter().enumerate() {
         ch_scratch.clear();
-        for (&s, &f) in demod_fft.iter().zip(filter) {
-            ch_scratch.push(np_cmul(s, f));
-        }
+        ch_scratch.extend(demod_fft.iter().zip(filter).map(|(&s, &f)| np_cmul(s, f)));
         let ifft_res = ffi_ducc::ifft(&ch_scratch);
         if let Some(s) = dump {
             if i < 2 {
@@ -625,17 +672,13 @@ pub(crate) fn demod_block_cpu(
                 );
             }
         }
-        let mut out_f32: Vec<f32> = ifft_res.iter().map(|v| v.re as f32).collect();
         let offset = match i {
             0 => 0usize,
             1 => spec.filters.f05_offset,
             2 => spec.filters.fvideo_burst_offset,
             _ => unreachable!(),
         };
-        if offset > 0 && !out_f32.is_empty() {
-            let n = offset % out_f32.len();
-            out_f32.rotate_left(n);
-        }
+        let out_f32 = rolled_f32_range(&ifft_res, offset, cstart, cend);
         match i {
             0 => video.demod = out_f32,
             1 => video.demod_05 = out_f32,
@@ -644,12 +687,6 @@ pub(crate) fn demod_block_cpu(
         }
     }
     st.mark(12);
-    if cut {
-        video.demod = cut_block(&video.demod, spec);
-        video.demod_raw = cut_block(&video.demod_raw, spec);
-        video.demod_05 = cut_block(&video.demod_05, spec);
-        video.demod_burst = cut_block(&video.demod_burst, spec);
-    }
     BlockDecode { video, rfhpf }
 }
 
