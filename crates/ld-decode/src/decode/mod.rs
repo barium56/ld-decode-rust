@@ -631,7 +631,6 @@ impl Decoder {
                         self.analog_audio_freq,
                         audio_offset,
                         &self.side_pool,
-                        &self.side_pool,
                     )?;
                     // downscale(final_=true) already encoded the luma into
                     // field.dspicture with the same levels; reuse it instead of
