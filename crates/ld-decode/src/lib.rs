@@ -1,6 +1,7 @@
 #![cfg_attr(nightly_portable_simd, feature(portable_simd))]
 
 mod decode;
+mod envflag;
 mod ffi_ducc;
 pub mod logging;
 mod optimized;

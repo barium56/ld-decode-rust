@@ -884,6 +884,22 @@ impl Decoder {
                 ms(self.dbg.df_plan),
                 ms(self.dbg.df_new),
             );
+            if crate::decode::demodblock::demod_prof::enabled() {
+                let d = crate::decode::demodblock::stage_deltas();
+                let mut parts = String::new();
+                for (i, name) in crate::decode::demodblock::demod_prof::STAGE_NAMES
+                    .iter()
+                    .enumerate()
+                {
+                    parts.push_str(&format!("{}={:.2} ", name, d[i] as f64 / 1e6));
+                }
+                crate::teeprintln!(
+                    "DEMODTIME fw={} {}total={:.2}",
+                    self.fields_written,
+                    parts,
+                    d.iter().sum::<u64>() as f64 / 1e6
+                );
+            }
         }
 
         Ok((self.fdoffset, output))

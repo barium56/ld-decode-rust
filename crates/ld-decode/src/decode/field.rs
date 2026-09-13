@@ -2373,16 +2373,33 @@ impl Field {
         // slower than a straight serial loop). 24 lines per task keeps the pool
         // busy with a handful of long-enough jobs.
         const BURST_CHUNK: usize = 24;
+        // Sum of the per-task durations: budgeted against the section's wall
+        // time it says whether this stage is short of threads or just slow.
+        let burst_cpu = std::sync::atomic::AtomicU64::new(0);
+        let burst_t0 = std::time::Instant::now();
         let mut per_line: Vec<(Option<bool>, f64)> = vec![(None, 0.0); 266];
         per_line
             .par_chunks_mut(BURST_CHUNK)
             .enumerate()
             .for_each(|(ci, chunk)| {
+                let c0 = std::time::Instant::now();
                 for (i, slot) in chunk.iter_mut().enumerate() {
                     let l = ci * BURST_CHUNK + i;
                     *slot = self.compute_line_bursts(linelocs, l, prev_phaseadjust);
                 }
+                burst_cpu.fetch_add(
+                    c0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             });
+        if std::env::var_os("LD_SUBTIME").is_some() {
+            eprintln!(
+                "BURSTSPLIT wall={:.3} cpu={:.3} threads={}",
+                burst_t0.elapsed().as_nanos() as f64 / 1e6,
+                burst_cpu.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                rayon::current_num_threads()
+            );
+        }
         if std::env::var_os("LD_DUMP_CLB").is_some() {
             use std::io::Write;
             let filter = std::env::var("LD_DUMP_CLB_RL").unwrap_or_default();

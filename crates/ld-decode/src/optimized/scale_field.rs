@@ -126,10 +126,15 @@ pub(crate) fn scale_field_sinc(
     let dsout_len = dsout.len();
     let mut dsout = dsout;
     let chunk = 4096usize;
+    // Sum of the per-chunk durations. Compared against this section's wall
+    // time it separates "the gather is slow" from "the pool did not give the
+    // gather the threads it asked for" — the two have different fixes.
+    let gather_cpu = std::sync::atomic::AtomicU64::new(0);
     dsout
         .par_chunks_mut(chunk)
         .enumerate()
         .for_each(|(ci, out)| {
+            let c0 = std::time::Instant::now();
             let base = dsout_start + ci * chunk;
             // Fused per-sample: resolve the LUT row pair, blend the 16 weights,
             // gather+accumulate, then move on. No intermediate gather lists —
@@ -251,14 +256,22 @@ pub(crate) fn scale_field_sinc(
                 }
                 out[jj] = (adjust * result) as f32;
             }
+            if subt {
+                gather_cpu.fetch_add(
+                    c0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         });
 
     if subt {
         let t_gather = ts0.elapsed().as_nanos() as u64;
+        let cpu = gather_cpu.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "SINCSPLIT adjust={:.3} gather={:.3} n={} threads={}",
+            "SINCSPLIT adjust={:.3} gather={:.3} gathercpu={:.3} n={} threads={}",
             t_adjust as f64 / 1e6,
             (t_gather - t_adjust) as f64 / 1e6,
+            cpu as f64 / 1e6,
             dsout_len,
             rayon::current_num_threads()
         );

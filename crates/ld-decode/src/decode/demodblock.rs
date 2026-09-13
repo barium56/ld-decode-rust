@@ -235,12 +235,107 @@ pub(crate) mod demod_prof {
     pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static NANOS: AtomicU64 = AtomicU64::new(0);
 
+    /// Stage labels for the `LD_DEMODTIME` breakdown, in `STAGE_NANOS` order.
+    pub(crate) const STAGE_NAMES: [&str; 13] = [
+        "indata_rfft",
+        "rfhpf_cmul",
+        "rfhpf_ifft",
+        "efm_cmul",
+        "efm_ifft",
+        "audio",
+        "video_cmul",
+        "hilbert_ifft",
+        "unwrap",
+        "clip_rfft",
+        "demod_raw",
+        "fvideo",
+        "cut",
+    ];
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static STAGE_NANOS: [AtomicU64; 13] = [
+        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
+    ];
+
+    /// `LD_DEMODTIME`: only then does the kernel pay for the stage timers.
+    pub(crate) fn enabled() -> bool {
+        static ON: crate::envflag::CachedFlag = crate::envflag::CachedFlag::new();
+        ON.get("LD_DEMODTIME")
+    }
+
     pub(crate) fn snapshot() -> (u64, u64) {
         (
             CALLS.load(Ordering::Relaxed),
             NANOS.load(Ordering::Relaxed),
         )
     }
+
+    pub(crate) fn stage_snapshot() -> [u64; 13] {
+        std::array::from_fn(|i| STAGE_NANOS[i].load(Ordering::Relaxed))
+    }
+}
+
+/// Rolling stage timer for the `LD_DEMODTIME` breakdown. One instance is
+/// created per demod block and `mark`ed at each stage boundary; the elapsed
+/// time since the previous mark is charged to the stage that was current.
+/// With the probe off (`on == false`) `mark` is a branch plus a move.
+pub(crate) struct StageT {
+    on: bool,
+    stage: usize,
+    at: std::time::Instant,
+}
+
+impl StageT {
+    #[inline]
+    pub(crate) fn new(stage: usize) -> Self {
+        let on = demod_prof::enabled();
+        StageT {
+            on,
+            stage,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// Charge the time since the last mark to the current stage, then switch.
+    #[inline]
+    pub(crate) fn mark(&mut self, stage: usize) {
+        if self.on {
+            demod_prof::STAGE_NANOS[self.stage].fetch_add(
+                self.at.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.at = std::time::Instant::now();
+        }
+        self.stage = stage;
+    }
+}
+
+impl Drop for StageT {
+    #[inline]
+    fn drop(&mut self) {
+        if self.on {
+            demod_prof::STAGE_NANOS[self.stage].fetch_add(
+                self.at.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Per-field deltas of the stage counters — summed over every worker thread,
+/// so the total is the field's demod **CPU**, not its wall time.
+pub(crate) fn stage_deltas() -> [u64; 13] {
+    use std::sync::Mutex;
+    static PREV: Mutex<[u64; 13]> = Mutex::new([0; 13]);
+    let now = demod_prof::stage_snapshot();
+    let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = [0u64; 13];
+    for i in 0..13 {
+        out[i] = now[i].saturating_sub(prev[i]);
+        prev[i] = now[i];
+    }
+    out
 }
 
 pub(crate) struct DemodProf(std::time::Instant);
@@ -274,11 +369,18 @@ pub(crate) fn demod_block_cpu(
 ) -> BlockDecode {
     let blocklen = spec.blocklen;
     let _prof = DemodProf::start();
+    let mut st = StageT::new(0);
 
     // Stage-dump harness: every call dumps this block's intermediates and the
     // filters into $LD_DUMP_PIPE as s{n}_{stage}.bin (n = call sequence), so
     // blocks can be matched between a Python and a Rust run by content.
-    let pipe_dir = std::env::var_os("LD_DUMP_PIPE").map(|p| p.to_string_lossy().into_owned());
+    // The switch is cached: this probe runs on every block of every field.
+    static DUMP_PIPE: crate::envflag::CachedFlag = crate::envflag::CachedFlag::new();
+    let pipe_dir = if DUMP_PIPE.get("LD_DUMP_PIPE") {
+        std::env::var_os("LD_DUMP_PIPE").map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     static PIPE_SEQ: AtomicUsize = AtomicUsize::new(0);
     // `LD_DUMP_PIPE_BLOCK` restricts the dump to a comma-separated list of block
@@ -332,6 +434,7 @@ pub(crate) fn demod_block_cpu(
     // indata_fft = npfft.fft(data[:blocklen])  -- f64 (the f32 input samples
     // are exact integers, identical to Python's int16-as-float64 input).
     let indata_fft = ffi_ducc::fft_real_full(&data[..blocklen].iter().map(|&v| f64::from(v)).collect::<Vec<f64>>());
+    st.mark(1);
 
     // Dropout-detection RF highpass. Python cuts with `video_rot` during
     // field decode (delays set), and with 0 during the setup fakedecode
@@ -340,6 +443,7 @@ pub(crate) fn demod_block_cpu(
     for (v, &f) in rfhpf_spec.iter_mut().zip(&spec.filters.frfhpf) {
         *v = np_cmul(*v, f);
     }
+    st.mark(2);
     let rfhpf_full = ffi_ducc::ifft(&rfhpf_spec);
     let rfhpf_f64: Vec<f64> = rfhpf_full.iter().map(|v| v.re).collect();
     if let Some(s) = dump {
@@ -351,12 +455,14 @@ pub(crate) fn demod_block_cpu(
     }
     let rfhpf_f32: Vec<f32> = rfhpf_f64.iter().map(|&v| v as f32).collect();
     let rfhpf = cut_rfhpf(&rfhpf_f32, spec, rotdelay);
+    st.mark(3);
 
     // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
     let mut efm_spec = indata_fft.clone();
     for (v, &f) in efm_spec.iter_mut().zip(&spec.filters.fefm) {
         *v = np_cmul(*v, f);
     }
+    st.mark(4);
     let efm_full = ffi_ducc::ifft(&efm_spec);
     if let Some(s) = dump {
         let efm_f64: Vec<f64> = efm_full.iter().map(|v| v.re).collect();
@@ -375,6 +481,7 @@ pub(crate) fn demod_block_cpu(
         let end = efm.len().saturating_sub(spec.blockcut_end);
         efm = efm[start.min(end)..end].to_vec();
     }
+    st.mark(5);
 
     // Analog audio stage 1: per-channel sliced bandpass demod.
     let fdiv = spec.filters.audio_fdiv;
@@ -406,6 +513,7 @@ pub(crate) fn demod_block_cpu(
         };
     }
 
+    st.mark(6);
     // indata_fft_filt = indata_fft * RFVideo  (* MTF**mtf_level when nonzero).
     {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -447,6 +555,7 @@ pub(crate) fn demod_block_cpu(
         }
     }
 
+    st.mark(7);
     let hilbert = ffi_ducc::ifft(&filtered);
     if let Some(s) = dump {
         pipe_write(
@@ -455,6 +564,7 @@ pub(crate) fn demod_block_cpu(
             &pipe_cf(&hilbert),
         );
     }
+    st.mark(8);
     let demod = unwrap_hilbert(&hilbert, spec.freq_hz);
     if let Some(s) = dump {
         pipe_write(
@@ -470,6 +580,7 @@ pub(crate) fn demod_block_cpu(
         .iter()
         .map(|&d| d.clamp(1_500_000.0, freq_hz * 0.75))
         .collect();
+    st.mark(9);
     let demod_fft = ffi_ducc::fft_real_full(&clipped);
     if let Some(s) = dump {
         pipe_write(
@@ -478,6 +589,7 @@ pub(crate) fn demod_block_cpu(
             &pipe_cf(&demod_fft),
         );
     }
+    st.mark(10);
 
     let mut video = VideoChannels {
         demod: Vec::new(),
@@ -487,6 +599,7 @@ pub(crate) fn demod_block_cpu(
         audio,
         efm,
     };
+    st.mark(11);
 
     // The three post-demod filters, each with its own known delay rolled in
     // the time domain, exactly like the reference. A single reusable scratch
@@ -530,6 +643,7 @@ pub(crate) fn demod_block_cpu(
             _ => unreachable!(),
         }
     }
+    st.mark(12);
     if cut {
         video.demod = cut_block(&video.demod, spec);
         video.demod_raw = cut_block(&video.demod_raw, spec);
