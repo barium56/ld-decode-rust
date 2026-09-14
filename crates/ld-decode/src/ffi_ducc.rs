@@ -112,6 +112,71 @@ mod tests {
         }
     }
 
+    // PARITY PROBE (measured, REJECTED): does the c2r path reproduce the
+    // real parts of the c2c backward transform bit-for-bit? No - even on an
+    // exactly Hermitian spectrum the real parts differ (relative ~1e-7, e.g.
+    // c2c 4.82243740404508792e-6 vs c2r 4.82243740410059907e-6 at n=32768),
+    // and the pipeline's spectra are only approximately Hermitian anyway.
+    // The c2r path would halve the six discarded-imaginary iffts in
+    // demodblock (~27% of demod CPU by LD_DEMODTIME) and is therefore
+    // permanently off the table under the bit-parity directive. This test
+    // pins the divergence so the trade-off is never re-derived.
+    #[test]
+    fn irfft_matches_c2c_real_parts() {
+        let n = 32768usize;
+        // Hermitian spectrum built exactly like fft_real_full: forward r2c of
+        // a real signal, then reflect bins 1..n/2 with negated imaginary part.
+        let sig: Vec<f64> = (0..n)
+            .map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5)
+            .collect();
+        let half = rfft(&sig);
+        let herm = {
+            let mut out = Vec::with_capacity(n);
+            out.extend_from_slice(&half);
+            for k in (1..n / 2).rev() {
+                let c = half[k];
+                out.push(Complex64::new(c.re, -c.im));
+            }
+            out
+        };
+        // Pipeline-like spectrum: small asymmetric perturbation, like the
+        // MTF/rounded-filter products in demodblock.
+        let mut nonherm = herm.clone();
+        for (i, v) in nonherm.iter_mut().enumerate() {
+            let s = ((i as f64) * 0.104).sin();
+            v.re *= 1.0 + 1e-9 * s;
+            v.im *= 1.0 + 1.2e-9 * (s + 0.3);
+        }
+        for (name, spec) in [("hermitian", &herm), ("nonherm", &nonherm)] {
+            let c2c = ifft(spec);
+            let c2r = irfft(spec, n);
+            let mut worst = 0u64;
+            let mut worst_idx = 0usize;
+            for i in 0..n {
+                let d = c2c[i].re.to_bits() as i64 - c2r[i].to_bits() as i64;
+                let d = d.unsigned_abs();
+                if d > worst {
+                    worst = d;
+                    worst_idx = i;
+                }
+            }
+            println!(
+                "{name}: exact={} worst_bits={worst} at {worst_idx}",
+                worst == 0
+            );
+            if worst != 0 {
+                println!(
+                    "  c2c[{worst_idx}]={:+.17e} c2r[{worst_idx}]={:+.17e}",
+                    c2c[worst_idx].re, c2r[worst_idx]
+                );
+            }
+            // The whole point of this probe: under bit parity, c2r can never
+            // replace the c2c iffts. Pin the divergence so a future change
+            // that accidentally switches paths fails here.
+            assert!(worst != 0, "{name}: c2r unexpectedly matched c2c");
+        }
+    }
+
     // PERF PROBE: measure plan-cache reuse for the pipeline sizes.
     #[test]
     fn bench_plan_reuse() {

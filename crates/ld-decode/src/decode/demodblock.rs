@@ -488,10 +488,17 @@ pub(crate) fn demod_block_cpu(
     // Dropout-detection RF highpass. Python cuts with `video_rot` during
     // field decode (delays set), and with 0 during the setup fakedecode
     // (delays not yet computed) — the caller passes the matching value.
-    let mut rfhpf_spec = indata_fft.clone();
-    for (v, &f) in rfhpf_spec.iter_mut().zip(&spec.filters.frfhpf) {
-        *v = np_cmul(*v, f);
-    }
+    // The product is built directly into a fresh buffer instead of a
+    // clone-then-overwrite pass; per element the arithmetic is the same
+    // np_cmul, so the spectrum is bit-identical and one full-buffer read
+    // plus one write per block is gone.
+    let mut rfhpf_spec: Vec<Complex64> = Vec::with_capacity(blocklen);
+    rfhpf_spec.extend(
+        indata_fft
+            .iter()
+            .zip(&spec.filters.frfhpf)
+            .map(|(&v, &f)| np_cmul(v, f)),
+    );
     st.mark(2);
     let rfhpf_full = ffi_ducc::ifft(&rfhpf_spec);
     if let Some(s) = dump {
@@ -506,10 +513,14 @@ pub(crate) fn demod_block_cpu(
     st.mark(3);
 
     // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
-    let mut efm_spec = indata_fft.clone();
-    for (v, &f) in efm_spec.iter_mut().zip(&spec.filters.fefm) {
-        *v = np_cmul(*v, f);
-    }
+    // Same direct-build as rfhpf_spec above (no clone-then-overwrite pass).
+    let mut efm_spec: Vec<Complex64> = Vec::with_capacity(blocklen);
+    efm_spec.extend(
+        indata_fft
+            .iter()
+            .zip(&spec.filters.fefm)
+            .map(|(&v, &f)| np_cmul(v, f)),
+    );
     st.mark(4);
     let efm_full = ffi_ducc::ifft(&efm_spec);
     if let Some(s) = dump {
@@ -538,15 +549,15 @@ pub(crate) fn demod_block_cpu(
         let af = &spec.filters.audio[ch];
         // fft_do_slice(indata_fft)
         let nbins_half = af.nbins / 2;
-        let mut sliced: Vec<Complex64> = indata_fft[af.lowbin..af.lowbin + nbins_half]
+        // Slice-and-multiply fused: the previous shape materialised the slice
+        // copy only to overwrite every element with the filt1 product. The
+        // per-element arithmetic (np_cmul) and the slice order are unchanged.
+        let sliced: Vec<Complex64> = indata_fft[af.lowbin..af.lowbin + nbins_half]
             .iter()
             .chain(&indata_fft[blocklen - af.lowbin - nbins_half..blocklen - af.lowbin])
-            .cloned()
+            .zip(&af.filt1)
+            .map(|(&v, &f)| np_cmul(v, f))
             .collect();
-        // a1 = ifft(sliced * filt1)
-        for (v, &f) in sliced.iter_mut().zip(&af.filt1) {
-            *v = np_cmul(*v, f);
-        }
         let a1 = ffi_ducc::ifft(&sliced);
         // a1u = unwrap_hilbert(a1, a1_freq) + low_freq
         let a1u = unwrap_hilbert(&a1, af.a1_freq);
