@@ -32,7 +32,8 @@ use writer::DecodeWriter;
 struct Args {
     /// Source file (.lds, .s16, .r16, .rf, .r30)
     infile: String,
-    /// Base name for the output .tbc and .tbc.json files
+    /// Base name for the output .tbc and .tbc.json files; "-" streams the
+    /// .tbc picture to stdout (sidecar outputs are then disabled)
     outfile: String,
     /// Input sample rate in MHz
     #[arg(long, default_value_t = 40.0)]
@@ -122,21 +123,34 @@ fn main() -> Result<()> {
     // ld-decode). Opened before the tracing subscriber so every line of the
     // run lands in the file; a failure only disables file logging.
     let outfile = args.outfile.clone();
-    if let Err(e) = ld_decode::logging::install(std::path::Path::new(&format!("{outfile}.log"))) {
-        eprintln!("WARN: cannot create log file {outfile}.log: {e:#}");
+    // `-` means the picture goes to stdout: no `<outfile>.*` sidecars exist
+    // then, and the console log has to go to stderr so it cannot interleave
+    // with the binary picture bytes on stdout.
+    let to_stdout = outfile == "-";
+    if !to_stdout {
+        if let Err(e) = ld_decode::logging::install(std::path::Path::new(&format!("{outfile}.log"))) {
+            eprintln!("WARN: cannot create log file {outfile}.log: {e:#}");
+        }
     }
 
-    tracing_subscriber::fmt()
+    let fmt = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_target(false)
-        .with_writer(tracing_subscriber::fmt::writer::Tee::new(
+        .with_target(false);
+    if to_stdout {
+        fmt.with_writer(std::io::stderr).init();
+        ld_decode::teeprintln!(
+            "NOTE: outfile is \"-\": streaming the .tbc picture to stdout; .tbc.json/.pcm/.efm/.tbc.db and .log are disabled"
+        );
+    } else {
+        fmt.with_writer(tracing_subscriber::fmt::writer::Tee::new(
             std::io::stdout,
             LogFileWriter,
         ))
         .init();
+    }
 
     let mut request = DecodeRequest::default();
     request.inputfreq = args.inputfreq;
@@ -172,19 +186,31 @@ fn main() -> Result<()> {
     let mut reader = DecodeReader::new(source);
 
     let outfile = args.outfile.clone();
-    let luma = File::create(format!("{outfile}.tbc"))
-        .with_context(|| format!("creating {outfile}.tbc"))?;
+    let luma: Box<dyn std::io::Write + Send> = if to_stdout {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(
+            File::create(format!("{outfile}.tbc"))
+                .with_context(|| format!("creating {outfile}.tbc"))?,
+        )
+    };
     // Opened read+write: `File::create` alone is write-only on Windows, and
     // the writer re-reads the fields array at close time to prepend the JSON
     // header (os error 5 otherwise).
-    let json = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{outfile}.tbc.json"))
-        .with_context(|| format!("creating {outfile}.tbc.json"))?;
-    let audio = if args.disable_analog_audio {
+    let json = if to_stdout {
+        None
+    } else {
+        Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(format!("{outfile}.tbc.json"))
+                .with_context(|| format!("creating {outfile}.tbc.json"))?,
+        )
+    };
+    let audio = if args.disable_analog_audio || to_stdout {
         None
     } else {
         Some(
@@ -192,7 +218,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("creating {outfile}.pcm"))?,
         )
     };
-    let efm = if args.no_efm {
+    let efm = if args.no_efm || to_stdout {
         None
     } else {
         Some(
@@ -205,7 +231,13 @@ fn main() -> Result<()> {
     });
     // SQLite metadata sidecar, created fresh every run (like the reference,
     // which unlinks any pre-existing `<out>.tbc.db`).
-    let db = async_db::AsyncDbWriter::create(std::path::Path::new(&format!("{outfile}.tbc.db")))?;
+    let db = if to_stdout {
+        None
+    } else {
+        Some(async_db::AsyncDbWriter::create(std::path::Path::new(
+            &format!("{outfile}.tbc.db"),
+        ))?)
+    };
     // The writer's per-field file writes run on a dedicated thread (FIFO, so
     // the byte stream is identical to the inline loop) and overlap the decode
     // serial tail instead of extending it.
@@ -214,8 +246,8 @@ fn main() -> Result<()> {
         audio,
         efm,
         pre_efm,
-        Some(json),
-        Some(db),
+        json,
+        db,
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);

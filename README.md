@@ -60,6 +60,22 @@ ld-decode.exe [OPTIONS] <INFILE> <OUTFILE>
 (`out` produces `out.tbc`, `out.tbc.json`, `out.pcm`, `out.efm`, `out.tbc.db`
 and `out.log`).
 
+`OUTFILE` may also be `-`, which streams the `.tbc` picture to stdout as raw
+little-endian `uint16` and disables every sidecar output (the JSON header
+rewrite needs a seekable file, and the log would otherwise interleave with the
+picture bytes — in this mode the console log goes to stderr instead):
+
+```bash
+# pipe the picture straight into something else
+ld-decode.exe -j 12 "capture.s16" - > out.tbc
+ld-decode.exe -j 12 "capture.s16" - | ffmpeg -f rawvideo ...
+```
+
+The bytes are identical to what a normal run writes, so `out.tbc` above is the
+same file the `out` form would have produced. If the reader at the other end
+closes the pipe early the decode stops immediately with an error instead of
+decoding the rest of the disc into a broken pipe (same for a filled disk).
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-s`, `--start <n>` | `0` | Rough jump to **frame** `n` of the capture (2 fields per frame). |
@@ -78,7 +94,8 @@ and `out.log`).
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
 
-The output prefix doubles as the log path, so each run writes `<outfile>.log`.
+The output prefix doubles as the log path, so each run writes `<outfile>.log`
+(unless `OUTFILE` is `-`, see above).
 
 ## Input formats
 
@@ -116,6 +133,20 @@ ld-decode.exe -j 12 "capture.s16" rust_full
 b3sum rust_full.tbc rust_full.pcm rust_full.efm rust_full.tbc.json
 # compare against the hashes recorded for the Python run of the same input
 ```
+
+For a change that cannot touch long-run state there is a much cheaper gate than
+a full decode: a from-0 partial run is a **byte-exact prefix** of the Python
+full-run artifacts. Decode `-l 500` (1000 fields, ~480 MB) and compare the
+prefix without hashing 80 GB:
+
+```bash
+ld-decode.exe -j 12 -l 500 "capture.s16" head500
+for x in tbc pcm efm; do
+  cmp -n "$(stat -c%s head500.$x)" head500.$x "_stock_s16_full_7.3.0/capture.$x"
+done
+```
+
+A from-0 `-l` run matches; a `-s` (windowed) run does not, for the reasons below.
 
 Notes that matter when comparing runs:
 

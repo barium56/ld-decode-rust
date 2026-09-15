@@ -89,6 +89,18 @@ jobs:
           done
           grep -q '"fields":\[\]' smoke/out.tbc.json
           grep -q "Decode finished" smoke/out.log
+
+          # `-` streams the picture to stdout: the bytes must match the file
+          # writer's exactly, no sidecar files may appear, and the console log
+          # must move to stderr.
+          "$BIN" -j 4 -l 4 smoke/zeros.s16 - > smoke/pipe.tbc 2> smoke/pipe.err
+          cmp smoke/out.tbc smoke/pipe.tbc
+          if compgen -G "smoke/-.*" > /dev/null; then
+            echo "Pipe mode created sidecar files:"
+            compgen -G "smoke/-.*"
+            exit 1
+          fi
+          grep -q "streaming the .tbc picture to stdout" smoke/pipe.err
           echo "Smoke test outputs:"
           ls -la smoke
 

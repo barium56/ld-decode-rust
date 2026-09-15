@@ -25,7 +25,11 @@ const REFERENCE_VERSION: &str = "release:7.3.0";
 const FIELDS_OPEN: &[u8] = b"{\"fields\":[";
 
 pub struct DecodeWriter {
-    outfile_video: BufWriter<File>,
+    /// The picture stream. Boxed so the CLI can point it at stdout (`outfile
+    /// == "-"`) instead of a `.tbc` file without a second code path; every
+    /// other output is a real file (a pipe cannot carry the json header
+    /// rewrite, which needs seek).
+    outfile_video: BufWriter<Box<dyn Write + Send>>,
     outfile_audio: Option<BufWriter<File>>,
     outfile_efm: Option<BufWriter<File>>,
     /// Debug dump of the EFM samples fed to the PLL (mirrors ld-decode's
@@ -86,7 +90,7 @@ struct TbcMetadata {
 
 impl DecodeWriter {
     pub fn new(
-        luma: File,
+        luma: Box<dyn Write + Send>,
         audio: Option<File>,
         efm: Option<File>,
         pre_efm: Option<File>,

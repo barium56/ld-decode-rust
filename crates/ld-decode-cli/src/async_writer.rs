@@ -8,6 +8,7 @@
 //! `close` carries it and `finish` reports errors that happened on the thread.
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
@@ -24,6 +25,9 @@ enum Cmd {
 pub struct AsyncDecodeWriter {
     tx: Option<SyncSender<Cmd>>,
     handle: Option<JoinHandle<()>>,
+    /// Fatal write error from the writer thread (broken pipe, full disk).
+    /// Reported by `close` in place of the resulting channel disconnect.
+    err: Arc<Mutex<Option<String>>>,
 }
 
 impl AsyncDecodeWriter {
@@ -33,6 +37,8 @@ impl AsyncDecodeWriter {
         // decode ever outruns disk for a sustained stretch.
         const BOUND: usize = 4;
         let (tx, rx): (SyncSender<Cmd>, Receiver<Cmd>) = sync_channel(BOUND);
+        let err = Arc::new(Mutex::new(None::<String>));
+        let err_thread = Arc::clone(&err);
         let handle = std::thread::Builder::new()
             .name("writer".into())
             .stack_size(4 * 1024 * 1024)
@@ -41,7 +47,13 @@ impl AsyncDecodeWriter {
                     match cmd {
                         Cmd::Write(field, metadata) => {
                             if let Err(e) = writer.write_writeable(&field, metadata.as_ref()) {
+                                // Stop consuming: whatever broke the output
+                                // (closed pipe, full disk) will break every
+                                // later field too, so let the decode abort
+                                // instead of running on with no output.
                                 tracing::error!("writer thread: {e:#}");
+                                *err_thread.lock().unwrap() = Some(format!("{e:#}"));
+                                break;
                             }
                         }
                         Cmd::Close(metadata) => {
@@ -58,6 +70,7 @@ impl AsyncDecodeWriter {
         Self {
             tx: Some(tx),
             handle: Some(handle),
+            err,
         }
     }
 
@@ -75,6 +88,11 @@ impl AsyncDecodeWriter {
             .expect("writer thread already joined")
             .send(Cmd::Write(Box::new(field), metadata.cloned()));
         if let Err(e) = owned {
+            // Prefer the writer's own error (broken pipe, disk full) over the
+            // channel disconnect it caused.
+            if let Some(msg) = self.err.lock().unwrap().clone() {
+                anyhow::bail!("writer: {msg}");
+            }
             anyhow::bail!("writer thread gone: {e}");
         }
         Ok(())
@@ -84,6 +102,11 @@ impl AsyncDecodeWriter {
     pub fn close(&mut self, metadata: Option<DecoderMetadata>) -> Result<()> {
         if let Some(tx) = self.tx.take() {
             if let Err(e) = tx.send(Cmd::Close(metadata)) {
+                // The thread stopped on its own (a write error leaves the
+                // loop): surface that error, not the channel disconnect.
+                if let Some(msg) = self.err.lock().unwrap().clone() {
+                    anyhow::bail!("writer: {msg}");
+                }
                 anyhow::bail!("writer thread gone: {e}");
             }
         }
