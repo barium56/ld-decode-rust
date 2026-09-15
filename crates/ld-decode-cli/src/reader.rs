@@ -69,18 +69,121 @@ pub fn open_source(path: &str, file: File, format: SampleFormat) -> Result<Box<d
             let s = unpack_r30_group(b);
             out[..3].copy_from_slice(&s);
         })),
-        SampleFormat::Ldf => Box::new(LdfSource::open(path, file)?),
-        SampleFormat::Flac => {
-            // Try ffmpeg first (C-speed decode, exact s16 semantics like the
-            // Python reference); fall back to in-process claxon.
-            if std::env::var_os("LD_NO_FFMPEG").is_none() {
-                if let Ok(src) = FfmpegFlacSource::spawn(path, 0) {
-                    return Ok(Box::new(src));
-                }
-            }
-            Box::new(RawFlacSource::open(path, file)?)
-        }
+        SampleFormat::Ldf => open_ldf(path, file)?,
+        SampleFormat::Flac => open_raw_flac(path, file, 0)?,
     })
+}
+
+/// Container of a FLAC capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Container {
+    /// FLAC carried in an Ogg stream (`OggS` page header).
+    Ogg,
+    /// Bare FLAC bitstream (`fLaC` marker).
+    Flac,
+}
+
+/// Bytes scanned for a container magic when the file does not start with one.
+/// The Python reference reads `.ldf`/`.flac` through PyAV, which probes rather
+/// than trusting offset 0, so a leading tag/header is transparent there.
+const PROBE_WINDOW: usize = 64 * 1024;
+
+/// First `OggS` or `fLaC` magic in `buf`, as `(container, byte offset)`.
+fn find_container(buf: &[u8]) -> Option<(Container, usize)> {
+    let find = |magic: &[u8]| buf.windows(magic.len()).position(|w| w == magic);
+    match (find(b"OggS"), find(b"fLaC")) {
+        (Some(o), Some(f)) if o <= f => Some((Container::Ogg, o)),
+        (Some(_), Some(f)) => Some((Container::Flac, f)),
+        (Some(o), None) => Some((Container::Ogg, o)),
+        (None, Some(f)) => Some((Container::Flac, f)),
+        (None, None) => None,
+    }
+}
+
+/// Read as much of `file` as fits in `buf`, tolerating short reads.
+fn read_fully(file: &mut File, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("probing input container"),
+        }
+    }
+    Ok(filled)
+}
+
+/// Describe what a file that holds neither container actually looks like.
+fn unrecognised(path: &str, head: &[u8], size: u64) -> String {
+    let hex = head
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hint = match head {
+        [0x1f, 0x8b, ..] => " (looks gzip-compressed)",
+        [0x50, 0x4b, ..] => " (looks like a zip archive)",
+        [b'I', b'D', b'3', ..] => " (ID3 tag but no FLAC stream behind it)",
+        [b'R', b'I', b'F', b'F', ..] => " (looks like a RIFF/WAV file)",
+        _ => "",
+    };
+    let detail = if head.is_empty() {
+        "file is empty (0 bytes)".to_string()
+    } else {
+        format!("file is {size} bytes, starts with: {hex}")
+    };
+    format!(
+        "{path}: no FLAC capture found in the first {PROBE_WINDOW} bytes{hint}\n  \
+         {detail}\n  .ldf inputs must be FLAC -- Ogg-wrapped (as the Domesday \
+         Duplicator writes them) or a bare FLAC stream"
+    )
+}
+
+/// `.ldf` input. The documented container is FLAC-in-Ogg (`LdfSource`), but the
+/// Python reference decodes `.ldf` through PyAV, which detects the container
+/// itself: a `.ldf` holding a bare FLAC stream (capture tools that skip the Ogg
+/// wrapper, files re-encoded later) must decode here too. Assuming `OggS` at
+/// offset 0 failed those files with "No Ogg capture pattern found".
+fn open_ldf(path: &str, mut file: File) -> Result<Box<dyn SampleSource>> {
+    let mut head = vec![0u8; PROBE_WINDOW];
+    let n = read_fully(&mut file, &mut head)?;
+    head.truncate(n);
+    let (container, offset) = match find_container(&head) {
+        Some(found) => found,
+        None => {
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let shown = &head[..head.len().min(16)];
+            bail!("{}", unrecognised(path, shown, size));
+        }
+    };
+    let offset = offset as u64;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking {path}"))?;
+    match container {
+        Container::Ogg => Ok(Box::new(LdfSource::open(path, file, offset)?)),
+        // Bare FLAC follows the `.flac` route (ffmpeg first, claxon fallback),
+        // but ffmpeg only probes the stream from offset 0 -- a shifted marker
+        // goes straight to claxon positioned on it.
+        Container::Flac if offset == 0 => open_raw_flac(path, file, 0),
+        Container::Flac => Ok(Box::new(RawFlacSource::open(path, file, offset)?)),
+    }
+}
+
+/// Open a bare-FLAC capture: ffmpeg child first (C-speed decode, s16 semantics
+/// identical to the Python reference's PyAV resampler), claxon fallback at
+/// `offset` when ffmpeg is unavailable or cannot probe the stream.
+fn open_raw_flac(path: &str, mut file: File, offset: u64) -> Result<Box<dyn SampleSource>> {
+    if offset == 0 && std::env::var_os("LD_NO_FFMPEG").is_none() {
+        if let Ok(src) = FfmpegFlacSource::spawn(path, 0) {
+            return Ok(Box::new(src));
+        }
+    }
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seeking {path}"))?;
+    }
+    Ok(Box::new(RawFlacSource::open(path, file, offset)?))
 }
 
 /// Streams input as raw `f32` samples and seeks by sample index.
@@ -328,6 +431,9 @@ impl DecodeReader {
 /// packet payloads to claxon as a plain byte stream.
 struct LdfSource {
     path: String,
+    /// Byte offset of the first Ogg page, from the container sniff (0 for the
+    /// ordinary case; non-zero when the file has a leading tag/header).
+    offset: u64,
     flac: FlacReader<PacketStream>,
     block: Vec<i32>,
     block_pos: usize,
@@ -344,13 +450,16 @@ struct PacketStream {
 }
 
 impl PacketStream {
-    fn new(file: File) -> Self {
-        Self {
+    fn new(mut file: File, offset: u64) -> std::io::Result<Self> {
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))?;
+        }
+        Ok(Self {
             ogg: ogg::PacketReader::new(BufReader::new(file)),
             current: Vec::new(),
             pos: 0,
             skip: 9,
-        }
+        })
     }
 }
 
@@ -391,11 +500,12 @@ impl Read for PacketStream {
 }
 
 impl LdfSource {
-    fn open(path: &str, file: File) -> Result<Self> {
-        let flac = FlacReader::new(PacketStream::new(file))
+    fn open(path: &str, file: File, offset: u64) -> Result<Self> {
+        let flac = FlacReader::new(PacketStream::new(file, offset)?)
             .context("opening .ldf FLAC stream")?;
         Ok(Self {
             path: path.to_string(),
+            offset,
             flac,
             block: Vec::new(),
             block_pos: 0,
@@ -422,16 +532,24 @@ impl LdfSource {
 /// sample values).
 struct RawFlacSource {
     path: String,
+    /// Byte offset of the FLAC marker, from the container sniff (0 for ordinary
+    /// `.flac` files; non-zero for a `.ldf` holding a shifted FLAC stream).
+    offset: u64,
     flac: FlacReader<BufReader<File>>,
     block: Vec<i32>,
     block_pos: usize,
 }
 
 impl RawFlacSource {
-    fn open(path: &str, file: File) -> Result<Self> {
+    fn open(path: &str, mut file: File, offset: u64) -> Result<Self> {
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("seeking {path}"))?;
+        }
         let flac = FlacReader::new(BufReader::new(file)).context("opening .flac FLAC stream")?;
         Ok(Self {
             path: path.to_string(),
+            offset,
             flac,
             block: Vec::new(),
             block_pos: 0,
@@ -620,8 +738,11 @@ impl SampleSource for RawFlacSource {
             ld_decode::teeprintln!("FLAC SEEK to {sample}");
         }
         let sample = flac_pyseek(sample);
-        let file = File::open(&self.path)
+        let mut file = File::open(&self.path)
             .with_context(|| format!("reopening {} for seek", self.path))?;
+        if self.offset > 0 {
+            file.seek(SeekFrom::Start(self.offset))?;
+        }
         self.flac = FlacReader::new(BufReader::new(file))
             .context("reopening .flac FLAC stream")?;
         self.block.clear();
@@ -695,7 +816,7 @@ impl SampleSource for LdfSource {
         // reference does the same for small seeks).
         let file = File::open(&self.path)
             .with_context(|| format!("reopening {} for seek", self.path))?;
-        self.flac = FlacReader::new(PacketStream::new(file))
+        self.flac = FlacReader::new(PacketStream::new(file, self.offset)?)
             .context("reopening .ldf FLAC stream")?;
         self.block.clear();
         self.block_pos = 0;
@@ -714,6 +835,49 @@ impl SampleSource for LdfSource {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_container_detects_magic_at_offset_zero() {
+        assert_eq!(find_container(b"OggS\x00\x02\0\0"), Some((Container::Ogg, 0)));
+        assert_eq!(
+            find_container(b"fLaC\x00\x00\x00\x22"),
+            Some((Container::Flac, 0))
+        );
+    }
+
+    #[test]
+    fn find_container_tolerates_a_leading_tag() {
+        let mut ogg = b"junk".to_vec();
+        ogg.extend_from_slice(b"OggS");
+        assert_eq!(find_container(&ogg), Some((Container::Ogg, 4)));
+
+        let mut flac = b"ID3\x04\x00\x00".to_vec();
+        flac.extend_from_slice(&[0u8; 64]);
+        flac.extend_from_slice(b"fLaC");
+        assert_eq!(find_container(&flac), Some((Container::Flac, 70)));
+    }
+
+    #[test]
+    fn find_container_reports_nothing_for_other_data() {
+        assert_eq!(find_container(b""), None);
+        assert_eq!(find_container(&[0u8; 4096]), None);
+        // Raw s16 RF samples: neither container.
+        assert_eq!(find_container(&[0x11, 0x22, 0x33, 0x44, 0x55]), None);
+    }
+
+    #[test]
+    fn unrecognised_names_the_container_it_sees() {
+        let gz = unrecognised("x.ldf", &[0x1f, 0x8b, 0x08, 0x00], 1234);
+        assert!(gz.contains("gzip"), "{gz}");
+        assert!(gz.contains("1f 8b 08 00"), "{gz}");
+        assert!(gz.contains("1234"), "{gz}");
+        assert!(unrecognised("x.ldf", &[], 0).contains("empty"));
+    }
+}
 
 /// No-op source used only for Send assertions in tests/prefetch wiring.
 pub struct NullSource;

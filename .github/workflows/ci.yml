@@ -90,6 +90,38 @@ jobs:
           grep -q '"fields":\[\]' smoke/out.tbc.json
           grep -q "Decode finished" smoke/out.log
 
+          # Container sniffing for `.ldf`. The extension normally carries
+          # Ogg-wrapped FLAC (what the Domesday Duplicator writes), but the
+          # Python reference decodes these inputs with PyAV, which detects the
+          # container itself -- so a bare FLAC stream under `.ldf` has to decode
+          # too, instead of failing with "No Ogg capture pattern found".
+          # (ffmpeg is the same decoder the `.flac` path spawns.)
+          ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i smoke/zeros.s16 \
+            -c:a flac -f flac smoke/zeros.ldf
+          cp smoke/zeros.ldf smoke/zeros.flac
+          "$BIN" -j 4 -l 4 smoke/zeros.ldf smoke/ldf
+          "$BIN" -j 4 -l 4 smoke/zeros.flac smoke/flac
+          cmp smoke/flac.tbc smoke/ldf.tbc
+
+          # Ogg-wrapped FLAC must still take the Ogg path.
+          ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i smoke/zeros.s16 \
+            -c:a flac -compression_level 6 -f ogg smoke/ogg.ldf
+          "$BIN" -j 4 -l 4 smoke/ogg.ldf smoke/ogg
+          for ext in tbc pcm efm tbc.json tbc.db log; do
+            if [ ! -f "smoke/ogg.$ext" ]; then
+              echo "Missing output: smoke/ogg.$ext"
+              exit 1
+            fi
+          done
+
+          # A file that is not FLAC at all fails on the sniffing message.
+          head -c 100000 /dev/urandom > smoke/junk.ldf
+          if "$BIN" -j 4 -l 4 smoke/junk.ldf smoke/junk > /dev/null 2> smoke/junk.err; then
+            echo "junk.ldf unexpectedly decoded"
+            exit 1
+          fi
+          grep -q "no FLAC capture found" smoke/junk.err
+
           # `-` streams the picture to stdout: the bytes must match the file
           # writer's exactly, no sidecar files may appear, and the console log
           # must move to stderr.

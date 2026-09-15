@@ -109,7 +109,7 @@ explicit format flag.
 | `.rf` | Raw 32-bit float samples. |
 | `.lds` | Packed 10-bit DdD format (4 samples in 5 bytes). |
 | `.r30` | Packed 10-bit legacy format (3 samples in 4 bytes). |
-| `.ldf` | Ogg-FLAC capture, decoded in-process (claxon). Seeking restarts the decoder, as in Python. |
+| `.ldf` | FLAC capture. The container is sniffed, like PyAV does for the Python reference: Ogg-wrapped FLAC (what the Domesday Duplicator writes) is decoded in-process by claxon with seeking restarting the decoder, while a bare FLAC stream is handled exactly like `.flac`. Trailing tags or a stray capture header before the magic are tolerated. |
 | `.flac`, `.ddd.flac` | Raw (non-Ogg) FLAC capture, decoded by an `ffmpeg` subprocess; set `LD_NO_FFMPEG=1` to fall back to the in-process decoder. |
 
 ## Output files
