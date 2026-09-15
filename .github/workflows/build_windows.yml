@@ -16,7 +16,7 @@ on:
         description: "Rust toolchain to build with"
         required: false
         type: string
-        default: "nightly-2026-08-28"
+        default: "nightly-2026-08-29"
 
 permissions:
   contents: read

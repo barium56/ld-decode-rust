@@ -40,7 +40,7 @@ jobs:
           # Pinned to the nightly this port is developed and verified with.
           # Several tests assert bit-level agreement with scipy 1.18.0
           # references, and codegen drift between nightlies moves them.
-          toolchain: nightly-2026-08-28
+          toolchain: nightly-2026-08-29
 
       - name: Build release
         shell: bash

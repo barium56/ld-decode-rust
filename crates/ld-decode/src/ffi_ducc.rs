@@ -266,8 +266,11 @@ mod tests {
         }
     }
 
-    // TEMP probe: real linked lib vs scipy at all pipeline sizes.
+    // TEMP probe: real linked lib vs scipy at all pipeline sizes. Reads dumps
+    // from a scratch directory outside the repo, so it is ignored by default;
+    // run it with `cargo test -- --ignored` where those dumps exist.
     #[test]
+    #[ignore = "needs the work/ducc_gate dumps from a scratch scipy run"]
     fn probe_sizes_vs_scipy() {
         let dir = "C:/Software/freebuff_rust_ld-decode/work/ducc_gate";
         for n in [4096usize, 8192, 16384, 32768, 983072] {
