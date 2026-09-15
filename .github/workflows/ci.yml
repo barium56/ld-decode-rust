@@ -1,0 +1,103 @@
+name: CI
+
+# Windows x86-64 only, deliberately: `crates/ld-decode/build.rs` compiles the
+# vendored ducc0 FFT with clang-cl (MSVC ABI, SSE2, single-threaded) so that it
+# reproduces the rounding of the scipy 1.18.0 wheel this port is parity-locked
+# to. There is no portable/Linux configuration worth gating here.
+#
+# The real end-to-end gate is b3sum 4/4 against the `F:\DdD` references, which
+# needs the capture files and hours of runtime; it stays a local, manual check.
+# What CI can gate is everything below that: build, the hermetic scipy/numpy
+# fidelity tests, and a full CLI run through every output writer.
+#
+# Do not set RUSTFLAGS in this workflow: an env RUSTFLAGS replaces
+# `.cargo/config.toml`'s `target-cpu=x86-64-v3`, which is part of the verified
+# release configuration.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  windows:
+    name: Build, test and smoke (windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # Pinned to the nightly this port is developed and verified with.
+          # Several tests assert bit-level agreement with scipy 1.18.0
+          # references, and codegen drift between nightlies moves them.
+          toolchain: nightly-2026-08-28
+
+      - name: Build release
+        shell: bash
+        run: cargo build --release --workspace
+
+      - name: Test (debug profile)
+        shell: bash
+        # The debug profile is where the filter/FFT fidelity gates are exact;
+        # release codegen drifts ~1e-14 on `gen_bpf_supergauss`, which is why
+        # the test tolerances sit at 1e-12. `pll_matches_stock_field_stream`
+        # needs the LD_PLL_DIR golden field stream dumped from a stock Python
+        # run, which is not in the repo, so it is skipped in both profiles.
+        run: cargo test --workspace -- --skip pll_matches_stock_field_stream
+
+      - name: Test (release profile)
+        shell: bash
+        run: cargo test --workspace --release -- --skip pll_matches_stock_field_stream
+
+      - name: Smoke test the decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/release/ld-decode.exe"
+          if [ ! -f "$BIN" ]; then
+            echo "No decoder binary at $BIN"
+            exit 1
+          fi
+
+          "$BIN" --help > ci-help.txt
+          grep -q -- "--start" ci-help.txt
+          grep -q -- "--threads" ci-help.txt
+
+          # One second of zero samples. Nothing decodes, but the reader, the
+          # no-signal recovery path and every writer (tbc/pcm/efm/json/db/log)
+          # must still run to completion and exit cleanly.
+          mkdir -p smoke
+          head -c 40000000 /dev/zero > smoke/zeros.s16
+          "$BIN" -j 4 -l 4 smoke/zeros.s16 smoke/out
+
+          for ext in tbc pcm efm tbc.json tbc.db log; do
+            if [ ! -f "smoke/out.$ext" ]; then
+              echo "Missing output: smoke/out.$ext"
+              ls -la smoke
+              exit 1
+            fi
+          done
+          grep -q '"fields":\[\]' smoke/out.tbc.json
+          grep -q "Decode finished" smoke/out.log
+          echo "Smoke test outputs:"
+          ls -la smoke
+
+      - name: Upload decoder binary
+        # Pull requests do not need a downloadable binary; the dispatchable
+        # build_windows.yml is the artifact-producing workflow.
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ld-decode-windows-x86_64
+          path: target/release/ld-decode.exe
+          if-no-files-found: error

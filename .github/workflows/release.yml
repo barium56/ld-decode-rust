@@ -1,0 +1,264 @@
+name: "Build and release binary"
+
+# Tag a commit `v<version>` (or dispatch this workflow with a release_tag) to
+# publish `ld-decode.exe` as a versioned ZIP on a GitHub release. Mirrors the
+# release side of the sibling tape-decode-gui project's build.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to release when manually dispatched (example: v0.2.0)"
+        required: false
+        type: string
+      create_release:
+        description: "Create a GitHub release and upload the built asset"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  windows-decode:
+    name: Build ld-decode.exe (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve build version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            VERSION="${{ github.event.inputs.release_tag }}"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${VERSION} for ${{ matrix.target }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # Pinned to the nightly this port is developed and verified with.
+          # Several tests assert bit-level agreement with scipy 1.18.0
+          # references, and codegen drift between nightlies moves them.
+          toolchain: nightly-2026-08-28
+          targets: ${{ matrix.target }}
+
+      - name: Build release
+        shell: bash
+        run: cargo build --release --workspace --target "${{ matrix.target }}"
+
+      - name: Test (release profile)
+        shell: bash
+        # `pll_matches_stock_field_stream` needs the LD_PLL_DIR golden field
+        # stream dumped from a stock Python run, which is not in the repo.
+        run: cargo test --workspace --release --target "${{ matrix.target }}" -- --skip pll_matches_stock_field_stream
+
+      - name: Smoke test the decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/ld-decode.exe"
+          if [ ! -f "$BIN" ]; then
+            echo "No decoder binary at $BIN"
+            exit 1
+          fi
+
+          "$BIN" --help > release-help.txt
+          grep -q -- "--start" release-help.txt
+          grep -q -- "--threads" release-help.txt
+
+          mkdir -p smoke
+          head -c 40000000 /dev/zero > smoke/zeros.s16
+          "$BIN" -j 4 -l 4 smoke/zeros.s16 smoke/out
+
+          for ext in tbc pcm efm tbc.json tbc.db log; do
+            if [ ! -f "smoke/out.$ext" ]; then
+              echo "Missing output: smoke/out.$ext"
+              ls -la smoke
+              exit 1
+            fi
+          done
+          grep -q '"fields":\[\]' smoke/out.tbc.json
+          grep -q "Decode finished" smoke/out.log
+
+      - name: Package versioned Windows ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Version = '${{ steps.version.outputs.version }}'
+          $BinPath = "target\${{ matrix.target }}\release\ld-decode.exe"
+          if (-not (Test-Path $BinPath)) { throw "missing $BinPath" }
+          $ExeName = "ld-decode-windows_${Version}_${{ matrix.artifact_suffix }}.exe"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Path $BinPath -Destination "dist\$ExeName" -Force
+          $ZipName = "ld-decode-windows_${Version}_${{ matrix.artifact_suffix }}.zip"
+          Compress-Archive -Path @("dist\$ExeName") -DestinationPath $ZipName -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipName))
+          try {
+            if ($zip.Entries.Count -ne 1) {
+              throw "Expected 1 entry in $ZipName, found $($zip.Entries.Count)"
+            }
+            foreach ($entry in $zip.Entries) {
+              if ($entry.FullName.Contains('/') -or $entry.FullName.Contains('\')) {
+                throw "ZIP entry is nested; expected flat layout: $($entry.FullName)"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          Get-Item $ZipName | Format-List Name, Length
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: ld-decode-windows-${{ matrix.arch }}
+          path: ld-decode-windows_*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: [windows-decode]
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            RAW="${{ github.event.inputs.release_tag }}"
+            if [[ -z "$RAW" ]]; then
+              echo "release_tag is required when create_release=true" >&2
+              exit 1
+            fi
+            TAG="v${RAW#v}"
+            if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git tag "$TAG" "$GITHUB_SHA"
+              git push origin "$TAG"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Determine previous release tag
+        id: previous
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PREVIOUS_TAG="$(git describe --tags --abbrev=0 --match "v*" "${RELEASE_TAG}^" 2>/dev/null || true)"
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "Using release notes range: ${PREVIOUS_TAG}..${RELEASE_TAG}"
+          else
+            echo "No previous release tag found before ${RELEASE_TAG}; generating notes from full history."
+          fi
+          echo "previous_tag=${PREVIOUS_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.previous_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PREVIOUS_TAG" ]; then
+            gh api --method POST -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="$RELEASE_TAG" \
+              -f previous_tag_name="$PREVIOUS_TAG" \
+              --jq '.body' > release-notes.md
+          else
+            gh api --method POST -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="$RELEASE_TAG" \
+              --jq '.body' > release-notes.md
+          fi
+          cat release-notes.md
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refreshing release notes."
+            gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --notes-file release-notes.md
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md
+          fi
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ASSETS="$(find artifacts -type f -name '*.zip')"
+          if [ -z "$ASSETS" ]; then
+            echo "No release assets found under artifacts/" >&2
+            exit 1
+          fi
+          echo "Uploading release assets:"
+          printf '%s\n' $ASSETS
+          gh release upload "$RELEASE_TAG" $ASSETS --repo "${{ github.repository }}" --clobber
+
+      - name: Mark release as latest
+        continue-on-error: true
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --latest
