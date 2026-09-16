@@ -250,6 +250,92 @@ mod tests {
         }
     }
 
+    // Pipeline-size parity gate. The 1024-point test above is a canary, but the
+    // demod kernel only ever transforms 32768-point blocks (`blocklen`), so the
+    // size that actually decides output parity needs its own bit-for-bit check
+    // against the reference library. Goldens: `scripts/gen_fft32768_ref.py`
+    // under the bundled 7.3.0 python (scipy 1.18.0, numpy 2.4.6), raw
+    // little-endian f64, complex files interleaved re/im.
+    fn data_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(name)
+    }
+
+    fn read_f64s(name: &str) -> Vec<f64> {
+        let raw = std::fs::read(data_path(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        raw.chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn read_cf(name: &str) -> Vec<Complex64> {
+        let v = read_f64s(name);
+        v.chunks_exact(2)
+            .map(|c| Complex64::new(c[0], c[1]))
+            .collect()
+    }
+
+    fn assert_same_bits(got: &[Complex64], want: &[Complex64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for i in 0..want.len() {
+            assert_eq!(got[i].re.to_bits(), want[i].re.to_bits(), "{what}: idx {i} re");
+            assert_eq!(got[i].im.to_bits(), want[i].im.to_bits(), "{what}: idx {i} im");
+        }
+    }
+
+    // PARITY PROBE (measured, REJECTED 2026-09-16): an AVX2 build of the
+    // vendored ducc0 (`-mavx2 -mfma` added next to `/O2` in build.rs) is 2.7x
+    // faster on exactly the transform the decoder spends its time in — with a
+    // forced rebuild, fft+ifft n=32768 goes 1072 us -> 394 us per pair and
+    // rfft+irfft 682 us -> 344 us — but it rounds differently at *every* size
+    // this crate uses: this test fails at idx 1, `fft_real_full` at idx 1 and
+    // the 1024 canary at idx 1. Every transform the pipeline runs is
+    // 32768-point (2 r2c + 6 c2c per block, 21 blocks per field, plus small
+    // audio slices), so there is no subset of sizes where AVX2 could be
+    // enabled — permanently off the table under the bit-parity directive, like
+    // the c2r path. To re-measure: add the two flags to build.rs, `touch` it
+    // (cargo does not rebuild on an env var change) and run these tests. Do not
+    // leave the flags in a default build.
+    /// c2c forward and inverse at the pipeline's block length.
+    #[test]
+    fn fft_matches_scipy_32768() {
+        let x = read_cf("fft32768_in.f64");
+        assert_eq!(x.len(), 32768);
+        assert_same_bits(&fft(&x), &read_cf("fft32768_fwd.f64"), "fft 32768");
+        assert_same_bits(&ifft(&x), &read_cf("fft32768_inv.f64"), "ifft 32768");
+    }
+
+    /// `scipy.fft.fft` of a *real* array — what the kernel's `indata_fft` and
+    /// `demod_fft` are: pocketfft computes the r2c half and reflects it, so this
+    /// pins the r2c result *and* the reflection in one comparison.
+    #[test]
+    fn fft_real_full_matches_scipy_32768() {
+        let real = read_f64s("rfft32768_in.f64");
+        assert_eq!(real.len(), 32768);
+        let got = fft_real_full(&real);
+        let want = read_cf("rfft32768_full.f64");
+        assert_eq!(got.len(), want.len());
+        for i in 0..want.len() {
+            // Bins 0 and n/2 are mathematically real for a real input; measured,
+            // scipy's c2c gives +0.0 there while the r2c + conjugate-reflection
+            // path gives -0.0 (2 cells of 65536). That signed zero is all that
+            // differs, it stays +-0.0 through the filter products, and every
+            // consumer of the forward spectra of real data reads the affected
+            // cells only as a zero imaginary term — which is why the decodes are
+            // byte-identical to the reference. Pinned here so the exception stays
+            // checked instead of assumed; everything else must match bit-for-bit.
+            let trivial_im = i == 0 || i == want.len() / 2;
+            assert_eq!(got[i].re.to_bits(), want[i].re.to_bits(), "idx {i} re");
+            if trivial_im {
+                assert_eq!(got[i].im, 0.0, "idx {i}: trivial bin im must be zero");
+                assert_eq!(want[i].im, 0.0, "idx {i}: golden trivial bin im");
+            } else {
+                assert_eq!(got[i].im.to_bits(), want[i].im.to_bits(), "idx {i} im");
+            }
+        }
+    }
+
     // PERF PROBE: measure plan-cache reuse for the pipeline sizes.
     #[test]
     fn bench_plan_reuse() {
