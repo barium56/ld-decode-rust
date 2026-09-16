@@ -336,6 +336,50 @@ mod tests {
         }
     }
 
+    // PERF PROBE (temporary): split `fft_real_full_into` into its r2c and its
+    // Hermitian reflection to see which one holds the time.
+    #[test]
+    fn bench_reflection_split() {
+        use std::time::Instant;
+        let n = 32768usize;
+        let xr: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5).collect();
+        let iters = 400;
+        let mut sink = 0.0f64;
+        let mut buf: Vec<Complex64> = Vec::new();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            fft_real_full_into(&xr, &mut buf);
+            sink += buf[7].re;
+        }
+        eprintln!("PERF rfft+reflect into reused buf: {:?}/call", t0.elapsed() / iters);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let h = rfft(&xr);
+            sink += h[7].re;
+        }
+        eprintln!("PERF rfft (fresh alloc): {:?}/call", t0.elapsed() / iters);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for k in (1..n / 2).rev() {
+                let c = buf[k];
+                buf[n - k] = Complex64::new(c.re, -c.im);
+            }
+            sink += buf[3].re;
+        }
+        eprintln!("PERF reflection loop only: {:?}/call", t0.elapsed() / iters);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let (head, tail) = buf.split_at_mut(n / 2);
+            for (dst, src) in tail.iter_mut().rev().zip(head[1..].iter()) {
+                dst.re = src.re;
+                dst.im = -src.im;
+            }
+            sink += buf[3].re;
+        }
+        eprintln!("PERF reflection split_at_mut form: {:?}/call", t0.elapsed() / iters);
+        eprintln!("PERF sink {sink}");
+    }
+
     // PERF PROBE: measure plan-cache reuse for the pipeline sizes.
     #[test]
     fn bench_plan_reuse() {

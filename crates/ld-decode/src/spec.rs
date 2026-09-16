@@ -651,6 +651,117 @@ pub(crate) fn np_cmul(a: Complex64, b: Complex64) -> Complex64 {
     )
 }
 
+/// Element-wise [`np_cmul`] over slices: `out[i] = np_cmul(a[i], b[i])`.
+///
+/// The scalar form is two rounded products feeding one FMA each, written over
+/// an interleaved `[re, im]` layout — the layout is exactly what stops LLVM
+/// from vectorizing it (the `.re`/`.im` operands of neighbouring elements are
+/// strided by 16 bytes). Holding two complex values in one AVX2 register makes
+/// the interleave an advantage: `vfmaddsub` applies the subtract to the even
+/// (real) lanes and the add to the odd (imaginary) lanes, which is precisely
+/// `fma(ar, br, -(ai*bi))` and `fma(ar, bi, ai*br)`. Every lane keeps the
+/// scalar form's operand order and rounding, so results are bit-identical and
+/// the scalar loop stays the fallback for the tail and non-x86 targets.
+pub(crate) fn np_cmul_slices(a: &[Complex64], b: &[Complex64], out: &mut [Complex64]) {
+    let n = a.len().min(b.len()).min(out.len());
+    debug_assert_eq!(n, a.len());
+    debug_assert_eq!(n, b.len());
+    debug_assert_eq!(n, out.len());
+    np_cmul_core(
+        a.as_ptr() as *const f64,
+        b.as_ptr() as *const f64,
+        out.as_mut_ptr() as *mut f64,
+        n,
+    );
+}
+
+/// [`np_cmul_slices`] appended to a reused vector (leaving any existing
+/// elements in place, like `extend`). The appended elements are left
+/// uninitialised before the fill (same convention as the FFT wrappers) since
+/// every one of them is overwritten.
+pub(crate) fn np_cmul_extend(a: &[Complex64], b: &[Complex64], out: &mut Vec<Complex64>) {
+    let n = a.len().min(b.len());
+    let base = out.len();
+    out.reserve(n);
+    // SAFETY: `base + n <= capacity` after `reserve`, and the fill writes all
+    // `n` appended elements; `Complex64` is `Copy` and owns no resources, so
+    // the uninit window cannot be observed (no panic path can unwind through
+    // the fill).
+    unsafe { out.set_len(base + n) };
+    np_cmul_core(
+        a.as_ptr() as *const f64,
+        b.as_ptr() as *const f64,
+        unsafe { out.as_mut_ptr().add(base) } as *mut f64,
+        n,
+    );
+}
+
+/// [`np_cmul_slices`] into a reused vector: cleared, then refilled to the
+/// shorter input's length.
+pub(crate) fn np_cmul_fill(a: &[Complex64], b: &[Complex64], out: &mut Vec<Complex64>) {
+    out.clear();
+    np_cmul_extend(a, b, out);
+}
+
+/// In-place element-wise [`np_cmul`]: `a[i] = np_cmul(a[i], b[i])`.
+pub(crate) fn np_cmul_assign(a: &mut [Complex64], b: &[Complex64]) {
+    let n = a.len().min(b.len());
+    let p = a.as_mut_ptr() as *mut f64;
+    np_cmul_core(p as *const f64, b.as_ptr() as *const f64, p, n);
+}
+
+/// Scalar/vector dispatch for the element-wise complex multiply. `ap` and `op`
+/// may be the same pointer (in-place); each element is read before it is
+/// written.
+#[inline]
+fn np_cmul_core(ap: *const f64, bp: *const f64, op: *mut f64, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `#[target_feature]` fns must be `unsafe fn`; the crate is built for
+        // x86-64-v3 (AVX2+FMA), the same assumption the `fma` helper makes.
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn mul_avx2(ap: *const f64, bp: *const f64, op: *mut f64, n: usize) {
+            use std::arch::x86_64::*;
+            let mut i = 0usize;
+            // Two complex values per iteration: [re0, im0, re1, im1].
+            while i + 2 <= n {
+                let a = _mm256_loadu_pd(ap.add(i * 2));
+                let b = _mm256_loadu_pd(bp.add(i * 2));
+                // [ar0, ar0, ar1, ar1] and [ai0, ai0, ai1, ai1].
+                let ar = _mm256_movedup_pd(a);
+                let ai = _mm256_permute_pd(a, 0b1111);
+                // [bi0, br0, bi1, br1]: the odd-lane operand of each part.
+                let bswap = _mm256_permute_pd(b, 0b0101);
+                // [ai0*bi0, ai0*br0, ai1*bi1, ai1*br1].
+                let t = _mm256_mul_pd(ai, bswap);
+                // Even lanes subtract (real), odd lanes add (imag).
+                let r = _mm256_fmaddsub_pd(ar, b, t);
+                _mm256_storeu_pd(op.add(i * 2), r);
+                i += 2;
+            }
+            while i < n {
+                let ar = *ap.add(i * 2);
+                let ai = *ap.add(i * 2 + 1);
+                let br = *bp.add(i * 2);
+                let bi = *bp.add(i * 2 + 1);
+                *op.add(i * 2) = ar.mul_add(br, -(ai * bi));
+                *op.add(i * 2 + 1) = ar.mul_add(bi, ai * br);
+                i += 1;
+            }
+        }
+        unsafe { mul_avx2(ap, bp, op, n) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for i in 0..n {
+        let (ar, ai) = unsafe { (*ap.add(i * 2), *ap.add(i * 2 + 1)) };
+        let (br, bi) = unsafe { (*bp.add(i * 2), *bp.add(i * 2 + 1)) };
+        unsafe {
+            *op.add(i * 2) = fma(ar, br, -(ai * bi));
+            *op.add(i * 2 + 1) = fma(ar, bi, ai * br);
+        }
+    }
+}
+
 /// numpy complex128 division (Smith's algorithm with multiply-by-reciprocal,
 /// matching the SIMD `npyv_cdiv_f64` kernel).
 pub(crate) fn np_cdiv(a: Complex64, b: Complex64) -> Complex64 {
@@ -2321,5 +2432,97 @@ mod tests {
             fefm[worst_i],
             (re[worst_i], im[worst_i])
         );
+    }
+
+    /// Deterministic pseudo-random complex data with a wide exponent range, so
+    /// a lane mix-up or a rounding difference cannot hide.
+    fn pseudo_random(n: usize, seed: u64) -> Vec<Complex64> {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        (0..n)
+            .map(|i| {
+                let scale = (2.0f64).powi((i % 21) as i32 - 10);
+                Complex64::new(next() * scale, next() * scale)
+            })
+            .collect()
+    }
+
+    /// The AVX2 pair kernel must be bit-identical to the scalar `np_cmul`,
+    /// including the odd-length tail and the in-place form.
+    #[test]
+    fn np_cmul_slices_is_bit_exact() {
+        for &n in &[0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 33, 1023, 4096, 32768] {
+            let a = pseudo_random(n, 0x9E3779B97F4A7C15);
+            let b = pseudo_random(n, 0xD1B54A32D192ED03);
+            if n > 0 {
+                // Include exact zeros (the trivial bins) and denormals.
+                let mut a2 = a.clone();
+                a2[0] = Complex64::new(0.0, 0.0);
+                let mut b2 = b.clone();
+                b2[n - 1] = Complex64::new(-0.0, 1e-310);
+                assert_bits(&a2, &b2, n);
+            }
+            assert_bits(&a, &b, n);
+        }
+    }
+
+    fn assert_bits(a: &[Complex64], b: &[Complex64], n: usize) {
+        let mut out = vec![Complex64::new(f64::NAN, f64::NAN); n];
+        np_cmul_slices(a, b, &mut out);
+        let mut inplace = a.to_vec();
+        np_cmul_assign(&mut inplace, b);
+        let mut filled: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); n + 3];
+        np_cmul_fill(a, b, &mut filled);
+        assert_eq!(filled.len(), n);
+        for i in 0..n {
+            let want = np_cmul(a[i], b[i]);
+            for (got, what) in [
+                (out[i], "slices"),
+                (inplace[i], "assign"),
+                (filled[i], "fill"),
+            ] {
+                assert_eq!(got.re.to_bits(), want.re.to_bits(), "n={n} i={i} re ({what})");
+                assert_eq!(got.im.to_bits(), want.im.to_bits(), "n={n} i={i} im ({what})");
+            }
+        }
+    }
+
+    // PERF PROBE: how much does the vector kernel buy over the scalar loop?
+    #[test]
+    fn bench_np_cmul_vector() {
+        use std::time::Instant;
+        let n = 32768usize;
+        let a = pseudo_random(n, 0x2545F4914F6CDD1D);
+        let b = pseudo_random(n, 0x1D8E4E27C47D124F);
+        let iters = 400;
+        let mut sink = 0.0f64;
+        let t0 = Instant::now();
+        let mut out = vec![Complex64::new(0.0, 0.0); n];
+        for _ in 0..iters {
+            np_cmul_slices(&a, &b, &mut out);
+            sink += out[1].re;
+        }
+        eprintln!("PERF np_cmul_slices avx2: {:?}/call", t0.elapsed() / iters);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let mut o: Vec<Complex64> = Vec::with_capacity(n);
+            o.extend(a.iter().zip(&b).map(|(&x, &y)| np_cmul(x, y)));
+            sink += o[1].re;
+        }
+        eprintln!("PERF scalar map+collect : {:?}/call", t0.elapsed() / iters);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for (x, &y) in out.iter_mut().zip(&b) {
+                *x = np_cmul(*x, y);
+            }
+            sink += out[1].re;
+        }
+        eprintln!("PERF scalar in-place loop: {:?}/call", t0.elapsed() / iters);
+        eprintln!("PERF sink {sink}");
     }
 }
