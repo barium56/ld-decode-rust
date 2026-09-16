@@ -117,7 +117,15 @@ impl std::io::Write for LogFileSink {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    // With no positional arguments, show the same usage text as `--help`
+    // instead of reporting missing required arguments.
+    let args = if std::env::args_os().nth(1).is_none() {
+        let mut help_args: Vec<_> = std::env::args_os().take(1).collect();
+        help_args.push("--help".into());
+        Args::parse_from(help_args)
+    } else {
+        Args::parse()
+    };
 
     // Mirror the terminal output into `<outfile>.log` (like the reference
     // ld-decode). Opened before the tracing subscriber so every line of the
