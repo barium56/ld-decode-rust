@@ -59,6 +59,16 @@ jobs:
         shell: bash
         run: cargo test --workspace --release -- --skip pll_matches_stock_field_stream
 
+      - name: Install FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install ffmpeg --yes --no-progress
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            throw 'FFmpeg was not added to PATH'
+          }
+          ffmpeg -version | Select-Object -First 1
+
       - name: Smoke test the decoder
         shell: bash
         run: |
