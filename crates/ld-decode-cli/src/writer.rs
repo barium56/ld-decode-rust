@@ -41,6 +41,9 @@ pub struct DecodeWriter {
     /// in memory and dumps the array only at close time; rust must do the
     /// same so the filler aliasing (below) can be resolved before writing.
     json_entries: Vec<FieldInfoEntry>,
+    /// fields_written at the time each json_entries entry was pushed (for the
+    /// dumper-drain aliasing rule).
+    json_push_fields: Vec<usize>,
     /// Scratch for the i8->u8 EFM byte conversion (reused across fields).
     efm_bytes: Vec<u8>,
     field_count: usize,
@@ -114,6 +117,7 @@ impl DecodeWriter {
             outfile_pre_efm: pre_efm.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
             json_file: json,
             json_entries: Vec::new(),
+            json_push_fields: Vec::new(),
     efm_bytes: Vec::new(),
             field_count: 0,
             first_field_write: None,
@@ -169,7 +173,29 @@ impl DecodeWriter {
         self.field_count += 1;
 
         if self.json_file.is_some() {
+            // Python's json dumper thread serializes the fi dicts by reference,
+            // but only drains them when the main loop calls write(): after every
+            // field while `fields_written < 100`, then only every 500. A backfill
+            // re-write of the same fi dict therefore lands BEFORE serialization
+            // only when the first write happened at fields_written >= 100 — the
+            // earlier json entry then shows the re-processed efmTValues (the DB,
+            // snapshotted per INSERT, always keeps its own). Below 100 the entry
+            // serializes with its own value. Replicate that split rule.
+            let dup_at = self
+                .json_entries
+                .iter()
+                .rposition(|p| p.seq_no == field.info.seq_no)
+                .map(|i| (i, self.json_push_fields[i]));
             self.json_entries.push(field.info.clone());
+            self.json_push_fields.push(self.field_count);
+            if let Some((i, orig_fw)) = dup_at {
+                if orig_fw >= 100 {
+                    let prev = &mut self.json_entries[i];
+                    prev.efm_t_values = field.info.efm_t_values;
+                    prev.audio_samples = field.info.audio_samples;
+                    prev.ac3_symbols = field.info.ac3_symbols;
+                }
+            }
         }
 
         const LOG_INTERVAL: usize = 500;

@@ -37,6 +37,15 @@ use field::{Field, FieldData, PrevField};
 pub(crate) use demodblock::{compute_mtf_pow, demod_block_cpu, DemodSpecRef};
 pub(crate) use vits::pairwise_sum_f64;
 
+/// Python truthiness for a redo target: `if redo:` / `if adjusted is False
+/// and redo:` treat 0.0 as false. The reference computes redo targets as
+/// `self.fdoffset - offset` AFTER `fdoffset += offset`, so a redo of the very
+/// first field (or a redo landing exactly on sample 0) has target 0.0 and is
+/// silently cancelled there. Option::Some(0.0) in Rust would be truthy.
+fn py_falsy_redo(target: f64) -> Option<f64> {
+    if target == 0.0 { None } else { Some(target) }
+}
+
 /// Memoized `MTF ** mtf_level`. Pure function of the (immutable) mtf filter
 /// and the scalar mtf, keyed by mtf's f64 bits. mtf is near-constant in
 /// steady state (constant for thousands of fields), so this turns the ~ms
@@ -713,7 +722,14 @@ impl Decoder {
                     }
 
                     redo = if !self.check_mtf() {
-                        Some(self.fdoffset_abs() - offset.unwrap_or(0.0))
+                        // Python: `redo = self.fdoffset - offset`, then every
+                        // redo test (`if redo:`, `if adjusted is False and
+                        // redo:`) is a truthiness test — a target of 0.0 is
+                        // FALSY, so a redo of the very first field (fdoffset
+                        // == offset == 0) is silently cancelled and the field
+                        // is written with its first-pass content. Replicating
+                        // that here; Option::Some(0.0) would be truthy.
+                        py_falsy_redo(self.fdoffset_abs() - offset.unwrap_or(0.0))
                     } else {
                         None
                     };
@@ -751,7 +767,10 @@ impl Decoder {
                                 if std::env::var_os("LD_TRACE_AGC").is_some() {
                                     crate::teeprintln!("AGC f#{} fdoffset={} offset={} redo_to={} ire0={:.3} hz_ire={:.3} vsync_ire={:.3}", self.fieldinfo.len(), self.fdoffset_abs(), offset.unwrap_or(0.0), redo_to, ire0_hz, hz_ire, vsync_ire);
                                 }
-                                redo = Some(redo_to);
+                                // Same Python truthiness rule as the checkMTF
+                                // redo above: a 0.0 target (first field) is
+                                // falsy and cancels the redo.
+                                redo = py_falsy_redo(redo_to);
                                 self.levels.ire0 = ire0_hz;
                                 self.levels.hz_ire = hz_ire;
                                 self.levels.vsync_ire = vsync_ire;
@@ -845,11 +864,19 @@ impl Decoder {
 
         let t_o0 = std::time::Instant::now();
         if need_filler {
-            if let Some(other) = self.lastvalidfield[1 - idx].clone() {
-                output.push(self.writeout(other)?);
-            }
-            if let Some(current) = self.lastvalidfield[idx].clone() {
-                output.push(self.writeout(current)?);
+            // Python writes the backfill pair only when the *other* slot is
+            // populated: `if self.lastvalidfield[not f.isFirstField] is not
+            // None:` wraps BOTH writeouts. On the first fields (other slot
+            // still None) it writes nothing and the skipped field is dropped
+            // entirely — writing `current` unconditionally here emitted a
+            // lead-in junk field the reference never produced.
+            if self.lastvalidfield[1 - idx].is_some() {
+                if let Some(other) = self.lastvalidfield[1 - idx].clone() {
+                    output.push(self.writeout(other)?);
+                }
+                if let Some(current) = self.lastvalidfield[idx].clone() {
+                    output.push(self.writeout(current)?);
+                }
             }
         } else if let Some(current) = self.lastvalidfield[idx].clone() {
             // Mirror LDdecode: the A/V-sync offset is computed from the last
@@ -1128,22 +1155,22 @@ impl Decoder {
             // blocks are demodulated at the current MTF.
             let mut decoded: Vec<Option<Arc<BlockDecode>>> = Vec::with_capacity(numblocks_read);
             let mut window_mtfs: Vec<(u64, f64)> = Vec::with_capacity(numblocks_read);
-            // Python's DemodCache re-demodulates a cached block when its
-            // stored MTF deviates from the current target by more than
-            // `MTF_tolerance` (0.05); reuse is only unconditional within that
-            // band. Mirror exactly: an out-of-band block is treated as a miss
-            // and re-demodulated at the current MTF.
-            const MTF_TOLERANCE: f64 = 0.05;
+            // Python's DemodCache reuses a cached block UNCONDITIONALLY once
+            // it holds a demod: `doread`'s skip only tests `demod in
+            // blocks[b]` (plus request/waiting bookkeeping), never the stored
+            // MTF. The worker's `MTF_tolerance` (0.05) re-demod check fires
+            // only for blocks queued for another reason (new block, redo
+            // flush), so a block demodulated under an older MTF level is
+            // served as-is to later reads until a redo flushes the cache.
+            // Verified with LD_DUMP_CACHE on the ldf lead-in: reads at mtf 0.0
+            // reuse blocks 44..139 demodulated at mtf 1.0 with no re-demod
+            // event; re-demodulating them there shifts every lineloc and
+            // diverges from the reference.
             for i in 0..numblocks_read {
                 let bnum = first_block as u64 + i as u64;
                 if let Some((cached_mtf, cached)) = self.demod_cache.get(&bnum) {
-                    if (*cached_mtf - mtf).abs() <= MTF_TOLERANCE {
-                        decoded.push(Some(Arc::clone(cached)));
-                        window_mtfs.push((bnum, *cached_mtf));
-                    } else {
-                        decoded.push(None);
-                        window_mtfs.push((bnum, mtf));
-                    }
+                    decoded.push(Some(Arc::clone(cached)));
+                    window_mtfs.push((bnum, *cached_mtf));
                 } else {
                     decoded.push(None);
                     window_mtfs.push((bnum, mtf));
@@ -1866,6 +1893,24 @@ impl Decoder {
         wf.info.audio_samples = wf.audio.len() / 2;
         wf.info.efm_t_values = wf.efm.len();
         wf.info.ac3_symbols = 0;
+        // Python's writeout MUTATES the fi dict stored in lastvalidfield, and the
+        // backfill path writes the same dataset twice (once as current, later as
+        // the filler pair's `other`). Both fieldinfo entries reference the SAME
+        // dict, so the earlier entry's efmTValues/audioSamples show the SECOND
+        // writeout's re-processed values (the EFM PLL is stateful, so the counts
+        // differ between passes). Rust's push clones, leaving the earlier entry
+        // stale — patch it to the re-processed values instead (py shows 19160/19160
+        // and 20066/20066 for the two skip-back pairs on the ldf lead-in).
+        if let Some(prev) = self
+            .fieldinfo
+            .iter_mut()
+            .rev()
+            .find(|p| p.seq_no == wf.info.seq_no)
+        {
+            prev.efm_t_values = wf.info.efm_t_values;
+            prev.audio_samples = wf.info.audio_samples;
+            prev.ac3_symbols = wf.info.ac3_symbols;
+        }
         self.fieldinfo.push(wf.info.clone());
         self.fields_written += 1;
         Ok(wf)
