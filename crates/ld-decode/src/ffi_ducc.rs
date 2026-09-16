@@ -43,13 +43,27 @@ pub fn fft(x: &[Complex64]) -> Vec<Complex64> {
 
 /// Inverse complex FFT (normalized by 1/n).
 pub fn ifft(x: &[Complex64]) -> Vec<Complex64> {
+    let mut out = Vec::new();
+    ifft_into(x, &mut out);
+    out
+}
+
+/// [`ifft`] into a caller-owned buffer that is reused across calls.
+///
+/// `out` is resized to `x.len()` and every element is written by ducc, so the
+/// buffer's previous contents can never leak into the result: reusing it is a
+/// pure allocation/cache win and cannot change a single value.
+pub fn ifft_into(x: &[Complex64], out: &mut Vec<Complex64>) {
     let n = x.len() as c_int;
-    let mut out = uninit_complex(x.len());
+    out.clear();
+    out.reserve(x.len());
+    // ducc writes all n output elements before returning.
+    unsafe { out.set_len(x.len()) };
     unsafe {
         duccq_ifft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
     }
-    out
 }
+
 
 /// Forward real FFT -> half spectrum (len `n/2+1` complex), unnormalized.
 pub fn rfft(x: &[f64]) -> Vec<Complex64> {
@@ -66,16 +80,34 @@ pub fn rfft(x: &[f64]) -> Vec<Complex64> {
 /// rest (`X[n-k] = conj(X[k])`), which is *not* the same rounding as a full
 /// complex c2c of the data with zero imaginary parts.
 pub fn fft_real_full(x: &[f64]) -> Vec<Complex64> {
-    let n = x.len();
-    let half = rfft(x); // n/2+1 values
-    let mut out = Vec::with_capacity(n);
-    out.extend_from_slice(&half);
-    for k in (1..n / 2).rev() {
-        let c = half[k];
-        out.push(Complex64::new(c.re, -c.im));
-    }
+    let mut out = Vec::new();
+    fft_real_full_into(x, &mut out);
     out
 }
+
+/// [`fft_real_full`] into a caller-owned buffer that is reused across calls.
+///
+/// The r2c half spectrum lands in `out[0..n/2+1]` and the reflected half is
+/// then built **in place** (`out[n-k] = conj(out[k])`), so the separate
+/// `half` buffer and the copy out of it are gone. Every element is written
+/// (ducc writes the first `n/2+1`, the loop below fills the rest), and the
+/// read range `1..n/2` never overlaps the write range `n/2+1..n`, so the
+/// values are identical to the allocating form by construction.
+pub fn fft_real_full_into(x: &[f64], out: &mut Vec<Complex64>) {
+    let n = x.len();
+    out.clear();
+    out.reserve(n);
+    // ducc fills bins 0..=n/2; the reflection loop fills n/2+1..n.
+    unsafe { out.set_len(n) };
+    unsafe {
+        duccq_rfft(n as c_int, x.as_ptr(), out.as_mut_ptr() as *mut f64);
+    }
+    for k in (1..n / 2).rev() {
+        let c = out[k];
+        out[n - k] = Complex64::new(c.re, -c.im);
+    }
+}
+
 
 /// Inverse real FFT from a half spectrum, `n` real out, normalized by 1/n.
 pub fn irfft(spectrum: &[Complex64], n: usize) -> Vec<f64> {
@@ -112,7 +144,48 @@ mod tests {
         }
     }
 
-    // PARITY PROBE (measured, REJECTED): does the c2r path reproduce the
+    // PARITY PROBE: the reusable-buffer forms exist only to remove per-call
+    // allocations and the intermediate `half` buffer; a reused buffer whose
+    // stale contents or length leaked into a result would be a parity bug, so
+    // pin that reuse (across repeated calls and across changing sizes) is
+    // observationally identical to a fresh allocation.
+    #[test]
+    fn reused_buffers_match_fresh_allocations() {
+        let n = 32768usize;
+        let xr: Vec<f64> = (0..n)
+            .map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5)
+            .collect();
+        let mut buf = Vec::new();
+        for round in 0..3 {
+            // Alternate full length and a shorter one: a buffer reused without
+            // resetting its length would keep the tail of the previous call.
+            let src: &[f64] = if round % 2 == 0 { &xr } else { &xr[..1024] };
+            fft_real_full_into(src, &mut buf);
+            let want = fft_real_full(src);
+            assert_eq!(buf.len(), want.len());
+            for i in 0..want.len() {
+                assert_eq!(buf[i].re.to_bits(), want[i].re.to_bits(), "real_full idx {i} re");
+                assert_eq!(buf[i].im.to_bits(), want[i].im.to_bits(), "real_full idx {i} im");
+            }
+        }
+
+        let xc: Vec<Complex64> = (0..n)
+            .map(|i| Complex64::new(xr[i], xr[(i + 7) % n]))
+            .collect();
+        let mut ibuf = Vec::new();
+        for round in 0..3 {
+            let src: &[Complex64] = if round % 2 == 0 { &xc } else { &xc[..1024] };
+            ifft_into(src, &mut ibuf);
+            let want = ifft(src);
+            assert_eq!(ibuf.len(), want.len());
+            for i in 0..want.len() {
+                assert_eq!(ibuf[i].re.to_bits(), want[i].re.to_bits(), "ifft idx {i} re");
+                assert_eq!(ibuf[i].im.to_bits(), want[i].im.to_bits(), "ifft idx {i} im");
+            }
+        }
+    }
+
+    // PARITY PROBE: does the c2r path reproduce the
     // real parts of the c2c backward transform bit-for-bit? No - even on an
     // exactly Hermitian spectrum the real parts differ (relative ~1e-7, e.g.
     // c2c 4.82243740404508792e-6 vs c2r 4.82243740410059907e-6 at n=32768),

@@ -104,16 +104,65 @@ pub(crate) struct BlockDecode {
     pub rfhpf: Vec<f32>,
 }
 
+/// Per-thread work buffers for [`demod_block_cpu`], reused across blocks.
+///
+/// The kernel runs ~21 times per field and each call used to allocate about a
+/// dozen 128-512 KB buffers, nearly all of them holding a pure intermediate.
+/// Every buffer here is either fully written by the step that produces it or
+/// explicitly initialised, so reusing one cannot change a value: the kernel's
+/// arithmetic, operand order and rounding are untouched. Sizes are refitted per
+/// call, so any block length this crate demodulates works.
+#[derive(Default)]
+struct Scratch {
+    /// f64 view of the block's samples, feeding the input r2c.
+    samples: Vec<f64>,
+    /// `fft_real_full` of the block (full Hermitian spectrum); later reused to
+    /// hold `demod_fft`, whose input spectrum is dead by then.
+    indata: Vec<Complex64>,
+    /// Spectrum intermediate: filter products, then the video-filter product.
+    spec_buf: Vec<Complex64>,
+    /// Inverse-FFT output intermediate.
+    out_buf: Vec<Complex64>,
+    /// Video-channel filter product.
+    ch_spec: Vec<Complex64>,
+    /// Video-channel inverse-FFT output.
+    ch_out: Vec<Complex64>,
+    /// `unwrap_hilbert` output, clamped in place for the second r2c.
+    demod_buf: Vec<f64>,
+}
+
+thread_local! {
+    /// `Option` so the kernel can move the buffers out for the duration of a
+    /// block (a panic just means the next block reallocates them).
+    static SCRATCH: std::cell::RefCell<Option<Box<Scratch>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Port of `utils.unwrap_hilbert`: recover the instantaneous frequency (Hz,
 /// in the range [0, freq_hz)) of an analytic (complex) signal via the
 /// conjugate-product FM discriminator, in f64 like the reference.
 pub(crate) fn unwrap_hilbert(hilbert: &[Complex64], freq_hz: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    unwrap_hilbert_into(hilbert, freq_hz, &mut out);
+    out
+}
+
+/// [`unwrap_hilbert`] into a caller-owned buffer that is reused across blocks.
+///
+/// The loop writes `1..len` only — index 0 stays the `0.0` the reference's
+/// `vec![0.0; len]` starts with — so the buffer is truncated to the new length
+/// and index 0 is set explicitly; every other element is overwritten.
+pub(crate) fn unwrap_hilbert_into(hilbert: &[Complex64], freq_hz: f64, out: &mut Vec<f64>) {
     use std::f64::consts::TAU;
     let len = hilbert.len();
-    let mut out = vec![0.0f64; len];
-    if len == 0 {
-        return out;
+    if out.len() != len {
+        out.clear();
+        out.resize(len, 0.0);
     }
+    if len == 0 {
+        return;
+    }
+    out[0] = 0.0;
     let scale = freq_hz / TAU;
     // Single pass: the conjugate-product components, the UCRT `atan2` and the
     // wrap/normalise step are all per-index independent, so they are fused.
@@ -136,7 +185,6 @@ pub(crate) fn unwrap_hilbert(hilbert: &[Complex64], freq_hz: f64) -> Vec<f64> {
         let d = crate::spec::ucrt_atan2::call(pim, pre);
         out[i] = if d < 0.0 { (d + TAU) * scale } else { d * scale };
     }
-    out
 }
 
 
@@ -480,9 +528,23 @@ pub(crate) fn demod_block_cpu(
         }
     }
 
+    // Reusable work buffers for this block (see `Scratch`).
+    let mut sc = SCRATCH.with(|c| c.borrow_mut().take().unwrap_or_default());
+    let Scratch {
+        samples,
+        indata,
+        spec_buf,
+        out_buf,
+        ch_spec,
+        ch_out,
+        demod_buf,
+    } = &mut *sc;
+
     // indata_fft = npfft.fft(data[:blocklen])  -- f64 (the f32 input samples
     // are exact integers, identical to Python's int16-as-float64 input).
-    let indata_fft = ffi_ducc::fft_real_full(&data[..blocklen].iter().map(|&v| f64::from(v)).collect::<Vec<f64>>());
+    samples.clear();
+    samples.extend(data[..blocklen].iter().map(|&v| f64::from(v)));
+    ffi_ducc::fft_real_full_into(samples, indata);
     st.mark(1);
 
     // Dropout-detection RF highpass. Python cuts with `video_rot` during
@@ -492,54 +554,60 @@ pub(crate) fn demod_block_cpu(
     // clone-then-overwrite pass; per element the arithmetic is the same
     // np_cmul, so the spectrum is bit-identical and one full-buffer read
     // plus one write per block is gone.
-    let mut rfhpf_spec: Vec<Complex64> = Vec::with_capacity(blocklen);
-    rfhpf_spec.extend(
-        indata_fft
+    spec_buf.clear();
+    spec_buf.extend(
+        indata
             .iter()
             .zip(&spec.filters.frfhpf)
             .map(|(&v, &f)| np_cmul(v, f)),
     );
     st.mark(2);
-    let rfhpf_full = ffi_ducc::ifft(&rfhpf_spec);
+    ffi_ducc::ifft_into(spec_buf, out_buf);
     if let Some(s) = dump {
-        let rfhpf_f64: Vec<f64> = rfhpf_full.iter().map(|v| v.re).collect();
+        let rfhpf_f64: Vec<f64> = out_buf.iter().map(|v| v.re).collect();
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_rfhpf.bin", s),
             &pipe_f64(&rfhpf_f64),
         );
     }
-    let rfhpf = cut_rfhpf(&rfhpf_full, spec, rotdelay);
+    let rfhpf = cut_rfhpf(out_buf, spec, rotdelay);
     st.mark(3);
 
     // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
     // Same direct-build as rfhpf_spec above (no clone-then-overwrite pass).
-    let mut efm_spec: Vec<Complex64> = Vec::with_capacity(blocklen);
-    efm_spec.extend(
-        indata_fft
+    spec_buf.clear();
+    spec_buf.extend(
+        indata
             .iter()
             .zip(&spec.filters.fefm)
             .map(|(&v, &f)| np_cmul(v, f)),
     );
     st.mark(4);
-    let efm_full = ffi_ducc::ifft(&efm_spec);
+    ffi_ducc::ifft_into(spec_buf, out_buf);
     if let Some(s) = dump {
-        let efm_f64: Vec<f64> = efm_full.iter().map(|v| v.re).collect();
+        let efm_f64: Vec<f64> = out_buf.iter().map(|v| v.re).collect();
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_efm.bin", s),
             &pipe_f64(&efm_f64),
         );
     }
-    let mut efm: Vec<i16> = efm_full
-        .iter()
-        .map(|v| (v.re.clamp(-32768.0, 32767.0)) as i16)
-        .collect();
-    if cut {
-        let start = spec.blockcut.min(efm.len());
-        let end = efm.len().saturating_sub(spec.blockcut_end);
-        efm = efm[start.min(end)..end].to_vec();
-    }
+    // The clip is element-wise, so building only the kept range yields exactly
+    // the elements the full-length build then sliced out.
+    let efm: Vec<i16> = {
+        let (start, end) = if cut {
+            let start = spec.blockcut.min(out_buf.len());
+            let end = out_buf.len().saturating_sub(spec.blockcut_end);
+            (start.min(end), end)
+        } else {
+            (0, out_buf.len())
+        };
+        out_buf[start..end]
+            .iter()
+            .map(|v| (v.re.clamp(-32768.0, 32767.0)) as i16)
+            .collect()
+    };
     st.mark(5);
 
     // Analog audio stage 1: per-channel sliced bandpass demod.
@@ -552,9 +620,9 @@ pub(crate) fn demod_block_cpu(
         // Slice-and-multiply fused: the previous shape materialised the slice
         // copy only to overwrite every element with the filt1 product. The
         // per-element arithmetic (np_cmul) and the slice order are unchanged.
-        let sliced: Vec<Complex64> = indata_fft[af.lowbin..af.lowbin + nbins_half]
+        let sliced: Vec<Complex64> = indata[af.lowbin..af.lowbin + nbins_half]
             .iter()
-            .chain(&indata_fft[blocklen - af.lowbin - nbins_half..blocklen - af.lowbin])
+            .chain(&indata[blocklen - af.lowbin - nbins_half..blocklen - af.lowbin])
             .zip(&af.filt1)
             .map(|(&v, &f)| np_cmul(v, f))
             .collect();
@@ -592,67 +660,70 @@ pub(crate) fn demod_block_cpu(
             }
         }
     }
-    let mut filtered = indata_fft;
     // Python: `indata_fft_filt = indata_fft * RFVideo` (FMA array multiply),
-    // then `*= MTF ** mtf_level` (whole-array power, then FMA multiply).
+    // then `*= MTF ** mtf_level` (whole-array power, then FMA multiply). The
+    // product is built into the reused spectrum buffer instead of into a copy
+    // of `indata`: per element the chain is the same `np_cmul(np_cmul(v, f),
+    // mf)`, and the reference's own fused/two-pass split already assumes both
+    // pass structures agree element-wise (they do; only the buffering differs).
+    spec_buf.clear();
+    spec_buf.extend(
+        indata
+            .iter()
+            .zip(&spec.filters.rfvideo)
+            .map(|(&v, &f)| np_cmul(v, f)),
+    );
     if let Some(mtf_pow) = mtf_pow {
-        if mtf_pow.len() == spec.filters.rfvideo.len() {
-            for (v, (&f, &mf)) in filtered.iter_mut().zip(spec.filters.rfvideo.iter().zip(mtf_pow)) {
-                *v = np_cmul(np_cmul(*v, f), mf);
-            }
-        } else {
-            for (v, &f) in filtered.iter_mut().zip(&spec.filters.rfvideo) {
-                *v = np_cmul(*v, f);
-            }
-            for (v, &f) in filtered.iter_mut().zip(mtf_pow) {
-                *v = np_cmul(*v, f);
-            }
-        }
-    } else {
-        for (v, &f) in filtered.iter_mut().zip(&spec.filters.rfvideo) {
-            *v = np_cmul(*v, f);
+        for (v, &mf) in spec_buf.iter_mut().zip(mtf_pow) {
+            *v = np_cmul(*v, mf);
         }
     }
 
     st.mark(7);
-    let hilbert = ffi_ducc::ifft(&filtered);
+    ffi_ducc::ifft_into(spec_buf, out_buf);
     if let Some(s) = dump {
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_hilbert.bin", s),
-            &pipe_cf(&hilbert),
+            &pipe_cf(out_buf),
         );
     }
     st.mark(8);
-    let demod = unwrap_hilbert(&hilbert, spec.freq_hz);
+    unwrap_hilbert_into(out_buf, spec.freq_hz, demod_buf);
     if let Some(s) = dump {
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_demod.bin", s),
-            &pipe_f64(&demod),
+            &pipe_f64(demod_buf),
         );
     }
 
+    // The raw channel comes off the *unclamped* demod (the reference reads
+    // `demod` before any clipped copy exists); the clamp then runs in place,
+    // holding exactly the values the reference's separate array held, and
+    // nothing reads the unclamped demod afterwards.
+    let demod_raw = f32_at_range(demod_buf, spec, cut);
     // demod_fft = fft(clip(demod, 1500000, freq_hz * 0.75))
     let freq_hz = spec.freq_hz;
-    let clipped: Vec<f64> = demod
-        .iter()
-        .map(|&d| d.clamp(1_500_000.0, freq_hz * 0.75))
-        .collect();
+    for v in demod_buf.iter_mut() {
+        *v = (*v).clamp(1_500_000.0, freq_hz * 0.75);
+    }
     st.mark(9);
-    let demod_fft = ffi_ducc::fft_real_full(&clipped);
+    // `demod_fft`, written over `indata`: that spectrum is dead here (the audio
+    // slice and the video-filter product were its last users).
+    ffi_ducc::fft_real_full_into(demod_buf, indata);
     if let Some(s) = dump {
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_demod_fft.bin", s),
-            &pipe_cf(&demod_fft),
+            &pipe_cf(indata),
         );
     }
     st.mark(10);
 
     let mut video = VideoChannels {
         demod: Vec::new(),
-        demod_raw: f32_at_range(&demod, spec, cut),
+        demod_raw,
         demod_05: Vec::new(),
         demod_burst: Vec::new(),
         audio,
@@ -661,15 +732,15 @@ pub(crate) fn demod_block_cpu(
     st.mark(11);
 
     // The three post-demod filters, each with its own known delay rolled in
-    // the time domain, exactly like the reference. A single reusable scratch
-    // holds the filtered spectrum (no per-channel clone of `demod_fft`), and
-    // the ifft output is converted straight to f32; identical arithmetic.
-    let mut ch_scratch: Vec<Complex64> = Vec::with_capacity(demod_fft.len());
-    let (cstart, cend) = kept_range(demod_fft.len(), spec, cut);
+    // the time domain, exactly like the reference. Reused scratch buffers hold
+    // the filtered spectrum and the ifft output (no per-channel clone of the
+    // demod spectrum), and the output is converted straight to f32; identical
+    // arithmetic.
+    let (cstart, cend) = kept_range(indata.len(), spec, cut);
     for (i, filter) in spec.filters.fvideo.iter().enumerate() {
-        ch_scratch.clear();
-        ch_scratch.extend(demod_fft.iter().zip(filter).map(|(&s, &f)| np_cmul(s, f)));
-        let ifft_res = ffi_ducc::ifft(&ch_scratch);
+        ch_spec.clear();
+        ch_spec.extend(indata.iter().zip(filter).map(|(&s, &f)| np_cmul(s, f)));
+        ffi_ducc::ifft_into(ch_spec, ch_out);
         if let Some(s) = dump {
             if i < 2 {
                 pipe_write(
@@ -679,7 +750,7 @@ pub(crate) fn demod_block_cpu(
                         s,
                         if i == 0 { "out_video" } else { "out_video05" }
                     ),
-                    &pipe_f64(&ifft_res.iter().map(|v| v.re).collect::<Vec<f64>>()),
+                    &pipe_f64(&ch_out.iter().map(|v| v.re).collect::<Vec<f64>>()),
                 );
             }
         }
@@ -689,7 +760,7 @@ pub(crate) fn demod_block_cpu(
             2 => spec.filters.fvideo_burst_offset,
             _ => unreachable!(),
         };
-        let out_f32 = rolled_f32_range(&ifft_res, offset, cstart, cend);
+        let out_f32 = rolled_f32_range(ch_out, offset, cstart, cend);
         match i {
             0 => video.demod = out_f32,
             1 => video.demod_05 = out_f32,
@@ -698,6 +769,8 @@ pub(crate) fn demod_block_cpu(
         }
     }
     st.mark(12);
+    // Hand the work buffers back for the next block on this thread.
+    SCRATCH.with(|c| *c.borrow_mut() = Some(sc));
     BlockDecode { video, rfhpf }
 }
 
