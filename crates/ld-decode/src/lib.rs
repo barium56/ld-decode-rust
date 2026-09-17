@@ -2,7 +2,7 @@
 
 mod decode;
 mod envflag;
-mod ffi_ducc;
+pub mod ffi_ducc;
 pub mod logging;
 mod optimized;
 mod request;

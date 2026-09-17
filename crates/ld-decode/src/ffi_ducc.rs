@@ -1,22 +1,162 @@
 //! FFI bindings to the vendored ducc0 FFT library (the exact FFT behind
 //! `scipy.fft` in scipy >= 1.18), compiled via `build.rs`.
 //!
-//! These reproduce scipy's `_duccfft` rounding **bit-for-bit** on x86-64 when
-//! the library is built the same way (SSE2 homegrown SIMD, single-threaded),
-//! which is required for the decoder's output to match the reference bit-exactly.
+//! The DEFAULT engine (`sse2`) reproduces scipy's `_duccfft` rounding
+//! **bit-for-bit** on x86-64, which is required for the decoder's output to
+//! match the reference bit-exactly.
+//!
+//! EXPERIMENTAL ENGINES (user-sanctioned 2026-09-17): the binary also carries
+//! `avx2fma` (-mavx2 -mfma — the historically 2.7x-faster but
+//! differently-rounding build) and `avx2` (-mavx2 -mfma -ffp-contract=off —
+//! tests whether the divergence is compiler FMA contraction; ducc's kernels
+//! use no explicit FMA, so without contraction a 4-lane AVX2 build should
+//! round identically to SSE2). Selection is runtime-only via `LD_FFT_ENGINE`
+//! (values: `sse2` default | `avx2fma` | `avx2`), gated on CPU features, with
+//! the active engine logged once at startup. The default path is untouched.
 
 use rustfft::num_complex::Complex64;
 use std::os::raw::c_int;
+use std::sync::OnceLock;
 
 unsafe extern "C" {
-    /// Forward complex FFT, no normalization. `in`/`out` hold `2n` doubles (n complex).
-    fn duccq_fft(n: c_int, inp: *const f64, out: *mut f64);
-    /// Inverse complex FFT, normalized by 1/n.
-    fn duccq_ifft(n: c_int, inp: *const f64, out: *mut f64);
-    /// Forward real FFT -> half spectrum, `n/2+1` complex out (unnormalized).
-    fn duccq_rfft(n: c_int, inp: *const f64, out: *mut f64);
-    /// Inverse real FFT from a half spectrum, `n` real out, normalized by 1/n.
-    fn duccq_irfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_fft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_ifft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_rfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_irfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2fma_fft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2fma_ifft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2fma_rfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2fma_irfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2_fft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2_ifft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2_rfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2_irfft(n: c_int, inp: *const f64, out: *mut f64);
+}
+
+/// The FFT engine backing the ducc FFI entry points.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FftEngine {
+    /// scipy-wheel replica (-msse2 only): the bit-exact default.
+    Sse2,
+    /// -mavx2 -mfma: fastest ducc build, historically divergent rounding.
+    Avx2Fma,
+    /// -mavx2 -mfma -ffp-contract=off: FMA-contraction-hypothesis build.
+    Avx2,
+}
+
+impl FftEngine {
+    pub fn name(self) -> &'static str {
+        match self {
+            FftEngine::Sse2 => "sse2",
+            FftEngine::Avx2Fma => "avx2fma",
+            FftEngine::Avx2 => "avx2",
+        }
+    }
+
+    fn resolve(requested: Option<&str>) -> Result<FftEngine, String> {
+        let eng = match requested.map(str::trim).filter(|s| !s.is_empty()) {
+            None => FftEngine::Sse2,
+            Some(s) if s.eq_ignore_ascii_case("sse2") => FftEngine::Sse2,
+            Some(s) if s.eq_ignore_ascii_case("avx2fma") => FftEngine::Avx2Fma,
+            Some(s) if s.eq_ignore_ascii_case("avx2") => FftEngine::Avx2,
+            Some(other) => {
+                return Err(format!(
+                    "unknown LD_FFT_ENGINE '{other}' (valid: sse2 | avx2fma | avx2)"
+                ))
+            }
+        };
+        // Runtime CPU gating: refusing loudly beats an illegal instruction.
+        if (matches!(eng, FftEngine::Avx2Fma | FftEngine::Avx2)
+            && !std::arch::is_x86_feature_detected!("avx2"))
+            || (matches!(eng, FftEngine::Avx2Fma)
+                && !std::arch::is_x86_feature_detected!("fma"))
+        {
+            return Err(format!(
+                "LD_FFT_ENGINE={} requested but this CPU lacks the required features",
+                eng.name()
+            ));
+        }
+        Ok(eng)
+    }
+}
+
+static ENGINE: OnceLock<FftEngine> = OnceLock::new();
+
+#[cfg(test)]
+static TEST_OVERRIDE: std::sync::RwLock<Option<FftEngine>> = std::sync::RwLock::new(None);
+
+/// Resolve and install the FFT engine from the `LD_FFT_ENGINE` env var (once
+/// per process). Called by the CLI before decoding starts; errors are fatal
+/// and reported verbatim.
+pub fn init_engine() -> Result<FftEngine, String> {
+    if let Some(e) = ENGINE.get() {
+        return Ok(*e);
+    }
+    let requested = std::env::var("LD_FFT_ENGINE").ok();
+    let eng = FftEngine::resolve(requested.as_deref())?;
+    let _ = ENGINE.set(eng);
+    Ok(eng)
+}
+
+/// The active engine (default `sse2` if [`init_engine`] was not called).
+pub fn active_engine() -> FftEngine {
+    *ENGINE.get_or_init(|| FftEngine::Sse2)
+}
+
+/// Resolve the engine once and cache the four entry points.
+fn eng() -> (
+    unsafe extern "C" fn(c_int, *const f64, *mut f64),
+    unsafe extern "C" fn(c_int, *const f64, *mut f64),
+    unsafe extern "C" fn(c_int, *const f64, *mut f64),
+    unsafe extern "C" fn(c_int, *const f64, *mut f64),
+) {
+    #[cfg(test)]
+    {
+        if let Ok(g) = TEST_OVERRIDE.read() {
+            if let Some(e) = *g {
+                return match e {
+                    FftEngine::Sse2 => (
+                        duccq_sse2_fft,
+                        duccq_sse2_ifft,
+                        duccq_sse2_rfft,
+                        duccq_sse2_irfft,
+                    ),
+                    FftEngine::Avx2Fma => (
+                        duccq_avx2fma_fft,
+                        duccq_avx2fma_ifft,
+                        duccq_avx2fma_rfft,
+                        duccq_avx2fma_irfft,
+                    ),
+                    FftEngine::Avx2 => (
+                        duccq_avx2_fft,
+                        duccq_avx2_ifft,
+                        duccq_avx2_rfft,
+                        duccq_avx2_irfft,
+                    ),
+                };
+            }
+        }
+    }
+    match active_engine() {
+        FftEngine::Sse2 => (
+            duccq_sse2_fft,
+            duccq_sse2_ifft,
+            duccq_sse2_rfft,
+            duccq_sse2_irfft,
+        ),
+        FftEngine::Avx2Fma => (
+            duccq_avx2fma_fft,
+            duccq_avx2fma_ifft,
+            duccq_avx2fma_rfft,
+            duccq_avx2fma_irfft,
+        ),
+        FftEngine::Avx2 => (
+            duccq_avx2_fft,
+            duccq_avx2_ifft,
+            duccq_avx2_rfft,
+            duccq_avx2_irfft,
+        ),
+    }
 }
 
 // `Complex64` is `#[repr(C)] { re: f64, im: f64 }`, i.e. its memory layout is
@@ -35,8 +175,9 @@ fn uninit_complex(len: usize) -> Vec<Complex64> {
 pub fn fft(x: &[Complex64]) -> Vec<Complex64> {
     let n = x.len() as c_int;
     let mut out = uninit_complex(x.len());
+    let (f_fft, _, _, _) = eng();
     unsafe {
-        duccq_fft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
+        f_fft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
     }
     out
 }
@@ -59,8 +200,9 @@ pub fn ifft_into(x: &[Complex64], out: &mut Vec<Complex64>) {
     out.reserve(x.len());
     // ducc writes all n output elements before returning.
     unsafe { out.set_len(x.len()) };
+    let (_, f_ifft, _, _) = eng();
     unsafe {
-        duccq_ifft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
+        f_ifft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
     }
 }
 
@@ -69,8 +211,9 @@ pub fn ifft_into(x: &[Complex64], out: &mut Vec<Complex64>) {
 pub fn rfft(x: &[f64]) -> Vec<Complex64> {
     let n = x.len() as c_int;
     let mut out = uninit_complex(x.len() / 2 + 1);
+    let (_, _, f_rfft, _) = eng();
     unsafe {
-        duccq_rfft(n, x.as_ptr(), out.as_mut_ptr() as *mut f64);
+        f_rfft(n, x.as_ptr(), out.as_mut_ptr() as *mut f64);
     }
     out
 }
@@ -99,8 +242,9 @@ pub fn fft_real_full_into(x: &[f64], out: &mut Vec<Complex64>) {
     out.reserve(n);
     // ducc fills bins 0..=n/2; the reflection loop fills n/2+1..n.
     unsafe { out.set_len(n) };
+    let (_, _, f_rfft, _) = eng();
     unsafe {
-        duccq_rfft(n as c_int, x.as_ptr(), out.as_mut_ptr() as *mut f64);
+        f_rfft(n as c_int, x.as_ptr(), out.as_mut_ptr() as *mut f64);
     }
     for k in (1..n / 2).rev() {
         let c = out[k];
@@ -112,8 +256,9 @@ pub fn fft_real_full_into(x: &[f64], out: &mut Vec<Complex64>) {
 /// Inverse real FFT from a half spectrum, `n` real out, normalized by 1/n.
 pub fn irfft(spectrum: &[Complex64], n: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; n];
+    let (_, _, _, f_irfft) = eng();
     unsafe {
-        duccq_irfft(n as c_int, spectrum.as_ptr() as *const f64, out.as_mut_ptr());
+        f_irfft(n as c_int, spectrum.as_ptr() as *const f64, out.as_mut_ptr());
     }
     out
 }
@@ -284,19 +429,17 @@ mod tests {
         }
     }
 
-    // PARITY PROBE (measured, REJECTED 2026-09-16): an AVX2 build of the
-    // vendored ducc0 (`-mavx2 -mfma` added next to `/O2` in build.rs) is 2.7x
-    // faster on exactly the transform the decoder spends its time in — with a
-    // forced rebuild, fft+ifft n=32768 goes 1072 us -> 394 us per pair and
-    // rfft+irfft 682 us -> 344 us — but it rounds differently at *every* size
-    // this crate uses: this test fails at idx 1, `fft_real_full` at idx 1 and
-    // the 1024 canary at idx 1. Every transform the pipeline runs is
-    // 32768-point (2 r2c + 6 c2c per block, 21 blocks per field, plus small
-    // audio slices), so there is no subset of sizes where AVX2 could be
-    // enabled — permanently off the table under the bit-parity directive, like
-    // the c2r path. To re-measure: add the two flags to build.rs, `touch` it
-    // (cargo does not rebuild on an env var change) and run these tests. Do not
-    // leave the flags in a default build.
+    // PARITY PROBE (2026-09-16 record, SUPERSEDED 2026-09-17 — see
+    // `engine_census_vs_scipy_goldens`): the original AVX2 experiment (flags
+    // hand-added to build.rs) measured 2.7x faster but divergent at idx 1 of
+    // every golden. Re-measured with the runtime-selectable engines: on the
+    // CURRENT toolchain, verified-AVX2 codegen (FMA/ymm instructions confirmed
+    // in the objects) is bit-identical to scipy on every golden and 4/4
+    // byte-identical end-to-end — and ~20% SLOWER per transform pair
+    // (1412 vs 1181 us), i.e. the old speed record is also stale (likely
+    // clang-cl fp-contraction/codegen drift). The engines stay available via
+    // LD_FFT_ENGINE with sse2 as the default; do not flip the default on
+    // micro-benchmarks alone.
     /// c2c forward and inverse at the pipeline's block length.
     #[test]
     fn fft_matches_scipy_32768() {
@@ -333,6 +476,153 @@ mod tests {
             } else {
                 assert_eq!(got[i].im.to_bits(), want[i].im.to_bits(), "idx {i} im");
             }
+        }
+    }
+
+    // CENSUS (experimental engines): for each engine, how far is its output
+    // from the scipy goldens? Runs all golden comparisons with the engine
+    // forced, reporting divergence stats instead of asserting. The sse2 row
+    // must be zero (it is the default build pinned by the tests above); the
+    // avx2/avx2fma rows quantify what a future "make AVX2 bit-perfect" effort
+    // would have to eliminate. `--nocapture` to see the table.
+    fn census_engine(e: FftEngine) {
+        // 1024 c2c canary.
+        let input_const: &[[f64; 2]] = include!("../tests/data/scipy_in_1024.rs");
+        let want_const: &[[f64; 2]] = include!("../tests/data/scipy_out_1024.rs");
+        let x: Vec<Complex64> = input_const
+            .iter()
+            .map(|d| Complex64::new(d[0], d[1]))
+            .collect();
+        let want: Vec<Complex64> = want_const
+            .iter()
+            .map(|d| Complex64::new(d[0], d[1]))
+            .collect();
+        *TEST_OVERRIDE.write().unwrap() = Some(e);
+        let y = fft(&x);
+        let mut cells = 0u64;
+        let mut worst_rel = 0.0f64;
+        let mut worst_idx = 0usize;
+        for i in 0..want.len() {
+            for (g, w) in [(y[i].re, want[i].re), (y[i].im, want[i].im)] {
+                if g.to_bits() != w.to_bits() {
+                    cells += 1;
+                    let d = (g - w).abs();
+                    let rel = d / w.abs().max(1e-300);
+                    if rel > worst_rel {
+                        worst_rel = rel;
+                        worst_idx = i;
+                    }
+                }
+            }
+        }
+        println!(
+            "{:8} c2c 1024: divergent cells {cells}/{} worst_rel {:.3e} at idx {worst_idx}",
+            e.name(),
+            want.len() * 2,
+            worst_rel
+        );
+
+        // 32768 golden set: c2c fwd/inv + r2c-full.
+        let xg = read_cf("fft32768_in.f64");
+        for (what, got, want) in [
+            ("fwd", fft(&xg), read_cf("fft32768_fwd.f64")),
+            ("inv", ifft(&xg), read_cf("fft32768_inv.f64")),
+        ] {
+            let mut cells = 0u64;
+            let mut worst_rel = 0.0f64;
+            let mut worst_idx = 0usize;
+            let mut ulp = 0u64;
+            for i in 0..want.len() {
+                for (g, w) in [(got[i].re, want[i].re), (got[i].im, want[i].im)] {
+                    if g.to_bits() != w.to_bits() {
+                        cells += 1;
+                        let dg = g.to_bits() as i64 - w.to_bits() as i64;
+                        let dw = w.to_bits() as i64 - g.to_bits() as i64;
+                        ulp = ulp.max(dg.unsigned_abs().max(dw.unsigned_abs()));
+                        let rel = (g - w).abs() / w.abs().max(1e-300);
+                        if rel > worst_rel {
+                            worst_rel = rel;
+                            worst_idx = i;
+                        }
+                    }
+                }
+            }
+            println!(
+                "{e2:8} c2c 32768 {what}: divergent cells {cells}/{} worst_rel {worst_rel:.3e} at idx {worst_idx} max_ulp_gap {ulp}",
+                want.len() * 2,
+                e2 = e.name()
+            );
+        }
+        let real = read_f64s("rfft32768_in.f64");
+        let got = fft_real_full(&real);
+        let want = read_cf("rfft32768_full.f64");
+        let mut cells = 0u64;
+        let mut worst_rel = 0.0f64;
+        for i in 0..want.len() {
+            let trivial_im = i == 0 || i == want.len() / 2;
+            for (g, w) in [(got[i].re, want[i].re), (got[i].im, want[i].im)] {
+                if g.to_bits() != w.to_bits() && !(trivial_im && g == 0.0 && w == 0.0) {
+                    cells += 1;
+                    let rel = (g - w).abs() / w.abs().max(1e-300);
+                    worst_rel = worst_rel.max(rel);
+                }
+            }
+        }
+        println!(
+            "{:8} r2c-full 32768: divergent cells {cells}/{} worst_rel {:.3e}",
+            e.name(),
+            want.len() * 2,
+            worst_rel
+        );
+        *TEST_OVERRIDE.write().unwrap() = None;
+    }
+
+    #[test]
+    fn engine_census_vs_scipy_goldens() {
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            println!("skip: CPU lacks avx2/fma");
+            return;
+        }
+        for e in [FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma] {
+            census_engine(e);
+        }
+    }
+
+    /// Flags-effectiveness check: the AVX2 engines only mean anything if the
+    /// compiler flags actually reached ducc (clang-cl may silently drop them).
+    /// The 2026-09-16 reference numbers: sse2 fft+ifft n=32768 ≈ 1072 us/pair,
+    /// avx2 ≈ 394 us/pair. If avx2fma is not meaningfully faster than sse2,
+    /// the flags were dropped and the census above says nothing about AVX2.
+    #[test]
+    fn engine_speed_census() {
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            println!("skip: CPU lacks avx2/fma");
+            return;
+        }
+        let n = 32768usize;
+        let xc: Vec<Complex64> = (0..n)
+            .map(|i| Complex64::new(((i as f64) * 0.38).fract() - 0.5, ((i as f64) * 0.11).fract()))
+            .collect();
+        for e in [FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma] {
+            *TEST_OVERRIDE.write().unwrap() = Some(e);
+            // warmup
+            let sink = fft(&xc);
+            let sink2 = ifft(&sink);
+            std::hint::black_box(&sink2);
+            let iters = 100;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let s = fft(&xc);
+                let s2 = ifft(&s);
+                std::hint::black_box(&s2);
+            }
+            let per_pair = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("{:8}: fft+ifft n=32768 pair = {:.0} us", e.name(), per_pair);
+            *TEST_OVERRIDE.write().unwrap() = None;
         }
     }
 

@@ -2,9 +2,26 @@
 // _duccfft rounding) to the Rust decoder via FFI.
 //
 // Compiled with clang targeting MSVC ABI, SSE2 homegrown SIMD, single-threaded.
+//
+// The shim is compiled ONCE PER ENGINE (see crates/ld-decode/build.rs):
+//   sse2    — the scipy-wheel replica (default, bit-exact reference build)
+//   avx2fma — -mavx2 -mfma (fastest, historically rounds differently)
+//   avx2    — -mavx2 -mfma -ffp-contract=off (FMA-contraction hypothesis)
+// DUCCQ_PREFIX gives each copy's extern "C" entry points distinct symbols so
+// all three can link into one binary and be selected at runtime. ducc
+// internals (fft1d_impl.h / fftnd_impl.h) are anonymous-namespace templates
+// instantiated inside this TU, so the per-engine copies cannot clash.
 #include <cstddef>
 #include <complex>
 #include "ducc0/fft/fftnd_impl.h"
+
+#ifndef DUCCQ_PREFIX
+#define DUCCQ_PREFIX duccq_
+#endif
+
+#define DUCCQ_CONCAT2(a, b) a##b
+#define DUCCQ_CONCAT(a, b) DUCCQ_CONCAT2(a, b)
+#define FN(name) DUCCQ_CONCAT(DUCCQ_PREFIX, name)
 
 using namespace ducc0;
 using namespace ducc0::detail_mav;
@@ -18,7 +35,7 @@ static void duccq_fail(const char *what, const char *fn) {
 extern "C" {
 
 // Forward complex FFT (no normalization). out[0..2n-1].
-void duccq_fft(int n, const double *in, double *out) {
+void FN(fft)(int n, const double *in, double *out) {
   try {
     shape_t axes{ 0 };
     cfmav<complex<double>> cin((complex<double>*)in, shape_t{(size_t)n});
@@ -29,7 +46,7 @@ void duccq_fft(int n, const double *in, double *out) {
 }
 
 // Inverse complex FFT (normalized by 1/n). out[0..2n-1].
-void duccq_ifft(int n, const double *in, double *out) {
+void FN(ifft)(int n, const double *in, double *out) {
   try {
     shape_t axes{ 0 };
     cfmav<complex<double>> cin((complex<double>*)in, shape_t{(size_t)n});
@@ -40,7 +57,7 @@ void duccq_ifft(int n, const double *in, double *out) {
 }
 
 // Forward real FFT -> half spectrum (n/2+1 complex). out size = 2*(n/2+1).
-void duccq_rfft(int n, const double *in, double *out) {
+void FN(rfft)(int n, const double *in, double *out) {
   try {
     cfmav<double> rin(in, shape_t{(size_t)n});
     vfmav<complex<double>> cout((complex<double>*)out, shape_t{(size_t)(n/2+1)});
@@ -50,7 +67,7 @@ void duccq_rfft(int n, const double *in, double *out) {
 }
 
 // Inverse real FFT: half spectrum (n/2+1 complex) in, n real out. fct=1/n.
-void duccq_irfft(int n, const double *in, double *out) {
+void FN(irfft)(int n, const double *in, double *out) {
   try {
     cfmav<complex<double>> cin((complex<double>*)in, shape_t{(size_t)(n/2+1)});
     vfmav<double> cout(out, shape_t{(size_t)n});

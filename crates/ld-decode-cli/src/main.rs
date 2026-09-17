@@ -179,6 +179,21 @@ fn main() -> Result<()> {
 
     ld_decode::set_worker_threads(args.threads);
 
+    // Resolve the FFT engine before any transform runs. Default (no
+    // LD_FFT_ENGINE) is the scipy-bit-exact sse2 build; the experimental
+    // engines are opt-in and logged so no run is ever ambiguous.
+    let engine = ld_decode::ffi_ducc::init_engine()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!(
+        "FFT engine: {}{}",
+        engine.name(),
+        if matches!(engine, ld_decode::ffi_ducc::FftEngine::Sse2) {
+            " (scipy bit-exact default)"
+        } else {
+            " (EXPERIMENTAL — output will differ from the reference unless the engine is verified bit-exact)"
+        }
+    );
+
     let spec = Arc::new(DecoderSpec::new(&request)?);
     tracing::info!(
         "System NTSC, {} MHz input, {} samples/line, {} lines/field",
