@@ -710,6 +710,94 @@ pub(crate) fn np_cmul_assign(a: &mut [Complex64], b: &[Complex64]) {
     np_cmul_core(p as *const f64, b.as_ptr() as *const f64, p, n);
 }
 
+/// Fused chain `out[i] = np_cmul(np_cmul(a[i], b[i]), c[i])` in one pass: the
+/// intermediate product stays in a register instead of round-tripping through
+/// memory. Per element the op sequence and rounding are identical to the
+/// [`np_cmul_fill`] + [`np_cmul_assign`] pair — the AVX2 kernel is the same
+/// `mul_avx2` body with the register product playing the "a" role in the
+/// second multiply — so results are bit-identical.
+pub(crate) fn np_cmul3_fill(a: &[Complex64], b: &[Complex64], c: &[Complex64], out: &mut Vec<Complex64>) {
+    out.clear();
+    let n = a.len().min(b.len()).min(c.len());
+    out.reserve(n);
+    // SAFETY: as in `np_cmul_extend` — `base + n <= capacity` after `reserve`,
+    // every appended element is overwritten, and the fill cannot unwind.
+    unsafe { out.set_len(n) };
+    np_cmul3_core(
+        a.as_ptr() as *const f64,
+        b.as_ptr() as *const f64,
+        c.as_ptr() as *const f64,
+        out.as_mut_ptr() as *mut f64,
+        n,
+    );
+}
+
+/// Scalar/vector dispatch for the fused two-multiply chain. `op` may alias any
+/// input only if that input is not also read after being overwritten — the
+/// production call sites never alias (a, b, c are all distinct from out).
+#[inline]
+fn np_cmul3_core(ap: *const f64, bp: *const f64, cp: *const f64, op: *mut f64, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn mul3_avx2(ap: *const f64, bp: *const f64, cp: *const f64, op: *mut f64, n: usize) {
+            use std::arch::x86_64::*;
+            let mut i = 0usize;
+            // Two complex values per iteration; lane layout as in `mul_avx2`.
+            while i + 2 <= n {
+                let a = _mm256_loadu_pd(ap.add(i * 2));
+                let b = _mm256_loadu_pd(bp.add(i * 2));
+                let ar = _mm256_movedup_pd(a);
+                let ai = _mm256_permute_pd(a, 0b1111);
+                let bswap = _mm256_permute_pd(b, 0b0101);
+                let t = _mm256_mul_pd(ai, bswap);
+                // p = np_cmul(a, b), held in a register.
+                let p = _mm256_fmaddsub_pd(ar, b, t);
+                let c = _mm256_loadu_pd(cp.add(i * 2));
+                // r = np_cmul(p, c): the packed register product takes the
+                // same role `a` plays in the single-multiply kernel (movedup
+                // / permute on `p`, direct + 0101-permute on `c`), so the
+                // lane ops match the two-pass kernel exactly.
+                let pr2 = _mm256_movedup_pd(p);
+                let pi2 = _mm256_permute_pd(p, 0b1111);
+                let cswap = _mm256_permute_pd(c, 0b0101);
+                let t2 = _mm256_mul_pd(pi2, cswap);
+                let r = _mm256_fmaddsub_pd(pr2, c, t2);
+                _mm256_storeu_pd(op.add(i * 2), r);
+                i += 2;
+            }
+            while i < n {
+                let ar = *ap.add(i * 2);
+                let ai = *ap.add(i * 2 + 1);
+                let br = *bp.add(i * 2);
+                let bi = *bp.add(i * 2 + 1);
+                // np_cmul(a, b) — scalar tail, same ops as `mul_avx2`'s tail.
+                let pr = ar.mul_add(br, -(ai * bi));
+                let pi = ar.mul_add(bi, ai * br);
+                let cr = *cp.add(i * 2);
+                let ci = *cp.add(i * 2 + 1);
+                // np_cmul(p, c)
+                *op.add(i * 2) = pr.mul_add(cr, -(pi * ci));
+                *op.add(i * 2 + 1) = pr.mul_add(ci, pi * cr);
+                i += 1;
+            }
+        }
+        unsafe { mul3_avx2(ap, bp, cp, op, n) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for i in 0..n {
+        let (ar, ai) = unsafe { (*ap.add(i * 2), *ap.add(i * 2 + 1)) };
+        let (br, bi) = unsafe { (*bp.add(i * 2), *bp.add(i * 2 + 1)) };
+        let (cr, ci) = unsafe { (*cp.add(i * 2), *cp.add(i * 2 + 1)) };
+        let pr = fma(ar, br, -(ai * bi));
+        let pi = fma(ar, bi, ai * br);
+        unsafe {
+            *op.add(i * 2) = fma(pr, cr, -(pi * ci));
+            *op.add(i * 2 + 1) = fma(pr, ci, pi * cr);
+        }
+    }
+}
+
 /// Scalar/vector dispatch for the element-wise complex multiply. `ap` and `op`
 /// may be the same pointer (in-place); each element is read before it is
 /// written.
@@ -2135,6 +2223,53 @@ fn ifft_real(data: &[Complex64], blocklen: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `np_cmul3` must be bit-identical to the two-pass fill+assign pair it
+    /// replaces (the demod video product): same lane ops, same rounding,
+    /// every element.
+    #[test]
+    fn np_cmul3_bit_identical_to_two_pass() {
+        fn probe(len: usize, seed: u64) -> Vec<Complex64> {
+            let mut s = seed | 1;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // Magnitudes spanning normal f64 well; occasional small values.
+                let m = (s >> 11) as f64 / (1u64 << 53) as f64;
+                let e = ((s >> 40) % 30) as i32 - 15;
+                Complex64::new(m * 10f64.powi(e), m * 10f64.powi(e - 3))
+            };
+            (0..len).map(|_| next()).collect()
+        }
+        for &(len, seed) in &[
+            (1usize, 0xDEADBEEF),
+            (2, 0x1234),
+            (3, 0x5678),
+            (7, 0x9ABC),
+            (1024, 0x1111),
+            (32768, 0x2222),
+        ] {
+            let a = probe(len, seed);
+            let b = probe(len, seed ^ 0x5555);
+            let c = probe(len, seed ^ 0xAAAA);
+            // Two-pass oracle.
+            let mut want: Vec<Complex64> = Vec::with_capacity(len);
+            np_cmul_extend(&a, &b, &mut want);
+            np_cmul_assign(&mut want, &c);
+            // Fused, into a reused buffer (also exercises the clear+reserve path).
+            let mut got: Vec<Complex64> = vec![Complex64::new(f64::NAN, f64::NAN); 5];
+            np_cmul3_fill(&a, &b, &c, &mut got);
+            assert_eq!(got.len(), want.len(), "len {len}");
+            for i in 0..len {
+                assert_eq!(
+                    (got[i].re.to_bits(), got[i].im.to_bits()),
+                    (want[i].re.to_bits(), want[i].im.to_bits()),
+                    "len={len} i={i}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn firwin_lowpass_matches_scipy() {

@@ -23,7 +23,8 @@ use rustfft::num_complex::Complex64;
 
 use crate::ffi_ducc;
 use crate::spec::{
-    np_cmul, np_cmul_assign, np_cmul_extend, np_cmul_fill, np_cpow, CalibLevels, Filters,
+    np_cmul, np_cmul3_fill, np_cmul_assign, np_cmul_extend, np_cmul_fill, np_cpow,
+    CalibLevels, Filters,
 };
 
 /// A borrow of everything a demodulation block needs from the spec, so the
@@ -672,13 +673,16 @@ pub(crate) fn demod_block_cpu(
     }
     // Python: `indata_fft_filt = indata_fft * RFVideo` (FMA array multiply),
     // then `*= MTF ** mtf_level` (whole-array power, then FMA multiply). The
-    // product is built into the reused spectrum buffer instead of into a copy
-    // of `indata`: per element the chain is the same `np_cmul(np_cmul(v, f),
-    // mf)`, and the reference's own fused/two-pass split already assumes both
-    // pass structures agree element-wise (they do; only the buffering differs).
-    np_cmul_fill(indata, &spec.filters.rfvideo, spec_buf);
-    if let Some(mtf_pow) = mtf_pow {
-        np_cmul_assign(spec_buf, mtf_pow);
+    // chain is fused into ONE pass over the spectrum: the intermediate
+    // `np_cmul(v, f)` product stays in a register instead of round-tripping
+    // through `spec_buf`, removing one full-buffer read + write per block.
+    // Per element the op sequence is exactly `np_cmul(np_cmul(v, f), mf)` —
+    // the same lane ops and rounding as the two-pass form — so the spectrum
+    // is bit-identical (same argument the reference's own fused/two-pass
+    // split already relies on).
+    match mtf_pow {
+        Some(mf) => np_cmul3_fill(indata, &spec.filters.rfvideo, mf, spec_buf),
+        None => np_cmul_fill(indata, &spec.filters.rfvideo, spec_buf),
     }
 
     st.mark(7);
