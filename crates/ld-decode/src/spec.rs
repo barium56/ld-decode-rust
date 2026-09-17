@@ -732,6 +732,27 @@ pub(crate) fn np_cmul3_fill(a: &[Complex64], b: &[Complex64], c: &[Complex64], o
     );
 }
 
+/// [`np_cmul3_fill`] into a caller-provided slice (the batched kernel writes
+/// each filter product straight into its row of the batch buffer). Same core as
+/// the `Vec` form, so the arithmetic and rounding are identical.
+///
+/// `out` may alias none of the inputs (the production call sites pass distinct
+/// buffers: a spectrum row is always written from a different source).
+pub(crate) fn np_cmul3_slices(a: &[Complex64], b: &[Complex64], c: &[Complex64], out: &mut [Complex64]) {
+    let n = a.len().min(b.len()).min(c.len()).min(out.len());
+    debug_assert_eq!(n, a.len());
+    debug_assert_eq!(n, b.len());
+    debug_assert_eq!(n, c.len());
+    debug_assert_eq!(n, out.len());
+    np_cmul3_core(
+        a.as_ptr() as *const f64,
+        b.as_ptr() as *const f64,
+        c.as_ptr() as *const f64,
+        out.as_mut_ptr() as *mut f64,
+        n,
+    );
+}
+
 /// Scalar/vector dispatch for the fused two-multiply chain. `op` may alias any
 /// input only if that input is not also read after being overwritten — the
 /// production call sites never alias (a, b, c are all distinct from out).

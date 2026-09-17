@@ -23,7 +23,7 @@ use rustfft::num_complex::Complex64;
 
 use crate::ffi_ducc;
 use crate::spec::{
-    np_cmul, np_cmul3_fill, np_cmul_assign, np_cmul_extend, np_cmul_fill, np_cpow,
+    np_cmul, np_cmul3_slices, np_cmul_assign, np_cmul_extend, np_cmul_slices, np_cpow,
     CalibLevels, Filters,
 };
 
@@ -122,14 +122,11 @@ struct Scratch {
     /// `fft_real_full` of the block (full Hermitian spectrum); later reused to
     /// hold `demod_fft`, whose input spectrum is dead by then.
     indata: Vec<Complex64>,
-    /// Spectrum intermediate: filter products, then the video-filter product.
-    spec_buf: Vec<Complex64>,
-    /// Inverse-FFT output intermediate.
-    out_buf: Vec<Complex64>,
-    /// Video-channel filter product.
-    ch_spec: Vec<Complex64>,
-    /// Video-channel inverse-FFT output.
-    ch_out: Vec<Complex64>,
+    /// Batched spectra: four `blocklen` rows of filter products, inverse
+    /// transformed in two batched calls per block (see the kernel body).
+    batch_spec: Vec<Complex64>,
+    /// Batched inverse-FFT output, row-aligned with `batch_spec`.
+    batch_out: Vec<Complex64>,
     /// `unwrap_hilbert` output, clamped in place for the second r2c.
     demod_buf: Vec<f64>,
 }
@@ -548,10 +545,8 @@ pub(crate) fn demod_block_cpu(
     let Scratch {
         samples,
         indata,
-        spec_buf,
-        out_buf,
-        ch_spec,
-        ch_out,
+        batch_spec,
+        batch_out,
         demod_buf,
     } = &mut *sc;
 
@@ -562,56 +557,63 @@ pub(crate) fn demod_block_cpu(
     ffi_ducc::fft_real_full_into(samples, indata);
     st.mark(1);
 
-    // Dropout-detection RF highpass. Python cuts with `video_rot` during
-    // field decode (delays set), and with 0 during the setup fakedecode
-    // (delays not yet computed) — the caller passes the matching value.
-    // The product is built directly into a fresh buffer instead of a
-    // clone-then-overwrite pass; per element the arithmetic is the same
-    // np_cmul, so the spectrum is bit-identical and one full-buffer read
-    // plus one write per block is gone.
-    np_cmul_fill(indata, &spec.filters.frfhpf, spec_buf);
+    // Batched inverse FFTs, in two groups per block. Four rows cover both: the
+    // early group is hilbert (row 0) + dropout-detection RF highpass (row 1),
+    // the late group is EFM (row 2) + the three post-demod video channels
+    // (rows 0, 1 and 3). Batching runs each transform ~1.83x faster than the
+    // per-transform call it replaces while staying bit-identical to it (see
+    // `ffi_ducc::ifft_batch_rows`).
+    //
+    // Row 2 is filled here, with the block spectrum still live, and consumed
+    // after the late group: `demod_fft` overwrites `indata` in between.
+    if batch_spec.len() < 4 * blocklen {
+        batch_spec.resize(4 * blocklen, Complex64::new(0.0, 0.0));
+        batch_out.resize(4 * blocklen, Complex64::new(0.0, 0.0));
+    }
+
+    // The hilbert product is fused with the MTF power (when nonzero): per
+    // element the op sequence is exactly `np_cmul(np_cmul(v, f), mf)` — the
+    // same lane ops and rounding as the two-pass form — so the spectrum is
+    // bit-identical.
+    match mtf_pow {
+        Some(mf) => np_cmul3_slices(indata, &spec.filters.rfvideo, mf, &mut batch_spec[..blocklen]),
+        None => np_cmul_slices(indata, &spec.filters.rfvideo, &mut batch_spec[..blocklen]),
+    }
+    // Dropout-detection RF highpass. Python cuts with `video_rot` during field
+    // decode (delays set), and with 0 during the setup fakedecode (delays not
+    // yet computed) — the caller passes the matching value. Built directly into
+    // its row, so no clone-then-overwrite pass and the same np_cmul arithmetic.
+    np_cmul_slices(
+        indata,
+        &spec.filters.frfhpf,
+        &mut batch_spec[blocklen..2 * blocklen],
+    );
+    // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
+    np_cmul_slices(
+        indata,
+        &spec.filters.fefm,
+        &mut batch_spec[2 * blocklen..3 * blocklen],
+    );
     st.mark(2);
-    ffi_ducc::ifft_into(spec_buf, out_buf);
+    ffi_ducc::ifft_batch_rows(
+        2,
+        blocklen,
+        &batch_spec[..2 * blocklen],
+        &mut batch_out[..2 * blocklen],
+    );
     if let Some(s) = dump {
-        let rfhpf_f64: Vec<f64> = out_buf.iter().map(|v| v.re).collect();
+        let rfhpf_f64: Vec<f64> = batch_out[blocklen..2 * blocklen]
+            .iter()
+            .map(|v| v.re)
+            .collect();
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_rfhpf.bin", s),
             &pipe_f64(&rfhpf_f64),
         );
     }
-    let rfhpf = cut_rfhpf(out_buf, spec, rotdelay);
+    let rfhpf = cut_rfhpf(&batch_out[blocklen..2 * blocklen], spec, rotdelay);
     st.mark(3);
-
-    // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
-    // Same direct-build as rfhpf_spec above (no clone-then-overwrite pass).
-    np_cmul_fill(indata, &spec.filters.fefm, spec_buf);
-    st.mark(4);
-    ffi_ducc::ifft_into(spec_buf, out_buf);
-    if let Some(s) = dump {
-        let efm_f64: Vec<f64> = out_buf.iter().map(|v| v.re).collect();
-        pipe_write(
-            pipe_dir.as_deref().unwrap(),
-            &format!("s{}_efm.bin", s),
-            &pipe_f64(&efm_f64),
-        );
-    }
-    // The clip is element-wise, so building only the kept range yields exactly
-    // the elements the full-length build then sliced out.
-    let efm: Vec<i16> = {
-        let (start, end) = if cut {
-            let start = spec.blockcut.min(out_buf.len());
-            let end = out_buf.len().saturating_sub(spec.blockcut_end);
-            (start.min(end), end)
-        } else {
-            (0, out_buf.len())
-        };
-        out_buf[start..end]
-            .iter()
-            .map(|v| (v.re.clamp(-32768.0, 32767.0)) as i16)
-            .collect()
-    };
-    st.mark(5);
 
     // Analog audio stage 1: per-channel sliced bandpass demod.
     let fdiv = spec.filters.audio_fdiv;
@@ -671,31 +673,18 @@ pub(crate) fn demod_block_cpu(
             }
         }
     }
-    // Python: `indata_fft_filt = indata_fft * RFVideo` (FMA array multiply),
-    // then `*= MTF ** mtf_level` (whole-array power, then FMA multiply). The
-    // chain is fused into ONE pass over the spectrum: the intermediate
-    // `np_cmul(v, f)` product stays in a register instead of round-tripping
-    // through `spec_buf`, removing one full-buffer read + write per block.
-    // Per element the op sequence is exactly `np_cmul(np_cmul(v, f), mf)` —
-    // the same lane ops and rounding as the two-pass form — so the spectrum
-    // is bit-identical (same argument the reference's own fused/two-pass
-    // split already relies on).
-    match mtf_pow {
-        Some(mf) => np_cmul3_fill(indata, &spec.filters.rfvideo, mf, spec_buf),
-        None => np_cmul_fill(indata, &spec.filters.rfvideo, spec_buf),
-    }
-
+    // The `RFVideo` (and optional MTF power) product was built into row 0 of
+    // the early batch, before the block spectrum was overwritten.
     st.mark(7);
-    ffi_ducc::ifft_into(spec_buf, out_buf);
     if let Some(s) = dump {
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_hilbert.bin", s),
-            &pipe_cf(out_buf),
+            &pipe_cf(&batch_out[..blocklen]),
         );
     }
     st.mark(8);
-    unwrap_hilbert_into(out_buf, spec.freq_hz, demod_buf);
+    unwrap_hilbert_into(&batch_out[..blocklen], spec.freq_hz, demod_buf);
     if let Some(s) = dump {
         pipe_write(
             pipe_dir.as_deref().unwrap(),
@@ -727,6 +716,61 @@ pub(crate) fn demod_block_cpu(
     }
     st.mark(10);
 
+    // Late batch: the three post-demod filters, each with its own known delay
+    // rolled in the time domain exactly like the reference, plus the EFM row
+    // parked in row 2 by the early group. Each product is built straight into
+    // its row (same np_cmul arithmetic, no per-channel clone of the demod
+    // spectrum) and the four inverse FFTs share one batched call.
+    let (cstart, cend) = kept_range(indata.len(), spec, cut);
+    for (i, filter) in spec.filters.fvideo.iter().enumerate() {
+        let row = match i {
+            0 => 0,
+            1 => 1,
+            2 => 3,
+            _ => unreachable!(),
+        };
+        np_cmul_slices(
+            indata,
+            filter,
+            &mut batch_spec[row * blocklen..(row + 1) * blocklen],
+        );
+    }
+    ffi_ducc::ifft_batch_rows(
+        4,
+        blocklen,
+        &batch_spec[..4 * blocklen],
+        &mut batch_out[..4 * blocklen],
+    );
+    st.mark(11);
+
+    // EFM (row 2): the clip is element-wise, so building only the kept range
+    // yields exactly the elements the full-length build then sliced out.
+    let efm: Vec<i16> = {
+        let row = &batch_out[2 * blocklen..3 * blocklen];
+        let (start, end) = if cut {
+            let start = spec.blockcut.min(row.len());
+            let end = row.len().saturating_sub(spec.blockcut_end);
+            (start.min(end), end)
+        } else {
+            (0, row.len())
+        };
+        row[start..end]
+            .iter()
+            .map(|v| (v.re.clamp(-32768.0, 32767.0)) as i16)
+            .collect()
+    };
+    if let Some(s) = dump {
+        let efm_f64: Vec<f64> = batch_out[2 * blocklen..3 * blocklen]
+            .iter()
+            .map(|v| v.re)
+            .collect();
+        pipe_write(
+            pipe_dir.as_deref().unwrap(),
+            &format!("s{}_efm.bin", s),
+            &pipe_f64(&efm_f64),
+        );
+    }
+
     let mut video = VideoChannels {
         demod: Vec::new(),
         demod_raw,
@@ -735,17 +779,17 @@ pub(crate) fn demod_block_cpu(
         audio,
         efm,
     };
-    st.mark(11);
 
-    // The three post-demod filters, each with its own known delay rolled in
-    // the time domain, exactly like the reference. Reused scratch buffers hold
-    // the filtered spectrum and the ifft output (no per-channel clone of the
-    // demod spectrum), and the output is converted straight to f32; identical
-    // arithmetic.
-    let (cstart, cend) = kept_range(indata.len(), spec, cut);
-    for (i, filter) in spec.filters.fvideo.iter().enumerate() {
-        np_cmul_fill(indata, filter, ch_spec);
-        ffi_ducc::ifft_into(ch_spec, ch_out);
+    // Consume the late batch: each channel is cut/rolled and converted straight
+    // to f32, identical arithmetic to the per-channel form.
+    for (i, _filter) in spec.filters.fvideo.iter().enumerate() {
+        let row = match i {
+            0 => 0,
+            1 => 1,
+            2 => 3,
+            _ => unreachable!(),
+        };
+        let ch_out = &batch_out[row * blocklen..(row + 1) * blocklen];
         if let Some(s) = dump {
             if i < 2 {
                 pipe_write(

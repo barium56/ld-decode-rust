@@ -180,6 +180,15 @@ struct util // hack to avoid duplicate symbols
 // multi-D infrastructure
 //
 
+// Codebuff: per-thread opt-in flag for batched (cross-transform SIMD)
+// execution of long transforms — see the `n_simul` heuristic in `general_nd`.
+// Set by the FFI shim around batch entry points only.
+inline bool &force_simul_batch()
+  {
+  static thread_local bool v = false;
+  return v;
+  }
+
 template<typename T> shared_ptr<T> get_plan(size_t length, bool vectorize=false)
   {
 #ifdef DUCC0_NO_FFT_CACHE
@@ -676,7 +685,18 @@ DUCC0_NOINLINE void general_nd(const cfmav<T> &in, const vfmav<T> &out,
       // is the FFT small enough to fit into L2 vectorized?
       if (wss(1)>l2cache) // "long" FFT, don't execute more than one at the same time
         {
-        n_simul=1;
+        // Codebuff: opt-in batched execution for long transforms. The stock
+        // heuristic forces n_simul=1 here because a vectorized run would not fit
+        // in L2 — but a scalar run of the same transform has the same ~786 KB
+        // working set at n=32768, so the cache premise does not distinguish the
+        // two on this workload. Measured on the ld-decode pipeline: batching
+        // several 32768-point transforms runs each of them ~1.83x faster than
+        // the scalar path and is bit-identical to it (hermetic test
+        // `ifft_batch_matches_scalar_transforms`, plus end-to-end b3sum).
+        // Enabled per call by the FFI shim for batch entry points only, on the
+        // calling thread; every single-transform call still takes the scalar
+        // fast path above and is untouched.
+        n_simul = force_simul_batch() ? vlen : 1;
         if (critstride)  // make bunch large to reduce overall copy cost
           {
           n_bunch=n_simul;

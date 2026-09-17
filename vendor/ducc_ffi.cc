@@ -12,6 +12,7 @@
 // internals (fft1d_impl.h / fftnd_impl.h) are anonymous-namespace templates
 // instantiated inside this TU, so the per-engine copies cannot clash.
 #include <cstddef>
+#include <cstdlib>
 #include <complex>
 #include "ducc0/fft/fftnd_impl.h"
 
@@ -75,5 +76,45 @@ void FN(irfft)(int n, const double *in, double *out) {
   } catch (const std::exception &e) { duccq_fail(e.what(), "irfft"); }
   catch (...) { duccq_fail("unknown", "irfft"); }
 }
+
+// Batched inverse c2c (fct=1/n) over `k` contiguous rows of length `n` —
+// several independent block-sized spectra transformed together.
+//
+// Why this is worth a special entry: ducc's 1-D contiguous path takes a fast
+// path whose `exec_simple` hands the SCALAR type index to the pass, so a lone
+// transform never reaches ducc's SIMD kernels (which vectorize *across*
+// independent transforms, not within one). Its multi-transform machinery does,
+// but the `n_simul` heuristic disables it for long transforms. Batching through
+// here opts into it; measured ~1.83x per transform at k=2/4/6/8, n=32768, with
+// results bit-identical to the scalar path.
+void FN(ifft_batch_rows)(int k, int n, const double *in, double *out) {
+  try {
+    force_simul_batch() = true;
+    shape_t shp{ (size_t)k, (size_t)n };
+    stride_t strd{ (ptrdiff_t)n, 1 };
+    cfmav<complex<double>> cin((complex<double>*)in, shp, strd);
+    vfmav<complex<double>> cout((complex<double>*)out, shp, strd);
+    c2c(cin, cout, shape_t{1}, BACKWARD, 1.0/double(n), 1);
+    force_simul_batch() = false;
+  } catch (const std::exception &e) {
+    force_simul_batch() = false;
+    duccq_fail(e.what(), "ifft_batch_rows");
+  }
+  catch (...) {
+    force_simul_batch() = false;
+    duccq_fail("unknown", "ifft_batch_rows");
+  }
+}
+
+} // extern "C"
+
+extern "C" {
+
+// Compile-time probes: the SIMD lane count this engine's FFT kernels select
+// for `double` (sse2 => 2 lanes, avx2* => 4) and the native SIMD width the
+// build targeted. Exposed so a test can prove the engines are genuinely
+// different machine code and not three copies of the same SSE2 build.
+int FN(simdlen)() { return int(fft1d_simdlen<double>); }
+int FN(native_simdlen)() { return int(native_simd<double>::size()); }
 
 } // extern "C"

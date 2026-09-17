@@ -31,6 +31,21 @@ unsafe extern "C" {
     fn duccq_avx2_ifft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_rfft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_irfft(n: c_int, inp: *const f64, out: *mut f64);
+    #[cfg(test)]
+    fn duccq_sse2_simdlen() -> c_int;
+    #[cfg(test)]
+    fn duccq_sse2_native_simdlen() -> c_int;
+    #[cfg(test)]
+    fn duccq_avx2fma_simdlen() -> c_int;
+    #[cfg(test)]
+    fn duccq_avx2fma_native_simdlen() -> c_int;
+    #[cfg(test)]
+    fn duccq_avx2_simdlen() -> c_int;
+    #[cfg(test)]
+    fn duccq_avx2_native_simdlen() -> c_int;
+    fn duccq_sse2_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2fma_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
 }
 
 /// The FFT engine backing the ducc FFI entry points.
@@ -109,6 +124,7 @@ fn eng() -> (
     unsafe extern "C" fn(c_int, *const f64, *mut f64),
     unsafe extern "C" fn(c_int, *const f64, *mut f64),
     unsafe extern "C" fn(c_int, *const f64, *mut f64),
+    unsafe extern "C" fn(c_int, c_int, *const f64, *mut f64),
 ) {
     #[cfg(test)]
     {
@@ -120,18 +136,21 @@ fn eng() -> (
                         duccq_sse2_ifft,
                         duccq_sse2_rfft,
                         duccq_sse2_irfft,
+                        duccq_sse2_ifft_batch_rows,
                     ),
                     FftEngine::Avx2Fma => (
                         duccq_avx2fma_fft,
                         duccq_avx2fma_ifft,
                         duccq_avx2fma_rfft,
                         duccq_avx2fma_irfft,
+                        duccq_avx2fma_ifft_batch_rows,
                     ),
                     FftEngine::Avx2 => (
                         duccq_avx2_fft,
                         duccq_avx2_ifft,
                         duccq_avx2_rfft,
                         duccq_avx2_irfft,
+                        duccq_avx2_ifft_batch_rows,
                     ),
                 };
             }
@@ -143,18 +162,21 @@ fn eng() -> (
             duccq_sse2_ifft,
             duccq_sse2_rfft,
             duccq_sse2_irfft,
+            duccq_sse2_ifft_batch_rows,
         ),
         FftEngine::Avx2Fma => (
             duccq_avx2fma_fft,
             duccq_avx2fma_ifft,
             duccq_avx2fma_rfft,
             duccq_avx2fma_irfft,
+            duccq_avx2fma_ifft_batch_rows,
         ),
         FftEngine::Avx2 => (
             duccq_avx2_fft,
             duccq_avx2_ifft,
             duccq_avx2_rfft,
             duccq_avx2_irfft,
+            duccq_avx2_ifft_batch_rows,
         ),
     }
 }
@@ -175,7 +197,7 @@ fn uninit_complex(len: usize) -> Vec<Complex64> {
 pub fn fft(x: &[Complex64]) -> Vec<Complex64> {
     let n = x.len() as c_int;
     let mut out = uninit_complex(x.len());
-    let (f_fft, _, _, _) = eng();
+    let (f_fft, _, _, _, _) = eng();
     unsafe {
         f_fft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
     }
@@ -200,18 +222,45 @@ pub fn ifft_into(x: &[Complex64], out: &mut Vec<Complex64>) {
     out.reserve(x.len());
     // ducc writes all n output elements before returning.
     unsafe { out.set_len(x.len()) };
-    let (_, f_ifft, _, _) = eng();
+    let (_, f_ifft, _, _, _) = eng();
     unsafe {
         f_ifft(n, x.as_ptr() as *const f64, out.as_mut_ptr() as *mut f64);
     }
 }
 
 
+/// Batched inverse complex FFT: `k` independent transforms of length `n` held
+/// as `k` contiguous rows, normalized by `1/n` like [`ifft`].
+///
+/// Results are bit-identical to `k` separate [`ifft_into`] calls (gated by
+/// `ifft_batch_matches_scalar_transforms`), but ducc executes them ~1.83x
+/// faster per transform at `n = blocklen`: its FFT SIMD vectorizes *across*
+/// independent transforms, and the 1-D entry point never reaches those kernels
+/// (its `exec_simple` passes the scalar type index to the plan), while the
+/// multi-transform machinery disables vectorization for long transforms unless
+/// the batch entry opts in (see the vendored-ducc `force_simul_batch` patch).
+///
+/// Both slices must hold exactly `k*n` values; ducc writes every output element
+/// before returning, so the destination's prior contents are never read.
+pub fn ifft_batch_rows(k: usize, n: usize, x: &[Complex64], out: &mut [Complex64]) {
+    debug_assert_eq!(x.len(), k * n);
+    debug_assert_eq!(out.len(), k * n);
+    let (_, _, _, _, f_batch) = eng();
+    unsafe {
+        f_batch(
+            k as c_int,
+            n as c_int,
+            x.as_ptr() as *const f64,
+            out.as_mut_ptr() as *mut f64,
+        );
+    }
+}
+
 /// Forward real FFT -> half spectrum (len `n/2+1` complex), unnormalized.
 pub fn rfft(x: &[f64]) -> Vec<Complex64> {
     let n = x.len() as c_int;
     let mut out = uninit_complex(x.len() / 2 + 1);
-    let (_, _, f_rfft, _) = eng();
+    let (_, _, f_rfft, _, _) = eng();
     unsafe {
         f_rfft(n, x.as_ptr(), out.as_mut_ptr() as *mut f64);
     }
@@ -242,7 +291,7 @@ pub fn fft_real_full_into(x: &[f64], out: &mut Vec<Complex64>) {
     out.reserve(n);
     // ducc fills bins 0..=n/2; the reflection loop fills n/2+1..n.
     unsafe { out.set_len(n) };
-    let (_, _, f_rfft, _) = eng();
+    let (_, _, f_rfft, _, _) = eng();
     unsafe {
         f_rfft(n as c_int, x.as_ptr(), out.as_mut_ptr() as *mut f64);
     }
@@ -256,7 +305,7 @@ pub fn fft_real_full_into(x: &[f64], out: &mut Vec<Complex64>) {
 /// Inverse real FFT from a half spectrum, `n` real out, normalized by 1/n.
 pub fn irfft(spectrum: &[Complex64], n: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; n];
-    let (_, _, _, f_irfft) = eng();
+    let (_, _, _, f_irfft, _) = eng();
     unsafe {
         f_irfft(n as c_int, spectrum.as_ptr() as *const f64, out.as_mut_ptr());
     }
@@ -590,11 +639,173 @@ mod tests {
         }
     }
 
-    /// Flags-effectiveness check: the AVX2 engines only mean anything if the
-    /// compiler flags actually reached ducc (clang-cl may silently drop them).
-    /// The 2026-09-16 reference numbers: sse2 fft+ifft n=32768 ≈ 1072 us/pair,
-    /// avx2 ≈ 394 us/pair. If avx2fma is not meaningfully faster than sse2,
-    /// the flags were dropped and the census above says nothing about AVX2.
+    /// [`ifft_batch_rows`] must stay bit-identical to the scalar per-transform
+    /// `ifft_into` it replaces in the demod kernel, and the pipeline's own batch
+    /// sizes (2 for the early group, 4 for the late group) are the ones that
+    /// matter. This is the gate for the vendored-ducc `force_simul_batch`
+    /// opt-in, which hands the plan the SIMD type index that the 1-D entry
+    /// point never passes; it is bit-exact because each SIMD lane runs the same
+    /// operation sequence for its own transform.
+    #[test]
+    fn ifft_batch_matches_scalar_transforms() {
+        let n = 32768usize;
+        let golden_in = read_cf("fft32768_in.f64");
+        let golden_inv = read_cf("fft32768_inv.f64");
+        assert_eq!(golden_in.len(), n);
+        // Every engine can be selected at runtime (`LD_FFT_ENGINE`), so every
+        // engine's batch path has to agree with the scalar path and the golden.
+        let have_avx2 = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+        let engines: &[FftEngine] = if have_avx2 {
+            &[FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma]
+        } else {
+            println!("note: CPU lacks avx2/fma; sse2 only");
+            &[FftEngine::Sse2]
+        };
+        let mut st = 0xd1b5_4a32_d192_ed03u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for engine in engines {
+        *TEST_OVERRIDE.write().unwrap() = Some(*engine);
+        for k in [1usize, 2, 3, 4, 6, 8] {
+            let mut x = vec![Complex64::new(0.0, 0.0); k * n];
+            // Row 0 is the scipy 1.18 golden input, so the batch is also
+            // checked against the reference library's own numbers.
+            x[..n].copy_from_slice(&golden_in);
+            for t in 1..k {
+                for i in 0..n {
+                    let scale = 2f64.powi(((t + i % 5) as i32 % 30) - 15);
+                    x[t * n + i] = Complex64::new(next() * scale, next() * scale);
+                }
+            }
+            let mut want = vec![Complex64::new(0.0, 0.0); k * n];
+            for t in 0..k {
+                let row: Vec<Complex64> = x[t * n..(t + 1) * n].to_vec();
+                want[t * n..(t + 1) * n].copy_from_slice(&ifft(&row));
+            }
+            let mut got = vec![Complex64::new(0.0, 0.0); k * n];
+            ifft_batch_rows(k, n, &x, &mut got);
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.re.to_bits(),
+                    w.re.to_bits(),
+                    "batched ifft ({}) k={k} diverged at flat index {i} (re)",
+                    engine.name()
+                );
+                assert_eq!(
+                    g.im.to_bits(),
+                    w.im.to_bits(),
+                    "batched ifft ({}) k={k} diverged at flat index {i} (im)",
+                    engine.name()
+                );
+            }
+            for i in 0..n {
+                assert_eq!(
+                    got[i].re.to_bits(),
+                    golden_inv[i].re.to_bits(),
+                    "batched ifft ({}) k={k} row 0 differs from the scipy golden at bin {i} (re)",
+                    engine.name()
+                );
+                assert_eq!(
+                    got[i].im.to_bits(),
+                    golden_inv[i].im.to_bits(),
+                    "batched ifft ({}) k={k} row 0 differs from the scipy golden at bin {i} (im)",
+                    engine.name()
+                );
+            }
+        }
+        }
+        *TEST_OVERRIDE.write().unwrap() = None;
+    }
+
+    /// SIMD lane counts compiled into each engine: `(fft1d_simdlen<double>,
+    /// native_simd<double>::size())`. Asserts rather than prints, because the
+    /// first version of this build silently dropped `-mavx2` under clang-cl
+    /// (`flag_if_supported` probed a flag the driver then discarded), leaving
+    /// three identical SSE2 engines behind three names.
+    #[test]
+    fn engine_simd_widths() {
+        unsafe {
+            let sse2 = (duccq_sse2_simdlen(), duccq_sse2_native_simdlen());
+            let avx2fma = (duccq_avx2fma_simdlen(), duccq_avx2fma_native_simdlen());
+            let avx2 = (duccq_avx2_simdlen(), duccq_avx2_native_simdlen());
+            println!(
+                "engine widths: sse2 {sse2:?}  avx2 {avx2:?}  avx2fma {avx2fma:?} \
+                 (fft1d_simdlen<double>, native_simd<double>::size())"
+            );
+            assert_eq!(sse2, (2, 2), "sse2 engine must be the 128-bit replica");
+            assert_eq!(avx2, (4, 4), "avx2 engine lost its -mavx2 flags");
+            assert_eq!(avx2fma, (4, 4), "avx2fma engine lost its -mavx2 flags");
+        }
+    }
+
+    /// Per-size timing for every engine, from L1-resident to the pipeline's
+    /// block length. All three are equal at every size, which is the signature
+    /// of the engines never differing in executed code: the 1-D contiguous
+    /// entry point ducc takes here hands the plan the *scalar* type index, so
+    /// the SIMD kernels are compiled in but never run. Only the batched entry
+    /// (`ifft_batch_rows`) reaches them, and there the lane width still makes no
+    /// difference — the win comes from batching independent transforms.
+    #[test]
+    fn engine_size_sweep() {
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            println!("skip: CPU lacks avx2/fma");
+            return;
+        }
+        let engines = [FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma];
+        for n in [1024usize, 4096, 16384, 32768] {
+            let xc: Vec<Complex64> = (0..n)
+                .map(|i| {
+                    Complex64::new(
+                        ((i as f64) * 0.38).fract() - 0.5,
+                        ((i as f64) * 0.11).fract(),
+                    )
+                })
+                .collect();
+            // Build plans for every engine first.
+            for e in engines {
+                *TEST_OVERRIDE.write().unwrap() = Some(e);
+                let s = fft(&xc);
+                std::hint::black_box(&ifft(&s));
+            }
+            let mut res: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..9 {
+                for (i, e) in engines.iter().enumerate() {
+                    *TEST_OVERRIDE.write().unwrap() = Some(*e);
+                    let iters = (1 << 20) / n;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let s = fft(&xc);
+                        let s2 = ifft(&s);
+                        std::hint::black_box(&s2);
+                    }
+                    res[i].push(t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
+                }
+            }
+            *TEST_OVERRIDE.write().unwrap() = None;
+            let mut line = format!("n={n:>6}:");
+            for (i, e) in engines.iter().enumerate() {
+                res[i].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                line.push_str(&format!("  {} {:>7.2} us", e.name(), res[i][res[i].len() / 2]));
+            }
+            println!("{line}");
+        }
+    }
+
+    /// Flags-effectiveness check + interleaved engine comparison.
+    ///
+    /// The engines are cycled round-robin inside the measurement loop (a
+    /// single sequential pass is not trustworthy: the first engine measured
+    /// also pays plan construction and any cold-cache effects) and each
+    /// result is the median of many rounds. Measures both transform shapes
+    /// the pipeline actually runs at the block length: a c2c forward+inverse
+    /// pair and the r2c (`real_full`) forward + inverse pair.
     #[test]
     fn engine_speed_census() {
         if !std::arch::is_x86_feature_detected!("avx2")
@@ -605,24 +816,65 @@ mod tests {
         }
         let n = 32768usize;
         let xc: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new(((i as f64) * 0.38).fract() - 0.5, ((i as f64) * 0.11).fract()))
+            .map(|i| {
+                Complex64::new(
+                    ((i as f64) * 0.38).fract() - 0.5,
+                    ((i as f64) * 0.11).fract(),
+                )
+            })
             .collect();
-        for e in [FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma] {
+        let xr: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5).collect();
+
+        let engines = [FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma];
+        // Build every engine's plan first so construction never lands in a
+        // timed sample.
+        let mut buf = Vec::new();
+        for e in engines {
             *TEST_OVERRIDE.write().unwrap() = Some(e);
-            // warmup
-            let sink = fft(&xc);
-            let sink2 = ifft(&sink);
-            std::hint::black_box(&sink2);
-            let iters = 100;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                let s = fft(&xc);
-                let s2 = ifft(&s);
-                std::hint::black_box(&s2);
+            let s = fft(&xc);
+            std::hint::black_box(&ifft(&s));
+            fft_real_full_into(&xr, &mut buf);
+            std::hint::black_box(&buf);
+        }
+
+        let mut c2c: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut r2c: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let rounds = 15;
+        let iters = 20;
+        for _ in 0..rounds {
+            for (i, e) in engines.iter().enumerate() {
+                *TEST_OVERRIDE.write().unwrap() = Some(*e);
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let s = fft(&xc);
+                    let s2 = ifft(&s);
+                    std::hint::black_box(&s2);
+                }
+                c2c[i].push(t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+                let t1 = std::time::Instant::now();
+                for _ in 0..iters {
+                    fft_real_full_into(&xr, &mut buf);
+                    let s2 = ifft(&buf);
+                    std::hint::black_box(&s2);
+                }
+                r2c[i].push(t1.elapsed().as_secs_f64() * 1e6 / iters as f64);
             }
-            let per_pair = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-            println!("{:8}: fft+ifft n=32768 pair = {:.0} us", e.name(), per_pair);
-            *TEST_OVERRIDE.write().unwrap() = None;
+        }
+        *TEST_OVERRIDE.write().unwrap() = None;
+        for (i, e) in engines.iter().enumerate() {
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            println!(
+                "{:8}: c2c fft+ifft {:>6.0} us (min {:>6.0}) | r2c+ifft {:>6.0} us (min {:>6.0})",
+                e.name(),
+                med(&mut c2c[i]),
+                c2c[i][0],
+                med(&mut r2c[i]),
+                r2c[i][0]
+            );
         }
     }
 
