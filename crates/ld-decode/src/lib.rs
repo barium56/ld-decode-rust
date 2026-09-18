@@ -27,22 +27,15 @@ static DEMOD_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// lose more from oversubscription than they gain from extra threads (measured
 /// on a 16-thread box: 12 demod + 3 tail beats 12 + 12 by ~7%).
 ///
-/// `LD_TAIL_POOL` overrides the tail pool size (default `n/4`, min 1). Re-checked
-/// 2026-09-18 under the old balance (demod-binding): a sweep of 2/3/4/6 tail
-/// threads at `-j 9` was flat — the sinc gather and wow eval shrank but
-/// `pffold` grew by exactly as much, since the demod prefetch was the bound.
-/// Under the new balance (driver-binding, see balance notes), the tail's slack
-/// is no longer fully consumed, so widening it buys again — gate any such run
-/// on bitparity, the demod pool still must not be starved.
+/// Re-checked under the new balance (driver-binding after the MTF fix):
+/// a sweep of 1/2/3/4/6 tail threads at `-j 9` was flat-to-worse (4/4 wins
+/// 2, 3/4/6 all lose FPS because they steal physical cores from the demod pool,
+/// causing SMT contention that inflates pffold). The split stays `n/4`.
 /// Call before the first decode.
 pub fn set_worker_threads(n: usize) {
     let n = n.max(1);
     DEMOD_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
-    let tail = std::env::var("LD_TAIL_POOL")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&t| t > 0)
-        .unwrap_or_else(|| (n / 4).max(1));
+    let tail = (n / 4).max(1);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(tail)
         .build_global();
