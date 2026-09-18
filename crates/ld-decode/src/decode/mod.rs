@@ -31,7 +31,7 @@ use rustfft::num_complex::Complex64;
 use crate::spec::{CalibLevels, DecoderSpec};
 use audio::audio_phase2;
 use demodblock::{BlockDecode, VideoChannels};
-use efm_pll::EfmPll;
+use efm_pll::{process_pll_detached, EfmPll, EfmPllState};
 use field::{Field, FieldData, PrevField};
 
 pub(crate) use demodblock::{compute_mtf_pow, demod_block_cpu, DemodSpecRef};
@@ -197,6 +197,10 @@ pub struct WriteableField {
     pub efm: Vec<i8>,
     /// Per-line locations (input samples) within the field.
     pub linelocs: Vec<f64>,
+    /// Which speculative PLL run this field's EFM belongs to (0 = none). Set by
+    /// the decode loop from the speculation it spawned for this field; the PLL
+    /// at `writeout` accepts a speculative result only when this token matches.
+    pub efm_token: u64,
 }
 
 impl WriteableField {
@@ -208,6 +212,7 @@ impl WriteableField {
             efm_raw: Vec::new(),
             efm: Vec::new(),
             linelocs: Vec::new(),
+            efm_token: 0,
         }
     }
 
@@ -217,6 +222,99 @@ impl WriteableField {
 
     pub fn luma(&self) -> &LumaOutput {
         &self.luma
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speculative EFM PLL
+//
+// The EFM PLL is the last serial step of a field (writeout), but its input is
+// already fixed right after `process()`: the slice bounds come from `linelocs`
+// and the state only changes at writeout. On the machines ld-decode runs on,
+// the demod prefetch batch is still the binding constraint, so the ~1.2 ms the
+// PLL costs on the serial tail can be spent on a helper thread during the
+// ~9 ms of downscale+vits+metadata that precede writeout.
+//
+// Correctness rests on two ids:
+//   * `token` — per-speculation, carried into the field's `WriteableField`, so
+//     a speculative result can only ever be installed on the field it was
+//     computed for (a backfill write of an older field has an older token).
+//   * `gen` — bumped on *every* PLL state advance, so a result computed from a
+//     state that a later writeout has already moved past is discarded.
+// Anything that fails those checks falls back to the plain inline call, which
+// is why the output cannot change: the commit path installs exactly the state
+// the inline call would have produced.
+
+struct PllJob {
+    token: u64,
+    gen: u64,
+    state: EfmPllState,
+    input: Arc<Vec<i16>>,
+}
+
+struct PllSpec {
+    jobs: std::sync::mpsc::Sender<PllJob>,
+    done: std::sync::mpsc::Receiver<(u64, u64, EfmPllState, Vec<i8>)>,
+    next_token: u64,
+    commits: u64,
+    fallbacks: u64,
+    disabled: bool,
+}
+
+impl PllSpec {
+    fn new(disabled: bool) -> Self {
+        let (jobs, job_rx) = std::sync::mpsc::channel::<PllJob>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("efm-pll-spec".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let (state, out) = process_pll_detached(job.state, &job.input);
+                    if done_tx.send((job.token, job.gen, state, out)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn EFM PLL speculation thread");
+        Self {
+            jobs,
+            done,
+            next_token: 0,
+            commits: 0,
+            fallbacks: 0,
+            disabled,
+        }
+    }
+
+    /// Hand a field's EFM to the helper thread; returns the field's token.
+    fn submit(&mut self, gen: u64, state: EfmPllState, input: Arc<Vec<i16>>) -> u64 {
+        self.next_token += 1;
+        let token = self.next_token;
+        let _ = self.jobs.send(PllJob {
+            token,
+            gen,
+            state,
+            input,
+        });
+        token
+    }
+
+    /// The speculative result for `(token, gen)`, if the helper produced one.
+    /// Results for other fields or a superseded state are dropped here.
+    fn take(&mut self, token: u64, gen: u64) -> Option<(EfmPllState, Vec<i8>)> {
+        let mut hit = None;
+        while let Ok((t, g, state, out)) = self.done.try_recv() {
+            if hit.is_none() && t == token && g == gen {
+                hit = Some((state, out));
+            }
+        }
+        if hit.is_some() {
+            self.commits += 1;
+        } else {
+            self.fallbacks += 1;
+        }
+        hit
     }
 }
 
@@ -328,6 +426,14 @@ pub struct Decoder {
     last_written: Option<(f64, u64)>,
     /// EFM PLL, carried across fields (the EFM track is continuous).
     efm_pll: EfmPll,
+    /// Helper thread running the EFM PLL ahead of writeout.
+    pll_spec: PllSpec,
+    /// Bumped on every PLL state advance (inline or committed), so an in-flight
+    /// speculation can tell whether the state it started from is still live.
+    pll_gen: u64,
+    /// Token of the speculation spawned for the field being decoded right now
+    /// (0 = none). Copied into that field's `WriteableField`.
+    pll_token: u64,
     /// Vits metrics computed in the decode loop for the current field, reused
     /// by buildmetadata (wSNR/bPSNR don't depend on the previous field).
     cached_vits: Option<vits::VitsOutcome>,
@@ -428,6 +534,11 @@ impl Decoder {
             lastvalidfield: [None, None],
             last_written: None,
             efm_pll: EfmPll::new(),
+            // Under LD_DUMP_PLL the reference debug stream comes straight from
+            // the inline call, so keep speculation out of that path entirely.
+            pll_spec: PllSpec::new(std::env::var_os("LD_DUMP_PLL").is_some()),
+            pll_gen: 0,
+            pll_token: 0,
             cached_vits: None,
             frame_number: None,
             is_clv: false,
@@ -658,6 +769,24 @@ impl Decoder {
                     // thread to overlap it with in this serial port.
                     let t_d0 = std::time::Instant::now();
                     let audio_offset = self.audio_offset(field, self.last_written);
+                    // The EFM slice bounds and the PLL state are both final now,
+                    // ~9 ms before writeout consumes them, so run the PLL here on
+                    // the helper thread. `pll_token` ties the result to *this*
+                    // field: it is set from the spawn (or cleared to 0 when there
+                    // is nothing to speculate about) in every iteration, and the
+                    // writeout below only accepts a result whose token and state
+                    // generation both still match.
+                    self.pll_token = 0;
+                    let mut efm_pre: Option<Arc<Vec<i16>>> = None;
+                    if self.digital_audio && !self.pll_spec.disabled {
+                        if let Some((s, e)) = field.efm_slice_bounds() {
+                            let input = Arc::new(field.data.efm[s..e].to_vec());
+                            self.pll_token =
+                                self.pll_spec
+                                    .submit(self.pll_gen, self.efm_pll.state(), input.clone());
+                            efm_pre = Some(input);
+                        }
+                    }
                     let luma = field.downscale(
                         self.output_lines,
                         self.spec.sys_outlinelen,
@@ -666,6 +795,7 @@ impl Decoder {
                         self.analog_audio_freq,
                         audio_offset,
                         &self.side_pool,
+                        efm_pre.as_ref().map(|v| v.as_slice()),
                     )?;
                     // downscale(final_=true) already encoded the luma into
                     // field.dspicture with the same levels; reuse it instead of
@@ -859,6 +989,9 @@ impl Decoder {
         let mut wf = WriteableField::new(fi, luma);
         wf.audio = std::mem::take(&mut field.dsaudio);
         wf.efm_raw = std::mem::take(&mut field.efmout);
+        // Claim this field's speculative PLL run (0 when none was spawned).
+        wf.efm_token = self.pll_token;
+        self.pll_token = 0;
         wf.linelocs = field.linelocs.clone();
         self.lastvalidfield[idx] = Some(wf);
 
@@ -1885,11 +2018,33 @@ impl Decoder {
                 drop(f);
                 out
             } else {
-                self.efm_pll.process(&wf.efm_raw)
+                let spec = if wf.efm_token != 0 {
+                    self.pll_spec.take(wf.efm_token, self.pll_gen)
+                } else {
+                    None
+                };
+                if let Some((state, out)) = spec {
+                    // The helper ran the same `process` from the state
+                    // snapshotted for this very field, so installing it (and
+                    // its resulting state) is the inline call, moved earlier.
+                    self.pll_gen += 1;
+                    self.efm_pll.set_state(state);
+                    out
+                } else {
+                    self.pll_gen += 1;
+                    self.efm_pll.process(&wf.efm_raw)
+                }
             }
         } else {
             Vec::new()
         };
+        static PLLSPEC: crate::envflag::CachedFlag = crate::envflag::CachedFlag::new();
+        if PLLSPEC.get("LD_PLLSPEC") {
+            let (c, f) = (self.pll_spec.commits, self.pll_spec.fallbacks);
+            if (c + f) % 500 == 0 {
+                crate::teeprintln!("PLLSPEC commits={} fallbacks={}", c, f);
+            }
+        }
         wf.info.audio_samples = wf.audio.len() / 2;
         wf.info.efm_t_values = wf.efm.len();
         wf.info.ac3_symbols = 0;

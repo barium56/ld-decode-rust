@@ -1894,6 +1894,28 @@ impl Field {
 
     /// Port of `Field.downscale` (video path only; analog audio is not yet
     /// ported). `final_=true` converts the luma to u16.
+    /// Bounds of this field's EFM slice — `[linelocs[1], linelocs[linecount+1])`
+    /// — or `None` when the field is too short or the bounds are out of range.
+    /// `downscale` cuts `efmout` with this; the driver calls the same helper so
+    /// the speculative PLL runs on exactly the bytes that get written.
+    pub fn efm_slice_bounds(&self) -> Option<(usize, usize)> {
+        if self.data.efm.len() <= 2 || self.linelocs.len() <= 2 {
+            return None;
+        }
+        let linecount = self.linecount.unwrap_or(self.outlinecount);
+        let start = self.linelocs[1] as usize;
+        let end = self
+            .linelocs
+            .get(linecount + 1)
+            .map(|&l| l as usize)
+            .unwrap_or(self.data.efm.len());
+        if start < end && end <= self.data.efm.len() {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
     pub fn downscale(
         &mut self,
         linesout: usize,
@@ -1903,6 +1925,7 @@ impl Field {
         audio_freq: f64,
         audio_offset: f64,
         side_pool: &rayon::ThreadPool,
+        efm_pre: Option<&[i16]>,
     ) -> Result<Vec<f32>> {
         let sub = std::env::var_os("LD_SUBTIME").is_some();
         let t0 = std::time::Instant::now();
@@ -2090,16 +2113,8 @@ impl Field {
 
         // EFM: slice the equalised signal between the first and last lines.
         let t4 = std::time::Instant::now();
-        if self.data.efm.len() > 2 && self.linelocs.len() > 2 {
+        if let Some((start, end)) = self.efm_slice_bounds() {
             let linecount = self.linecount.unwrap_or(self.outlinecount);
-            let start = self.linelocs[1] as usize;
-            let end = self
-                .linelocs
-                .get(linecount + 1)
-                .map(|&l| l as usize)
-                .unwrap_or(self.data.efm.len());
-            if start < end && end <= self.data.efm.len() {
-                if self.readloc == 1341417600 {
                     if let Some(p) = std::env::var_os("LD_DUMP_LINELOCS_FULL") {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -2112,7 +2127,6 @@ impl Field {
                             }
                         }
                     }
-                }
                 if let Some(p) = std::env::var_os("LD_DUMP_LINELOCS") {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -2188,8 +2202,14 @@ impl Field {
                         }
                     }
                 }
-                self.efmout = self.data.efm[start..end].to_vec();
-            }
+            self.efmout = match efm_pre {
+                // The driver already cut these exact bytes (same bounds, same
+                // field) to run the speculative PLL on, so reuse them: a
+                // re-slice would be identical anyway, and sharing the vector
+                // is what ties the speculative result to this field's data.
+                Some(pre) => pre.to_vec(),
+                None => self.data.efm[start..end].to_vec(),
+            };
         }
         let t_efm = t4.elapsed().as_nanos() as u64;
         if sub {

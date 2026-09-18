@@ -6,6 +6,27 @@
 //! deltas to a PLL that converts them to EFM T-values (1..11), one byte per
 //! symbol.
 
+/// The mutable part of the PLL state.
+///
+/// `EfmPll` can be snapshotted into this (and restored from it) so a field's
+/// T-values can be computed off-thread and installed later *only* if nothing
+/// else advanced the state meanwhile. The arithmetic is untouched — a restored
+/// PLL produces bit-identical output to one that never left the thread.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EfmPllState {
+    zc_previous_input: i16,
+    delta: f64,
+    base_period: f64,
+    minimum_period: f64,
+    maximum_period: f64,
+    period_adjust_base: f64,
+    current_period: f64,
+    phase_adjust: f64,
+    ref_clock_time: f64,
+    frequency_hysteresis: i32,
+    t_counter: i8,
+}
+
 /// EFM PLL state machine, carried across the whole decode (the EFM signal is
 /// continuous across field boundaries, so state must persist between writes).
 pub(crate) struct EfmPll {
@@ -51,6 +72,39 @@ impl EfmPll {
             frequency_hysteresis: 0,
             t_counter: 1,
         }
+    }
+
+    /// Snapshot the mutable state (the T-value scratch buffer is excluded —
+    /// `process` resets its length and overwrites every entry it emits).
+    pub fn state(&self) -> EfmPllState {
+        EfmPllState {
+            zc_previous_input: self.zc_previous_input,
+            delta: self.delta,
+            base_period: self.base_period,
+            minimum_period: self.minimum_period,
+            maximum_period: self.maximum_period,
+            period_adjust_base: self.period_adjust_base,
+            current_period: self.current_period,
+            phase_adjust: self.phase_adjust,
+            ref_clock_time: self.ref_clock_time,
+            frequency_hysteresis: self.frequency_hysteresis,
+            t_counter: self.t_counter,
+        }
+    }
+
+    /// Install a previously snapshotted state.
+    pub fn set_state(&mut self, state: EfmPllState) {
+        self.zc_previous_input = state.zc_previous_input;
+        self.delta = state.delta;
+        self.base_period = state.base_period;
+        self.minimum_period = state.minimum_period;
+        self.maximum_period = state.maximum_period;
+        self.period_adjust_base = state.period_adjust_base;
+        self.current_period = state.current_period;
+        self.phase_adjust = state.phase_adjust;
+        self.ref_clock_time = state.ref_clock_time;
+        self.frequency_hysteresis = state.frequency_hysteresis;
+        self.t_counter = state.t_counter;
     }
 
     /// Process a buffer of EFM samples (i16), returning the EFM T-values
@@ -149,10 +203,67 @@ impl EfmPll {
     }
 }
 
+/// Run `input` through a PLL seeded with `state`, returning both the resulting
+/// state and the T-values.
+///
+/// This is the off-thread form of `set_state(state); process(input)`: it builds
+/// the same machine and runs the same `process`, so the bytes are identical by
+/// construction rather than by re-implementation.
+pub(crate) fn process_pll_detached(state: EfmPllState, input: &[i16]) -> (EfmPllState, Vec<i8>) {
+    let mut pll = EfmPll::new();
+    pll.set_state(state);
+    let out = pll.process(input);
+    (pll.state(), out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// A deterministic pseudo-random EFM-ish signal (clustered zero crossings,
+    /// dropouts, flat runs) to exercise every branch of the state machine.
+    fn pseudo_efm(seed: u64, n: usize) -> Vec<i16> {
+        let mut s = seed | 1;
+        let mut out = Vec::with_capacity(n);
+        let mut v: i32 = 1000;
+        for i in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let r = (s >> 33) as i32;
+            if i % 997 == 0 {
+                v = 0; // dropout-ish flat run
+            } else if r % 3 == 0 {
+                v = -v + (r % 21);
+            } else {
+                v += (r % 7) - 3;
+            }
+            out.push(v.clamp(-32768, 32767) as i16);
+        }
+        out
+    }
+
+    /// The detached path must be bit-identical to the inline path across
+    /// carried state, including buffer-growth boundaries.
+    #[test]
+    fn detached_pll_matches_inline_bitwise() {
+        let sizes = [1usize, 2, 17, 4096, 65535, 65536, 65537, 70000];
+        let mut inline = EfmPll::new();
+        let mut detached_state = EfmPll::new().state();
+        for (k, &n) in sizes.iter().enumerate() {
+            let input = pseudo_efm(0x9E3779B97F4A7C15 ^ (k as u64), n);
+            let want = inline.process(&input);
+            let (next, got) = process_pll_detached(detached_state, &input);
+            assert_eq!(got.len(), want.len(), "len at size {n}");
+            assert!(
+                got == want,
+                "detached PLL diverged from inline at size {n}"
+            );
+            assert_eq!(next, inline.state(), "state diverged at size {n}");
+            detached_state = next;
+        }
+    }
 
     // Feed the concatenated stock EFM input (fields 0..N from the paired
     // LD_DUMP_PLL run) through the Rust PLL and compare against the stock
