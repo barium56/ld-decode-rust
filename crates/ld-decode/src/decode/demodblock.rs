@@ -315,8 +315,19 @@ fn pipe_cf(v: &[Complex64]) -> Vec<u8> {
 /// (window + prefetch) is demodulated at a single MTF, so this is computed
 /// once per field and shared by every block; the per-element values are
 /// identical to computing them inside each block, so outputs stay bit-identical.
+///
+/// Run in parallel because it sits on the prefetch batch's *critical path*:
+/// each element is a raw-dylib `ucrtbase!cpow` call, ~3 ms for the whole
+/// 32768-point filter, and the batch cannot dispatch a single block until the
+/// spectrum exists (measured: the dispatch task enters at +7 µs and does not
+/// start a block until +3048 µs, with the whole pool idle). The map is over
+/// independent elements whose only shared state is the input slice, so running
+/// it on the pool makes the memo miss cost ~0.3 ms instead of ~3 ms serial.
+/// Each element performs the same `np_cpow` call on the same input, and
+/// `collect` preserves order, so the result is bit-identical to a serial loop.
 pub(crate) fn compute_mtf_pow(mtf: &[Complex64], mtf_level: f64) -> Vec<Complex64> {
-    mtf.iter()
+    use rayon::prelude::*;
+    mtf.par_iter()
         .map(|f| {
             if mtf_level == 0.0 {
                 Complex64::new(1.0, 0.0)

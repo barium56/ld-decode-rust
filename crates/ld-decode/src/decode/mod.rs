@@ -69,7 +69,13 @@ fn mtf_pow_memo_get(
     if m.len() >= 4 {
         m.clear();
     }
+    let t = std::time::Instant::now();
     let p = Arc::new(compute_mtf_pow(mtf_filter, f_mtf));
+    MTF_POW_NANOS.fetch_add(
+        t.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    MTF_POW_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     m.insert(key, Arc::clone(&p));
     Some(p)
 }
@@ -397,6 +403,45 @@ struct DbgTiming {
 /// have different fixes. Written by the worker thread, dumped by the `LD_TIMING`
 /// line of a later field; a probe, not a control input.
 pub(crate) static PF_SPAN_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Always-on counters for the (potentially expensive) MTF power-spectrum cache
+/// miss: `compute_mtf_pow` maps `np_cpow` over the whole filter — 32k slow
+/// `ucrtbase!cpow` calls — and the prefetch batch cannot start a block until it
+/// returns, so a miss is serial dead time on the batch's critical path. Two
+/// relaxed atomics per miss is nothing against a call that costs milliseconds;
+/// the `LD_TIMING` line reports both per field.
+pub(crate) static MTF_POW_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static MTF_POW_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `LD_TIMING`-only unit timeline of a single prefetch batch
+/// (`LD_PF_TIMELINE=<fw>`): `(phase, plan index, start µs, end µs, rayon
+/// thread)` relative to the batch start. `pfspan` vs `pfwork/threads` says how
+/// much of a span is idle thread time; this says where it is.
+type PfTimelineRows = Vec<(u8, usize, u32, u32, u16)>;
+static PF_TIMELINE: std::sync::Mutex<Option<PfTimelineRows>> = std::sync::Mutex::new(None);
+
+/// Push one timeline row (no-op unless a dump is in progress for this field).
+fn pf_tl_push(phase: u8, start_us: u32, end_us: u32, idx: usize) {
+    if let Some(rows) = PF_TIMELINE.lock().unwrap().as_mut() {
+        rows.push((
+            phase,
+            idx,
+            start_us,
+            end_us,
+            rayon::current_thread_index().unwrap_or(usize::MAX) as u16,
+        ));
+    }
+}
+
+/// `LD_TIMING`-only: sum of the per-unit wall times in the prefetch batch.
+/// Compared against `PF_SPAN_NANOS`, this separates the two explanations for a
+/// span that exceeds `dcpu/threads`: if `work/threads` reaches the span, every
+/// thread was busy (units simply run slower under memory contention); if it
+/// stays near `dcpu/threads`, threads sat idle (a scheduling problem).
+pub(crate) static PF_WORK_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// An in-flight background prefetch demodulation (one per field). The window
@@ -1051,7 +1096,7 @@ impl Decoder {
             self.dbg.demod_calls = dcalls;
             self.dbg.demod_cpu_ns = dns;
             crate::teeprintln!(
-                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2} pfspan={:.2}",
+                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2} pfspan={:.2} pfwork={:.2} mtfpow={:.2} mtfmiss={}",
                 self.fields_written,
                 ms(df_total),
                 ms(dbg.demod),
@@ -1080,6 +1125,9 @@ impl Decoder {
                 ms(self.dbg.df_plan),
                 ms(self.dbg.df_new),
                 PF_SPAN_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                PF_WORK_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                MTF_POW_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                MTF_POW_MISSES.swap(0, std::sync::atomic::Ordering::Relaxed),
             );
             if crate::decode::demodblock::demod_prof::enabled() {
                 let d = crate::decode::demodblock::stage_deltas();
@@ -1445,7 +1493,36 @@ impl Decoder {
                     // `LD_TIMING`-only span probe: two clock reads and one
                     // atomic store per field, off by default.
                     let t_span = std::env::var_os("LD_TIMING").is_some().then(std::time::Instant::now);
+                    let fw_now = self.fields_written;
+                    // `LD_PF_TIMELINE=<fw>`: dump one batch's unit timeline
+                    // (`start_us end_us phase block thread`, relative to the batch
+                    // start; phase 9 = dispatch task entered right after the timer
+                    // was armed, 7 = spec built and the MTF spectrum resolved, 0 =
+                    // a demodulated block). `pfspan` vs `pfwork/threads` says *how
+                    // much* of a span is idle thread time; this says *where* it
+                    // is — which is how the 2.8 ms serial `cpow` prologue was
+                    // found. Cached read: one env lookup per process.
+                    static PF_TL_FIELD: crate::envflag::CachedVar =
+                        crate::envflag::CachedVar::new("LD_PF_TIMELINE");
+                    let tl_target: Option<u64> = PF_TL_FIELD
+                        .get()
+                        .and_then(|v| v.to_str())
+                        .and_then(|s| s.trim().parse().ok());
                     let worker = move || {
+                        // Timeline phase 9: this task's first instruction. The
+                        // driver armed the batch timer just before spawning it,
+                        // so phase 0's earliest `start_us` minus this is the
+                        // dispatch latency — and a big gap between 9 and 7 is
+                        // the spec build / MTF-spectrum lookup.
+                        let tl_on = t_span.is_some() && tl_target == Some(fw_now as u64);
+                        if tl_on {
+                            if let Some(t0) = t_span {
+                                let us = t0.elapsed().as_nanos() as u32 / 1000;
+                                *PF_TIMELINE.lock().unwrap() =
+                                    Some(Vec::with_capacity(inputs.len() + 2));
+                                pf_tl_push(9, us, us, 0);
+                            }
+                        }
                         let dspec = DemodSpecRef::with_plans(
                             freq,
                             freq_half,
@@ -1455,12 +1532,56 @@ impl Decoder {
                             &levels,
                         );
                         let mtf_pow = mtf_pow_memo_get(&memo, &spec_arc.filters.mtf, f_mtf);
+                        let work_ns: Option<Arc<std::sync::atomic::AtomicU64>> =
+                            t_span.map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+                        // Timeline phase 7: prologue done (spec built, MTF
+                        // spectrum resolved), about to dispatch the blocks.
+                        if tl_on {
+                            if let Some(t0) = t_span {
+                                let us = t0.elapsed().as_nanos() as u32 / 1000;
+                                pf_tl_push(7, us, us, 0);
+                            }
+                        }
                         let results: Vec<(u64, BlockDecode)> = inputs
                             .into_par_iter()
-                            .map(|(bnum, buf)| {
-                                (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot, bnum))
+                            .enumerate()
+                            .map(|(i, (bnum, buf))| {
+                                let t_u = work_ns.as_ref().map(|_| std::time::Instant::now());
+                                let tl_a = tl_on.then(|| t_span.unwrap().elapsed().as_nanos() as u32 / 1000);
+                                let r = (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot, bnum));
+                                if let (Some(w), Some(t)) = (&work_ns, t_u) {
+                                    w.fetch_add(
+                                        t.elapsed().as_nanos() as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                if let Some(ta) = tl_a {
+                                    pf_tl_push(
+                                        0,
+                                        ta,
+                                        t_span.unwrap().elapsed().as_nanos() as u32 / 1000,
+                                        i,
+                                    );
+                                }
+                                r
                             })
                             .collect();
+                        if tl_on {
+                            let mut rows = PF_TIMELINE.lock().unwrap().take().unwrap_or_default();
+                            rows.sort_by_key(|r| r.2);
+                            let mut s = String::from("PFTL start_us end_us phase block thread\n");
+                            for (ph, bi, st, en, th) in rows {
+                                s.push_str(&format!("PFTL {} {} {} {} {}\n", st, en, ph, bi, th));
+                            }
+                            let span_ms = t_span.unwrap().elapsed().as_secs_f64() * 1e3;
+                            crate::teeprintln!("{}PFTLSPAN {:.2}", s, span_ms);
+                        }
+                        if let Some(w) = &work_ns {
+                            PF_WORK_NANOS.store(
+                                w.load(std::sync::atomic::Ordering::Relaxed),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         if let Some(t0) = t_span {
                             PF_SPAN_NANOS.store(
                                 t0.elapsed().as_nanos() as u64,
