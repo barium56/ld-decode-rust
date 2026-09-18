@@ -168,11 +168,12 @@ pub(crate) fn scale_field_sinc(
                 let mut start = [0usize; 4];
                 let mut alpha = [0.0f32; 4];
                 let mut rowoff = [0usize; 4];
+                let mut adj = [0.0f64; 4];
                 unsafe {
                     for (k, i) in (base + j..base + j + 4).enumerate() {
                         // Compensates for the amplitude/frequency shift caused
                         // by FM demodulation under varying playback speed.
-                        let adjust = if no_smoothing {
+                        adj[k] = if no_smoothing {
                             let w = *wowfactors.get_unchecked(i);
                             if (w - median).abs() > threshold {
                                 median
@@ -226,26 +227,12 @@ pub(crate) fn scale_field_sinc(
                         r3 += f64::from(*buf.get_unchecked(start[3] + t) * w3);
                     }
                     // The final level_adjust * result multiply happens in f64
-                    // and rounds to f32 on the store.
-                    if no_smoothing {
-                        let w0 = *wowfactors.get_unchecked(base + j);
-                        let a0 = if (w0 - median).abs() > threshold { median } else { w0 };
-                        let w1 = *wowfactors.get_unchecked(base + j + 1);
-                        let a1 = if (w1 - median).abs() > threshold { median } else { w1 };
-                        let w2 = *wowfactors.get_unchecked(base + j + 2);
-                        let a2 = if (w2 - median).abs() > threshold { median } else { w2 };
-                        let w3 = *wowfactors.get_unchecked(base + j + 3);
-                        let a3 = if (w3 - median).abs() > threshold { median } else { w3 };
-                        *out.get_unchecked_mut(j) = (a0 * r0) as f32;
-                        *out.get_unchecked_mut(j + 1) = (a1 * r1) as f32;
-                        *out.get_unchecked_mut(j + 2) = (a2 * r2) as f32;
-                        *out.get_unchecked_mut(j + 3) = (a3 * r3) as f32;
-                    } else {
-                        *out.get_unchecked_mut(j) = (*level_adjusts.get_unchecked(base + j) * r0) as f32;
-                        *out.get_unchecked_mut(j + 1) = (*level_adjusts.get_unchecked(base + j + 1) * r1) as f32;
-                        *out.get_unchecked_mut(j + 2) = (*level_adjusts.get_unchecked(base + j + 2) * r2) as f32;
-                        *out.get_unchecked_mut(j + 3) = (*level_adjusts.get_unchecked(base + j + 3) * r3) as f32;
-                    }
+                    // and rounds to f32 on the store. Reuses adj[] computed above
+                    // (same arithmetic, no redundant recompute).
+                    *out.get_unchecked_mut(j) = (adj[0] * r0) as f32;
+                    *out.get_unchecked_mut(j + 1) = (adj[1] * r1) as f32;
+                    *out.get_unchecked_mut(j + 2) = (adj[2] * r2) as f32;
+                    *out.get_unchecked_mut(j + 3) = (adj[3] * r3) as f32;
                 }
                 j += 4;
             }
