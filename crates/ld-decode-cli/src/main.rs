@@ -84,12 +84,19 @@ struct Args {
     threads: usize,
 }
 
-/// Default demod thread count: three quarters of the logical cores. The demod
-/// pool and the serial tail's data-parallel sections overlap, so the split
-/// between them matters more than the total; 3:1 measured fastest on this box.
+/// Default demod thread count: half the logical cores plus one (9 on a 16-thread
+/// box). The demod pool and the serial tail's data-parallel sections overlap, so
+/// the split between them matters more than the total — and the ideal split
+/// moves with how much work the tail has. It was three quarters of the cores
+/// when the tail still carried the EFM PLL inline; with that offloaded the tail
+/// needs less headroom and giving the (memory-bound) demod more cores pays
+/// again: measured `-l 5000` on a 16-thread box, 2 rounds each —
+/// `-j 9` 38.29/38.20, `-j 10` 37.87/37.65, `-j 8` 37.18/36.95,
+/// `-j 12` 36.19/35.40 (the old default). Re-sweep after any change that
+/// moves the demod/tail balance.
 fn default_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| (n.get() / 4 * 3).max(2))
+        .map(|n| (n.get() / 2 + 1).max(2))
         .unwrap_or(4)
 }
 
