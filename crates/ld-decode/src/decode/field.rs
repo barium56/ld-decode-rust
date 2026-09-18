@@ -1438,8 +1438,12 @@ impl Field {
             return (Vec::new(), Vec::new(), Some(nfo));
         }
 
-        let mut linelocs_dict: HashMap<isize, f64> = HashMap::new();
-        let mut linelocs_dist: HashMap<isize, f64> = HashMap::new();
+        // Use Vec<Option<f64>> instead of HashMap<isize,f64> — rlineloc_i is
+        // bounded to 0..proclines (the only indices ever looked up below).
+        // Entries outside that range are never read, same as the HashMap.
+        let proclines_usize = proclines;
+        let mut linelocs_dict: Vec<Option<f64>> = vec![None; proclines_usize];
+        let mut linelocs_dist: Vec<Option<f64>> = vec![None; proclines_usize];
 
         for vp in &validpulses {
             let lineloc = (vp.start - line0loc) / meanlinelen;
@@ -1459,11 +1463,16 @@ impl Field {
             }
 
             let rlineloc_i = rlineloc as isize;
+            let rlineloc_idx = rlineloc_i as usize;
 
-            // only record if it's closer to the (probable) beginning of the line
+            // only record if it's closer to the (probable) beginning of the line.
+            // Out-of-range indices are skipped (never looked up below).
+            if rlineloc_idx >= proclines_usize {
+                continue;
+            }
             if lineloc_distance > self.spec_hsync_tolerance()
-                || (linelocs_dict.contains_key(&rlineloc_i)
-                    && lineloc_distance > linelocs_dist[&rlineloc_i])
+                || (linelocs_dist[rlineloc_idx].is_some()
+                    && lineloc_distance > linelocs_dist[rlineloc_idx].unwrap())
             {
                 continue;
             }
@@ -1476,14 +1485,15 @@ impl Field {
                 }
             }
 
-            linelocs_dict.insert(rlineloc_i, vp.start);
-            linelocs_dist.insert(rlineloc_i, lineloc_distance);
+            linelocs_dict[rlineloc_idx] = Some(vp.start);
+            linelocs_dist[rlineloc_idx] = Some(lineloc_distance);
         }
 
         let mut rv_err = vec![false; proclines];
 
-        let linelocs: Vec<f64> = (0..proclines)
-            .map(|l| linelocs_dict.get(&(l as isize)).copied().unwrap_or(-1.0))
+        let linelocs: Vec<f64> = linelocs_dict
+            .iter()
+            .map(|&opt| opt.unwrap_or(-1.0))
             .collect();
         let mut linelocs_filled = linelocs.clone();
 

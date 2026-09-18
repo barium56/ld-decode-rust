@@ -87,29 +87,36 @@ pub(crate) fn scale_field_sinc(
         0.001 // fallback for no variance
     };
 
-    // Serial on purpose: the work per element is one compare + select, and a
-    // rayon split/wake over ~240k elements costs more than it saves here.
-    let mut level_adjusts: Vec<f64> = wowfactors
-        .iter()
-        .map(|&w| {
-            if (w - median).abs() > threshold {
-                median
-            } else {
-                w
-            }
-        })
-        .collect();
-
-    if params.wow_level_adjust_smoothing > 0.0 {
+    // When smoothing is off (the default), defer the level-adjust
+    // computation into the gather itself: skip a 240k-element Vec
+    // allocation and a serial pass, computing `adjust` inline from
+    // `wowfactors[i]` + `median` + `threshold` — same arithmetic, bit-identical.
+    // When smoothing is on, the sequential IIR recurrence needs the full
+    // pre-built Vec.
+    let level_adjusts: Vec<f64> = if params.wow_level_adjust_smoothing > 0.0 {
         // Removes oscillating brightness variations: a low-pass filter that
         // smooths sudden brightness changes while staying reactive enough for
         // low-frequency wow.
+        let mut la: Vec<f64> = wowfactors
+            .iter()
+            .map(|&w| {
+                if (w - median).abs() > threshold {
+                    median
+                } else {
+                    w
+                }
+            })
+            .collect();
         let alpha = 1.0 / (f64::from(params.wow_level_adjust_smoothing) * params.outwidth as f64);
         let one_minus_alpha = 1.0 - alpha;
-        for i in 1..level_adjusts.len() {
-            level_adjusts[i] = alpha * level_adjusts[i] + one_minus_alpha * level_adjusts[i - 1];
+        for i in 1..la.len() {
+            la[i] = alpha * la[i] + one_minus_alpha * la[i - 1];
         }
-    }
+        la
+    } else {
+        Vec::new() // unused; adjust computed inline in the gather below
+    };
+    let no_smoothing = level_adjusts.is_empty();
 
     let t_adjust = ts0.elapsed().as_nanos() as u64;
     if subt {
@@ -165,7 +172,16 @@ pub(crate) fn scale_field_sinc(
                     for (k, i) in (base + j..base + j + 4).enumerate() {
                         // Compensates for the amplitude/frequency shift caused
                         // by FM demodulation under varying playback speed.
-                        let adjust = *level_adjusts.get_unchecked(i);
+                        let adjust = if no_smoothing {
+                            let w = *wowfactors.get_unchecked(i);
+                            if (w - median).abs() > threshold {
+                                median
+                            } else {
+                                w
+                            }
+                        } else {
+                            *level_adjusts.get_unchecked(i)
+                        };
 
                         // Reconstruct the waveform at the proper fractional
                         // sample position, undoing wow-induced timing
@@ -211,10 +227,25 @@ pub(crate) fn scale_field_sinc(
                     }
                     // The final level_adjust * result multiply happens in f64
                     // and rounds to f32 on the store.
-                    *out.get_unchecked_mut(j) = (*level_adjusts.get_unchecked(base + j) * r0) as f32;
-                    *out.get_unchecked_mut(j + 1) = (*level_adjusts.get_unchecked(base + j + 1) * r1) as f32;
-                    *out.get_unchecked_mut(j + 2) = (*level_adjusts.get_unchecked(base + j + 2) * r2) as f32;
-                    *out.get_unchecked_mut(j + 3) = (*level_adjusts.get_unchecked(base + j + 3) * r3) as f32;
+                    if no_smoothing {
+                        let w0 = *wowfactors.get_unchecked(base + j);
+                        let a0 = if (w0 - median).abs() > threshold { median } else { w0 };
+                        let w1 = *wowfactors.get_unchecked(base + j + 1);
+                        let a1 = if (w1 - median).abs() > threshold { median } else { w1 };
+                        let w2 = *wowfactors.get_unchecked(base + j + 2);
+                        let a2 = if (w2 - median).abs() > threshold { median } else { w2 };
+                        let w3 = *wowfactors.get_unchecked(base + j + 3);
+                        let a3 = if (w3 - median).abs() > threshold { median } else { w3 };
+                        *out.get_unchecked_mut(j) = (a0 * r0) as f32;
+                        *out.get_unchecked_mut(j + 1) = (a1 * r1) as f32;
+                        *out.get_unchecked_mut(j + 2) = (a2 * r2) as f32;
+                        *out.get_unchecked_mut(j + 3) = (a3 * r3) as f32;
+                    } else {
+                        *out.get_unchecked_mut(j) = (*level_adjusts.get_unchecked(base + j) * r0) as f32;
+                        *out.get_unchecked_mut(j + 1) = (*level_adjusts.get_unchecked(base + j + 1) * r1) as f32;
+                        *out.get_unchecked_mut(j + 2) = (*level_adjusts.get_unchecked(base + j + 2) * r2) as f32;
+                        *out.get_unchecked_mut(j + 3) = (*level_adjusts.get_unchecked(base + j + 3) * r3) as f32;
+                    }
                 }
                 j += 4;
             }
@@ -222,7 +253,16 @@ pub(crate) fn scale_field_sinc(
                 let i = base + jj;
                 // Compensates for the amplitude/frequency shift caused by FM
                 // demodulation under varying playback speed.
-                let adjust = level_adjusts[i];
+                let adjust = if no_smoothing {
+                    let w = wowfactors[i];
+                    if (w - median).abs() > threshold {
+                        median
+                    } else {
+                        w
+                    }
+                } else {
+                    level_adjusts[i]
+                };
 
                 // Reconstruct the waveform at the proper fractional sample
                 // position, undoing wow-induced timing variations. Clamp into
