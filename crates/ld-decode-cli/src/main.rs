@@ -185,6 +185,11 @@ fn main() -> Result<()> {
     }
 
     ld_decode::set_worker_threads(args.threads);
+    tracing::info!(
+        "Worker threads: {} demod budget, {} tail pool (sinc gather / assembly)",
+        args.threads,
+        ld_decode::tail_pool_threads()
+    );
 
     // Resolve the FFT engine before any transform runs. Default (no
     // LD_FFT_ENGINE) is the scipy-bit-exact sse2 build; the experimental
