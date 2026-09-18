@@ -63,6 +63,13 @@ fn main() {
             .define("DUCCQ_PREFIX", prefix)
 .flag_if_supported("/EHsc")
             .flag_if_supported("/std:c++17")
+            // `/O2`, and it stays `/O2`: an `/O3` shim (bit-identical by
+            // construction — clang-cl's `/O3` implies no fast-math — and 4/4 on
+            // b3sum) measured **neutral** on a clean 4-round interleaved
+            // `-l 2000` A/B (43.15 vs 42.99 FPS mean, 3/4 pairs positive), so it
+            // was reverted rather than kept as dead weight. The 76% of demod CPU
+            // that lives in this TU is dominated by memory traffic, not by the
+            // inlining/loop opts `/O3` adds.
             .flag_if_supported("/O2")
             .warnings(false)
             .include(vendor)
