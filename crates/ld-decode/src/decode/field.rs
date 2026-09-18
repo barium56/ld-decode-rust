@@ -200,18 +200,27 @@ fn inrange(a: f64, mi: f64, ma: f64) -> bool {
 /// the free zero-crossing helpers that have no access to the field.
 static CUR_READLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// `LD_DUMP_ZC2_RAW` destination and its readloc filter. Both are probed once
+/// per zero crossing (tens of thousands of times per field, from every pool
+/// worker), so they are cached values rather than fresh `std::env` reads — on
+/// Windows each read takes a process-wide lock plus a syscall, and the shared
+/// lock serializes otherwise independent burst/sinc workers.
+static ZC2_RAW_PATH: crate::envflag::CachedVar = crate::envflag::CachedVar::new("LD_DUMP_ZC2_RAW");
+static ZC_RL: crate::envflag::CachedVar = crate::envflag::CachedVar::new("LD_DUMP_ZC_RL");
+
 /// `LD_DUMP_ZC2_RAW` honouring an optional `LD_DUMP_ZC_RL` readloc filter.
+#[inline]
 fn zc2_dump_ok() -> bool {
-    if std::env::var_os("LD_DUMP_ZC2_RAW").is_none() {
+    if !ZC2_RAW_PATH.is_present() {
         return false;
     }
     let rl = CUR_READLOC.load(std::sync::atomic::Ordering::Relaxed);
-    match std::env::var("LD_DUMP_ZC_RL") {
-        Ok(f) if !f.trim().is_empty() => f
-            .split(',')
-            .any(|s| s.trim().parse::<u64>().ok() == Some(rl)),
-        _ => true,
+    let f = ZC_RL.str_or_empty();
+    if f.trim().is_empty() {
+        return true;
     }
+    f.split(',')
+        .any(|s| s.trim().parse::<u64>().ok() == Some(rl))
 }
 
 fn llstages_ok(readloc: u64) -> bool {
@@ -301,8 +310,8 @@ pub(crate) fn calczc_do_f32(
 
     if zc2_dump_ok() {
         use std::io::Write;
-        let p = std::env::var_os("LD_DUMP_ZC2_RAW").unwrap();
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let p = ZC2_RAW_PATH.get().unwrap();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
             let _ = writeln!(f, "x={} a={:.17} b={:.17} target={:.17} d0={:.9} d1={:.9}", x, a, b, target, data[x - 1], data[x]);
         }
     }
@@ -2255,19 +2264,25 @@ impl Field {
         line: usize,
         prev_phaseadjust: f64,
     ) -> (Option<bool>, f64) {
+        // These two probes sit in the per-line path (266 lines per field, on
+        // every pool worker), so they are cached once instead of re-read.
+        static BURSTAREA_DUMP: crate::envflag::CachedVar =
+            crate::envflag::CachedVar::new("LD_DUMP_BURSTAREA");
+        static BURSTAREA_RL: crate::envflag::CachedVar =
+            crate::envflag::CachedVar::new("LD_DUMP_BURSTAREA_RL");
         let line = line + self.lineoffset;
         // calczc works from integers, so get the start and remainder.
         let s = linelocs[line] as usize;
         let s_rem = linelocs[line] - s as f64;
 
-        if let Some(p) = std::env::var_os("LD_DUMP_BURSTAREA") {
+        if let Some(p) = BURSTAREA_DUMP.get() {
             use std::io::Write;
-            let filter = std::env::var("LD_DUMP_BURSTAREA_RL").unwrap_or_default();
+            let filter = BURSTAREA_RL.str_or_empty();
             if filter.split(',').any(|x| x.parse::<u64>().ok() == Some(self.readloc)) && line == 8 {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&p)
+                    .open(p)
                 {
                     let _ = writeln!(
                         f,
@@ -2348,14 +2363,14 @@ impl Field {
         }
 
         let rising = rising_count > (zc_count / 2);
-        if let Some(p) = std::env::var_os("LD_DUMP_BURSTAREA") {
+        if let Some(p) = BURSTAREA_DUMP.get() {
             use std::io::Write;
-            let filter = std::env::var("LD_DUMP_BURSTAREA_RL").unwrap_or_default();
+            let filter = BURSTAREA_RL.str_or_empty();
             if filter.split(',').any(|x| x.parse::<u64>().ok() == Some(self.readloc)) && line == 8 {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&p)
+                    .open(p)
                 {
                     let _ = writeln!(
                         f,
@@ -2848,6 +2863,10 @@ fn diff2(values: &[f64]) -> Vec<f64> {
 
 /// Port of `LDdecode.detectLevels`: returns (sync_hz, ire0_hz, ire100_hz).
 pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
+    // Two probes per line (and a third after the loop): cached, like the rest
+    // of the dump switches.
+    static LEVELS_RAW: crate::envflag::CachedVar =
+        crate::envflag::CachedVar::new("LD_DUMP_LEVELS_RAW");
     let spec = &field.spec;
     let mut sync_hzs: Vec<f64> = Vec::new();
     let mut ire0_hzs: Vec<f64> = Vec::new();
@@ -2907,7 +2926,7 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
         if inrange(adj, 0.98, 1.02) {
             if sa < ea && ea <= field.data.video.demod_05.len() {
                 let med = median_f32(&mut field.data.video.demod_05[sa..ea].to_vec());
-                if let Some(p) = std::env::var_os("LD_DUMP_LEVELS_RAW") {
+                if let Some(p) = LEVELS_RAW.get() {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
                         let _ = writeln!(f, "# sync l={} sa={} ea={} adj={:.17} med={:.9}", l, sa, ea, adj, med);
@@ -2917,7 +2936,7 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
             }
             if sb < eb && eb <= field.data.video.demod_05.len() {
                 let med = median_f32(&mut field.data.video.demod_05[sb..eb].to_vec());
-                if let Some(p) = std::env::var_os("LD_DUMP_LEVELS_RAW") {
+                if let Some(p) = LEVELS_RAW.get() {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
                         let _ = writeln!(f, "# ire0 l={} sb={} eb={} adj={:.17} med={:.9}", l, sb, eb, adj, med);
@@ -2928,9 +2947,9 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
         }
     }
 
-    if let Some(p) = std::env::var_os("LD_DUMP_LEVELS_RAW") {
+    if let Some(p) = LEVELS_RAW.get() {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
             let _ = writeln!(f, "# sync_hzs len={}", sync_hzs.len());
             for v in sync_hzs.iter() { let _ = writeln!(f, "{:.17}", v); }
             let _ = writeln!(f, "# ire0_hzs len={}", ire0_hzs.len());
