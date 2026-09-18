@@ -15,23 +15,20 @@ use rayon::prelude::*;
 use super::sinc::{build_kaiser_lut, SINC_PHASE_COUNT, SINC_TAP_COUNT};
 
 /// Median (mean of the two middle order statistics for an even count) of a
-/// slice, in place (reorders).
+/// slice, in place (reorders). Uses `f64::total_cmp` for the partition
+/// comparator: it is branch-free vs `partial_cmp().unwrap_or(Greater)` and
+/// orders finite non-NaN values identically (wow factors and their abs-diffs
+/// contain no NaN; ±0.0 pairs, if any, are equal in magnitude and do not
+/// affect the median of a real-valued signal).
 fn median_f64(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty());
     let mid = values.len() / 2;
     if values.len().is_multiple_of(2) {
-        let (left, &mut hi, _) = values.select_nth_unstable_by(mid, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater)
-        });
-        let lo = *left
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater))
-            .unwrap();
+        let (left, &mut hi, _) = values.select_nth_unstable_by(mid, f64::total_cmp);
+        let lo = *left.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
         (lo + hi) / 2.0
     } else {
-        let (_, &mut median, _) = values.select_nth_unstable_by(mid, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater)
-        });
+        let (_, &mut median, _) = values.select_nth_unstable_by(mid, f64::total_cmp);
         median
     }
 }
@@ -67,15 +64,22 @@ pub(crate) fn scale_field_sinc(
     // Average out unusual per-line spikes in wow: these indicate an hsync TBC
     // error rather than real playback-speed variation, so fall back to the
     // average wow to avoid a bright/dark line.
+    //
+    // `wow_copy` is reused for the MAD abs-diff pass (the median select
+    // reorders it, which is fine — the original `wowfactors` is still needed
+    // for `level_adjusts` below, so we read from `wow_copy` here, not from
+    // `wowfactors`). This avoids a second 240k-element Vec allocation+copy per
+    // field, cutting the serial preamble's allocator traffic.
     let mut wow_copy = wowfactors.to_vec();
     let _ta = std::time::Instant::now();
     let median = median_f64(&mut wow_copy);
     let _t_med1 = _ta.elapsed().as_nanos() as u64;
-    let mad = {
-        let mut diffs: Vec<f64> = wow_copy.iter().map(|&w| (w - median).abs()).collect();
-        let r = median_f64(&mut diffs);
-        r
-    };
+    // Overwrite wow_copy in place with |w - median| — same values, same order
+    // of operations: `w - median` then `.abs()`. Bit-identical results.
+    for w in wow_copy.iter_mut() {
+        *w = (*w - median).abs();
+    }
+    let mad = median_f64(&mut wow_copy);
     let _t_med2 = _ta.elapsed().as_nanos() as u64;
     let threshold = if mad > 0.0 {
         level_adjust_threshold * mad
