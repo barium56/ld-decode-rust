@@ -389,6 +389,16 @@ struct DbgTiming {
     df_new: u64,
 }
 
+/// Wall span of the most recent async prefetch batch, in nanoseconds: from just
+/// before the batch is spawned to the moment its worker has collected every
+/// block (so it includes the pool's dispatch latency). Compared against the
+/// batch's throughput requirement (`dcpu / threads`) and against `pffold`, it
+/// separates "the batch is slow" from "the batch was fed too late" — the two
+/// have different fixes. Written by the worker thread, dumped by the `LD_TIMING`
+/// line of a later field; a probe, not a control input.
+pub(crate) static PF_SPAN_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// An in-flight background prefetch demodulation (one per field). The window
 /// blocks of the current field are already demodulated and inserted, so the
 /// prefetch results can be computed on the rayon pool while the field's
@@ -1041,7 +1051,7 @@ impl Decoder {
             self.dbg.demod_calls = dcalls;
             self.dbg.demod_cpu_ns = dns;
             crate::teeprintln!(
-                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2}",
+                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2} pfspan={:.2}",
                 self.fields_written,
                 ms(df_total),
                 ms(dbg.demod),
@@ -1069,6 +1079,7 @@ impl Decoder {
                 ms(self.dbg.df_resolve),
                 ms(self.dbg.df_plan),
                 ms(self.dbg.df_new),
+                PF_SPAN_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
             );
             if crate::decode::demodblock::demod_prof::enabled() {
                 let d = crate::decode::demodblock::stage_deltas();
@@ -1431,6 +1442,9 @@ impl Decoder {
                     // per-block `for_each_with` streaming shape is what
                     // triggered rayon's unbounded steal-chain stack overflow
                     // here, so it must stay batched.
+                    // `LD_TIMING`-only span probe: two clock reads and one
+                    // atomic store per field, off by default.
+                    let t_span = std::env::var_os("LD_TIMING").is_some().then(std::time::Instant::now);
                     let worker = move || {
                         let dspec = DemodSpecRef::with_plans(
                             freq,
@@ -1447,6 +1461,12 @@ impl Decoder {
                                 (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot, bnum))
                             })
                             .collect();
+                        if let Some(t0) = t_span {
+                            PF_SPAN_NANOS.store(
+                                t0.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         let _ = tx.send(results);
                     };
                     if let Some(pool) = self.pf_pool.clone() {
