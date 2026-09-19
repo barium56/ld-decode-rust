@@ -957,12 +957,18 @@ fn np_csqrt(z: Complex64) -> Complex64 {
     }
 }
 
-/// UCRT (ucrtbase.dll) `atan2`. Rust's std `f64::atan2` is not bit-identical
-/// to the C runtime (it deviates by 1-2 ulp on a few percent of arguments on
-/// Windows), while numpy's `np.arctan2` calls UCRT's `atan2` exactly, so the
-/// demod (unwrap_hilbert) and VITS phase must call this to stay bit-exact.
+/// The platform C runtime's `atan2`: UCRT (ucrtbase.dll) on Windows, the
+/// system libm (glibc/musl/libSystem) elsewhere.
+///
+/// Rust's std `f64::atan2` is not bit-identical to the C runtime on Windows
+/// (it deviates by 1-2 ulp on a few percent of arguments), while numpy's
+/// `np.arctan2` calls the C library's `atan2` exactly, so the demod
+/// (unwrap_hilbert) and VITS phase must call this to stay bit-exact. On unix
+/// the two agree in practice (`f64::atan2` lowers to the same libm symbol),
+/// but binding the C symbol explicitly is what makes the parity contract
+/// platform-independent, so both paths go through a real libm call.
 #[cfg(target_os = "windows")]
-pub(crate) mod ucrt_atan2 {
+pub(crate) mod libm_atan2 {
     #[link(name = "ucrtbase", kind = "raw-dylib")]
     extern "C" {
         pub fn atan2(y: f64, x: f64) -> f64;
@@ -990,29 +996,47 @@ pub(crate) mod ucrt_atan2 {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) mod ucrt_atan2 {
+pub(crate) mod libm_atan2 {
+    // C99 `atan2` from the system math library. rustc links `-lm` on the unix
+    // targets that matter (linux, macOS), so the symbol is always present.
+    #[link(name = "m")]
+    extern "C" {
+        pub fn atan2(y: f64, x: f64) -> f64;
+    }
+
+    #[inline]
     pub fn call(y: f64, x: f64) -> f64 {
-        y.atan2(x)
+        unsafe { atan2(y, x) }
     }
 
     pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
         assert_eq!(out.len(), pim.len());
         assert_eq!(out.len(), pre.len());
         for i in 0..out.len() {
-            out[i] = pim[i].atan2(pre[i]);
+            out[i] = unsafe { atan2(pim[i], pre[i]) };
         }
     }
 }
 
-/// UCRT (ucrtbase.dll) C99 complex pow, exported as `cpow`.
+/// `double _Complex`, the C99 complex-double ABI type used by `cpow`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DComplex {
+    pub re: f64,
+    pub im: f64,
+}
+
+/// The platform C99 complex pow, exported as `cpow`: UCRT (ucrtbase.dll) on
+/// Windows, the system libm elsewhere.
+///
+/// Both ABIs pass and return a two-double aggregate in a pair of FP registers
+/// (xmm0/xmm1 on SysV x86-64, v0/v1 on AAPCS64), which is exactly what
+/// `#[repr(C)] struct DComplex` lowers to, so the declaration matches the C
+/// prototype `double _Complex cpow(double _Complex, double _Complex)` without
+/// needing a Rust `Complex` in the signature.
 #[cfg(target_os = "windows")]
-mod ucrt_cpow {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct DComplex {
-        pub re: f64,
-        pub im: f64,
-    }
+mod sys_cpow {
+    use super::DComplex;
 
     #[link(name = "ucrtbase", kind = "raw-dylib")]
     extern "C" {
@@ -1020,10 +1044,21 @@ mod ucrt_cpow {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+mod sys_cpow {
+    use super::DComplex;
+
+    #[link(name = "m")]
+    extern "C" {
+        pub fn cpow(a: DComplex, b: DComplex) -> DComplex;
+    }
+}
+
 /// `npy_cpow`: numpy's complex128 power. Integer exponents (-100..100) use the
 /// cmul-based fast path; everything else calls the system C library's `cpow`
-/// (on Windows, UCRT's `cpow` is what numpy's `npy_cpow` dispatches to via
-/// `HAVE_CPOW`, and it is not bit-identical to exp(b * log(a)) chains).
+/// (numpy's `npy_cpow` dispatches to it via `HAVE_CPOW` when the platform has
+/// it, and it is not bit-identical to an exp(b * log(a)) chain on any
+/// platform).
 pub(crate) fn np_cpow(a: Complex64, b: Complex64) -> Complex64 {
     if b.re == 0.0 && b.im == 0.0 {
         return Complex64::new(1.0, 0.0);
@@ -1066,26 +1101,13 @@ pub(crate) fn np_cpow(a: Complex64, b: Complex64) -> Complex64 {
             return acc;
         }
     }
-    #[cfg(target_os = "windows")]
-    {
-        let r = unsafe {
-            ucrt_cpow::cpow(
-                ucrt_cpow::DComplex { re: a.re, im: a.im },
-                ucrt_cpow::DComplex { re: b.re, im: b.im },
-            )
-        };
-        return Complex64::new(r.re, r.im);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Approximate fallback for non-Windows: exp(b * log(a)). Not bit-identical
-        // to numpy (which uses the platform libm cpow), but close.
-        let loga = Complex64::new(a.re.hypot(a.im).ln(), a.im.atan2(a.re));
-        let x = b.re * loga.re - b.im * loga.im;
-        let y = b.re * loga.im + b.im * loga.re;
-        let e = x.exp();
-        return Complex64::new(e * y.cos(), e * y.sin());
-    }
+    let r = unsafe {
+        sys_cpow::cpow(
+            DComplex { re: a.re, im: a.im },
+            DComplex { re: b.re, im: b.im },
+        )
+    };
+    Complex64::new(r.re, r.im)
 }
 
 /// Port of `scipy.signal.butter(..., output='ba')` (scipy >= 1.18, digital,
@@ -2030,7 +2052,7 @@ fn build_groupdelay_equalizer(
     let phase: Vec<f64> = {
         let raw: Vec<f64> = lpf_fft
             .iter()
-            .map(|v| crate::spec::ucrt_atan2::call(v.im, v.re))
+            .map(|v| crate::spec::libm_atan2::call(v.im, v.re))
             .collect();
         let n = raw.len();
         let mut ph = vec![0.0f64; n - 1];

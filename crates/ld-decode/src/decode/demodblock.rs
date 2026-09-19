@@ -182,7 +182,7 @@ pub(crate) fn unwrap_hilbert_into(hilbert: &[Complex64], freq_hz: f64, out: &mut
         let (c, dd) = (w.re, -w.im); // conj(w)
         let pre = a * c - bb * dd;
         let pim = a * dd + bb * c;
-        let d = crate::spec::ucrt_atan2::call(pim, pre);
+        let d = crate::spec::libm_atan2::call(pim, pre);
         out[i] = if d < 0.0 { (d + TAU) * scale } else { d * scale };
     }
 }
@@ -317,7 +317,8 @@ fn pipe_cf(v: &[Complex64]) -> Vec<u8> {
 /// identical to computing them inside each block, so outputs stay bit-identical.
 ///
 /// Run in parallel because it sits on the prefetch batch's *critical path*:
-/// each element is a raw-dylib `ucrtbase!cpow` call, ~3 ms for the whole
+/// each element is a raw-dylib `cpow` call (UCRT on Windows, libm elsewhere),
+/// ~3 ms for the whole
 /// 32768-point filter, and the batch cannot dispatch a single block until the
 /// spectrum exists (measured: the dispatch task enters at +7 µs and does not
 /// start a block until +3048 µs, with the whole pool idle). The map is over

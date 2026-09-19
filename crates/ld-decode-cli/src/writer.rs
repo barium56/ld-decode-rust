@@ -328,8 +328,10 @@ fn append_header(
 }
 
 /// Port of Python's `f'{platform.system()}:{platform.release()}:{platform.version()}'`.
-/// Best-effort: on Windows the release/version come from `ver`; elsewhere only
-/// the OS name is available from `std::env::consts`.
+/// Best-effort: on Windows the release/version come from `ver`, on unix from
+/// `uname -r`/`uname -v` (which is exactly what `platform.release()` and
+/// `platform.version()` return there). If the query fails only the OS name is
+/// emitted.
 fn platform_info() -> String {
     let os = match std::env::consts::OS {
         "windows" => "Windows",
@@ -354,8 +356,28 @@ fn platform_info() -> String {
                 }
             }
         }
+    } else if let Some(release) = uname_field("-r") {
+        let version = uname_field("-v").unwrap_or_default();
+        return format!("{os}:{release}:{version}");
     }
     os.to_string()
+}
+
+#[cfg(unix)]
+fn uname_field(flag: &str) -> Option<String> {
+    let out = std::process::Command::new("uname").arg(flag).output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+#[cfg(not(unix))]
+fn uname_field(_flag: &str) -> Option<String> {
+    None
 }
 
 fn write_u16_le(file: &mut dyn Write, values: &[u16]) -> Result<()> {

@@ -1,16 +1,19 @@
 name: CI
 
-# Windows x86-64 only, deliberately: `crates/ld-decode/build.rs` compiles the
-# vendored ducc0 FFT with clang-cl (MSVC ABI, SSE2, single-threaded) so that it
+# Windows x86-64 and Linux x86-64, both deliberately x86-64: the vendored
+# ducc0 FFT in `crates/ld-decode/build.rs` is compiled at the 128-bit SIMD
+# baseline (SSE2 on x86-64) with no AVX/FMA, single-threaded, so that it
 # reproduces the rounding of the scipy 1.18.0 wheel this port is parity-locked
-# to. There is no portable/Linux configuration worth gating here.
+# to. On Windows that is clang-cl with MSVC ABI/STL; on Linux clang++/g++ with
+# the GNU dialect. ducc0 selects its SIMD width from the compiler's predefined
+# macros, so both select the same kernels.
 #
 # The real end-to-end gate is b3sum 4/4 against the `F:\DdD` references, which
 # needs the capture files and hours of runtime; it stays a local, manual check.
 # What CI can gate is everything below that: build, the hermetic scipy/numpy
 # fidelity tests, and a full CLI run through every output writer.
 #
-# Do not set RUSTFLAGS in this workflow: an env RUSTFLAGS replaces
+# Do not set RUSTFLAGS in these workflows: an env RUSTFLAGS replaces
 # `.cargo/config.toml`'s `target-cpu=x86-64-v3`, which is part of the verified
 # release configuration.
 
@@ -71,87 +74,57 @@ jobs:
 
       - name: Smoke test the decoder
         shell: bash
-        run: |
-          set -euo pipefail
-          BIN="target/release/ld-decode.exe"
-          if [ ! -f "$BIN" ]; then
-            echo "No decoder binary at $BIN"
-            exit 1
-          fi
-
-          "$BIN" --help > ci-help.txt
-          grep -q -- "--start" ci-help.txt
-          grep -q -- "--threads" ci-help.txt
-
-          # One second of zero samples. Nothing decodes, but the reader, the
-          # no-signal recovery path and every writer (tbc/pcm/efm/json/db/log)
-          # must still run to completion and exit cleanly.
-          mkdir -p smoke
-          head -c 40000000 /dev/zero > smoke/zeros.s16
-          "$BIN" -j 4 -l 4 smoke/zeros.s16 smoke/out
-
-          for ext in tbc pcm efm tbc.json tbc.db log; do
-            if [ ! -f "smoke/out.$ext" ]; then
-              echo "Missing output: smoke/out.$ext"
-              ls -la smoke
-              exit 1
-            fi
-          done
-          grep -q '"fields":\[\]' smoke/out.tbc.json
-          grep -q "Decode finished" smoke/out.log
-
-          # Container sniffing for `.ldf`. The extension normally carries
-          # Ogg-wrapped FLAC (what the Domesday Duplicator writes), but the
-          # Python reference decodes these inputs with PyAV, which detects the
-          # container itself -- so a bare FLAC stream under `.ldf` has to decode
-          # too, instead of failing with "No Ogg capture pattern found".
-          # (ffmpeg is the same decoder the `.flac` path spawns.)
-          ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i smoke/zeros.s16 \
-            -c:a flac -f flac smoke/zeros.ldf
-          cp smoke/zeros.ldf smoke/zeros.flac
-          "$BIN" -j 4 -l 4 smoke/zeros.ldf smoke/ldf
-          "$BIN" -j 4 -l 4 smoke/zeros.flac smoke/flac
-          cmp smoke/flac.tbc smoke/ldf.tbc
-
-          # Ogg-wrapped FLAC must still take the Ogg path.
-          ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i smoke/zeros.s16 \
-            -c:a flac -compression_level 6 -f ogg smoke/ogg.ldf
-          "$BIN" -j 4 -l 4 smoke/ogg.ldf smoke/ogg
-          for ext in tbc pcm efm tbc.json tbc.db log; do
-            if [ ! -f "smoke/ogg.$ext" ]; then
-              echo "Missing output: smoke/ogg.$ext"
-              exit 1
-            fi
-          done
-
-          # A file that is not FLAC at all fails on the sniffing message.
-          head -c 100000 /dev/urandom > smoke/junk.ldf
-          if "$BIN" -j 4 -l 4 smoke/junk.ldf smoke/junk > /dev/null 2> smoke/junk.err; then
-            echo "junk.ldf unexpectedly decoded"
-            exit 1
-          fi
-          grep -q "no FLAC capture found" smoke/junk.err
-
-          # `-` streams the picture to stdout: the bytes must match the file
-          # writer's exactly, no sidecar files may appear, and the console log
-          # must move to stderr.
-          "$BIN" -j 4 -l 4 smoke/zeros.s16 - > smoke/pipe.tbc 2> smoke/pipe.err
-          cmp smoke/out.tbc smoke/pipe.tbc
-          if compgen -G "smoke/-.*" > /dev/null; then
-            echo "Pipe mode created sidecar files:"
-            compgen -G "smoke/-.*"
-            exit 1
-          fi
-          grep -q "streaming the .tbc picture to stdout" smoke/pipe.err
-          echo "Smoke test outputs:"
-          ls -la smoke
+        run: bash .github/scripts/smoke.sh target/release/ld-decode.exe
 
       - name: Upload decoder binary
         # Pull requests do not need a downloadable binary; the dispatchable
-        # build_windows.yml is the artifact-producing workflow.
+        # build.yml is the artifact-producing workflow.
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:
           name: ld-decode-windows-x86_64
           path: target/release/ld-decode.exe
+          if-no-files-found: error
+
+  linux:
+    name: Build, test and smoke (linux x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-29
+
+      - name: Install C++ toolchain and FFmpeg
+        # build.rs needs a C++17 compiler with the GNU dialect (clang++ is
+        # preferred, g++ is the fallback) plus the C++ runtime headers;
+        # `build-essential` supplies libstdc++-dev and the fallback g++. The
+        # `bundled` SQLite feature of rusqlite also compiles C here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang ffmpeg
+          clang++ --version | head -1
+          ffmpeg -version | head -1
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Test (debug profile)
+        run: cargo test --workspace -- --skip pll_matches_stock_field_stream
+
+      - name: Test (release profile)
+        run: cargo test --workspace --release -- --skip pll_matches_stock_field_stream
+
+      - name: Smoke test the decoder
+        run: bash .github/scripts/smoke.sh target/release/ld-decode
+
+      - name: Upload decoder binary
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ld-decode-linux-x86_64
+          path: target/release/ld-decode
           if-no-files-found: error

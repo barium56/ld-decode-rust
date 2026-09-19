@@ -1,0 +1,180 @@
+name: "Build decoder"
+
+# Manual, artifact-producing build of the decoder for Windows and Linux (no
+# release is created here; see release.yml for that). Mirrors the release side
+# of the sibling tape-decode-gui project's build.yml.
+#
+# This replaces the old Windows-only build_windows.yml. Both platforms are
+# x86-64 and both ship a single binary:
+#
+#  * `.cargo/config.toml` fixes the Rust ISA level at `target-cpu=x86-64-v3`
+#    (setting RUSTFLAGS would silently override that).
+#  * The vendored ducc0 FFT is compiled separately by build.rs and stays at the
+#    128-bit baseline ISA on purpose -- that is a parity requirement, not an
+#    oversight. Windows uses clang-cl (MSVC ABI), Linux clang++/g++ (GNU
+#    dialect); ducc0 selects its SIMD width from the compiler's predefined
+#    macros, so both select the same kernels and round identically.
+#
+# The Linux runner is pinned to ubuntu-22.04 rather than ubuntu-latest so the
+# released binary links against glibc 2.35 and runs on older distributions. If
+# that runner is ever retired, moving to ubuntu-24.04 raises the glibc floor to
+# 2.39 for every Linux user of the artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain:
+        description: "Rust toolchain to build with"
+        required: false
+        type: string
+        default: "nightly-2026-08-29"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-decode:
+    name: Build ld-decode (${{ matrix.os }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            runner: windows-2022
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            bin: ld-decode.exe
+          - os: linux
+            runner: ubuntu-22.04
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            bin: ld-decode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ inputs.toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Install C++ toolchain and FFmpeg
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang ffmpeg
+          clang++ --version | head -1
+
+      - name: Install FFmpeg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install ffmpeg --yes --no-progress
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            throw 'FFmpeg was not added to PATH'
+          }
+
+      - name: Resolve build version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${VERSION} for ${{ matrix.target }}"
+
+      - name: Build release
+        shell: bash
+        run: cargo build --release --workspace --target "${{ matrix.target }}"
+
+      - name: Test (release profile)
+        shell: bash
+        # `pll_matches_stock_field_stream` needs the LD_PLL_DIR golden field
+        # stream dumped from a stock Python run, which is not in the repo.
+        run: cargo test --workspace --release --target "${{ matrix.target }}" -- --skip pll_matches_stock_field_stream
+
+      - name: Smoke test the decoder
+        shell: bash
+        run: bash .github/scripts/smoke.sh "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+
+      - name: Package versioned archive (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          [ -f "$SRC" ] || { echo "missing $SRC" >&2; exit 1; }
+          mkdir -p dist
+          cp "$SRC" "dist/ld-decode"
+          ARCHIVE="ld-decode-linux_${VERSION}_${{ matrix.arch }}.tar.gz"
+          # --transform-free flat layout: one file, no directory component.
+          tar -czf "$ARCHIVE" -C dist ld-decode
+          ENTRIES="$(tar -tzf "$ARCHIVE")"
+          echo "$ENTRIES"
+          [ "$(printf '%s\n' "$ENTRIES" | wc -l)" -eq 1 ] || {
+            echo "Expected 1 entry in $ARCHIVE" >&2; exit 1; }
+          [ "$ENTRIES" = "ld-decode" ] || {
+            echo "Archive entry is nested; expected flat layout: $ENTRIES" >&2; exit 1; }
+          ls -l "$ARCHIVE"
+
+      - name: Package versioned ZIP (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Version = '${{ steps.version.outputs.version }}'
+          $BinPath = "target\${{ matrix.target }}\release\${{ matrix.bin }}"
+          if (-not (Test-Path $BinPath)) { throw "missing $BinPath" }
+          $ExeName = "ld-decode-windows_${Version}_${{ matrix.arch }}.exe"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Path $BinPath -Destination "dist\$ExeName" -Force
+          $ZipName = "ld-decode-windows_${Version}_${{ matrix.arch }}.zip"
+          Compress-Archive -Path @("dist\$ExeName") -DestinationPath $ZipName -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipName))
+          try {
+            if ($zip.Entries.Count -ne 1) {
+              throw "Expected 1 entry in $ZipName, found $($zip.Entries.Count)"
+            }
+            foreach ($entry in $zip.Entries) {
+              if ($entry.FullName.Contains('/') -or $entry.FullName.Contains('\')) {
+                throw "ZIP entry is nested; expected flat layout: $($entry.FullName)"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          Get-Item $ZipName | Format-List Name, Length
+
+      - name: Upload versioned archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ld-decode-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ld-decode-windows_*.zip
+            ld-decode-linux_*.tar.gz
+          if-no-files-found: error
+
+      - name: Upload raw decoder binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ld-decode-${{ matrix.os }}-${{ matrix.arch }}-binary
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error

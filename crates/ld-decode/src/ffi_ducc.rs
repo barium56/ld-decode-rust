@@ -81,10 +81,8 @@ impl FftEngine {
             }
         };
         // Runtime CPU gating: refusing loudly beats an illegal instruction.
-        if (matches!(eng, FftEngine::Avx2Fma | FftEngine::Avx2)
-            && !std::arch::is_x86_feature_detected!("avx2"))
-            || (matches!(eng, FftEngine::Avx2Fma)
-                && !std::arch::is_x86_feature_detected!("fma"))
+        if (matches!(eng, FftEngine::Avx2Fma | FftEngine::Avx2) && !cpu_has_avx2())
+            || (matches!(eng, FftEngine::Avx2Fma) && !cpu_has_fma())
         {
             return Err(format!(
                 "LD_FFT_ENGINE={} requested but this CPU lacks the required features",
@@ -92,6 +90,33 @@ impl FftEngine {
             ));
         }
         Ok(eng)
+    }
+}
+
+/// Runtime AVX2 availability. False on every non-x86 target: the AVX2 engines
+/// exist only because x86-64 is the parity target, and on other architectures
+/// `build.rs` compiles all three names from the same portable TU, so selecting
+/// one would silently mean "not the engine you asked for".
+pub(crate) fn cpu_has_avx2() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// Runtime FMA availability (same gating rules as [`cpu_has_avx2`]).
+pub(crate) fn cpu_has_fma() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
     }
 }
 
@@ -628,9 +653,7 @@ mod tests {
 
     #[test]
     fn engine_census_vs_scipy_goldens() {
-        if !std::arch::is_x86_feature_detected!("avx2")
-            || !std::arch::is_x86_feature_detected!("fma")
-        {
+        if !cpu_has_avx2() || !cpu_has_fma() {
             println!("skip: CPU lacks avx2/fma");
             return;
         }
@@ -654,8 +677,7 @@ mod tests {
         assert_eq!(golden_in.len(), n);
         // Every engine can be selected at runtime (`LD_FFT_ENGINE`), so every
         // engine's batch path has to agree with the scalar path and the golden.
-        let have_avx2 = std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma");
+        let have_avx2 = cpu_has_avx2() && cpu_has_fma();
         let engines: &[FftEngine] = if have_avx2 {
             &[FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma]
         } else {
@@ -729,6 +751,13 @@ mod tests {
     /// three identical SSE2 engines behind three names.
     #[test]
     fn engine_simd_widths() {
+        // The lane counts are an x86-64 statement: off x86, build.rs compiles
+        // all three engines from the same portable TU, so there is no
+        // "4-lane" engine to assert about.
+        if !cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+            println!("skip: not x86; the AVX2 engines are x86-only");
+            return;
+        }
         unsafe {
             let sse2 = (duccq_sse2_simdlen(), duccq_sse2_native_simdlen());
             let avx2fma = (duccq_avx2fma_simdlen(), duccq_avx2fma_native_simdlen());
@@ -752,9 +781,7 @@ mod tests {
     /// difference — the win comes from batching independent transforms.
     #[test]
     fn engine_size_sweep() {
-        if !std::arch::is_x86_feature_detected!("avx2")
-            || !std::arch::is_x86_feature_detected!("fma")
-        {
+        if !cpu_has_avx2() || !cpu_has_fma() {
             println!("skip: CPU lacks avx2/fma");
             return;
         }
@@ -808,9 +835,7 @@ mod tests {
     /// pair and the r2c (`real_full`) forward + inverse pair.
     #[test]
     fn engine_speed_census() {
-        if !std::arch::is_x86_feature_detected!("avx2")
-            || !std::arch::is_x86_feature_detected!("fma")
-        {
+        if !cpu_has_avx2() || !cpu_has_fma() {
             println!("skip: CPU lacks avx2/fma");
             return;
         }

@@ -76,9 +76,10 @@ fn wr_cf(dir: &str, name: &str, v: &[C64]) {
 #[test]
 #[ignore]
 fn atan2_cmp() {
-    // Compare std f64::atan2 vs UCRT atan2 on a sweep of arguments, dump
-    // divergences so the caller can inspect which implementation numpy matches.
-    use crate::spec::ucrt_atan2;
+    // Compare std f64::atan2 vs the platform C library's atan2 (UCRT on
+    // Windows, libm elsewhere) on a sweep of arguments, dump divergences so the
+    // caller can inspect which implementation numpy matches.
+    use crate::spec::libm_atan2;
     let mut ndiff = 0usize;
     let mut first: Vec<(f64, f64, f64, f64)> = Vec::new();
     let mut x = 0.001_f64;
@@ -92,7 +93,7 @@ fn atan2_cmp() {
         x *= m;
         y *= m;
         let s = y.atan2(x);
-        let u = ucrt_atan2::call(y, x);
+        let u = libm_atan2::call(y, x);
         if s.to_bits() != u.to_bits() {
             ndiff += 1;
             if first.len() < 5 {
@@ -102,9 +103,9 @@ fn atan2_cmp() {
     }
     let out = std::env::var("LD_PROBE_OUT").unwrap_or_default();
     if !out.is_empty() {
-        let mut s = format!("std-vs-ucrt atan2: {ndiff}/1000000 differ\n");
+        let mut s = format!("std-vs-libm atan2: {ndiff}/1000000 differ\n");
         for (x, y, a, b) in &first {
-            s.push_str(&format!("x={x} y={y} std={a:.17e} ucrt={b:.17e}\n"));
+            s.push_str(&format!("x={x} y={y} std={a:.17e} libm={b:.17e}\n"));
         }
         std::fs::write(std::path::PathBuf::from(out).join("atan2_cmp.txt"), s).unwrap();
     }

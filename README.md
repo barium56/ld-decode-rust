@@ -32,27 +32,40 @@ exists; parity is the constraint it is built under.
 
 ## Quick start
 
-Prerequisites, all on Windows x86-64 (see [Why Windows only](#why-windows-only)):
+Supported on **Windows x86-64 and Linux x86-64** (see
+[Platform support](#platform-support); one binary per platform, no runtime
+dependencies beyond `ffmpeg` for the FLAC-family inputs).
 
-- Rust **nightly** (`rustup toolchain install nightly-2026-08-29`), MSVC
-  toolchain, and LLVM's `clang-cl` (the build falls back to `clang-cl` on
-  `PATH`, and otherwise expects `C:\Program Files\LLVM\bin\clang-cl.exe`).
+Prerequisites:
+
+- Rust **nightly** (`rustup toolchain install nightly-2026-08-29`) on both
+  platforms.
+- A C++17 compiler, used to build the vendored ducc0 FFT (`build.rs`):
+  - **Windows**: the MSVC toolchain (Rust's default host) plus LLVM's
+    `clang-cl`, found on `PATH` or at
+    `C:\Program Files\LLVM\bin\clang-cl.exe`.
+  - **Linux**: `clang++` (preferred) or `g++`, and the C++ standard library
+    headers — `sudo apt install build-essential clang` on Debian/Ubuntu.
+    Override the choice with `CXX=...` if needed.
+- `ffmpeg` on `PATH` for `.flac` / `.ddd.flac` inputs (and for `.ldf` container
+  sniffing). Raw `.s16`/`.r16`/`.u16`/`.rf`/`.r30`/`.lds` capture decoding needs
+  nothing else.
 
 ```bash
-cargo build --release                     # produces target/release/ld-decode.exe
+cargo build --release    # target/release/ld-decode.exe on Windows, ld-decode elsewhere
 ```
 
 Decode a capture:
 
 ```bash
 # whole file
-target/release/ld-decode.exe -j 9 "capture.ddd.flac" out
+target/release/ld-decode -j 9 "capture.ddd.flac" out
 
 # start at frame 1000, decode 1000 frames (frames, not samples; 2 fields each)
-target/release/ld-decode.exe -j 9 -s 1000 -l 1000 "capture.s16" out
+target/release/ld-decode -j 9 -s 1000 -l 1000 "capture.s16" out
 
 # run with no arguments for the full usage text (same output as --help)
-target/release/ld-decode.exe
+target/release/ld-decode
 ```
 
 `-j 9` is the measured sweet spot on an 8-core/16-thread machine, and the
@@ -210,7 +223,7 @@ clean, the decoder is in its reference configuration.
 | `LD_TRACE_MTF=1`, `LD_TRACE_AGC=1`, `LD_TRACE_KEEP=1`, `LD_TRACE_SEEK=1` | Text traces of the calibration and reader decisions. |
 | `LD_DUMP_*` | Binary dumps of intermediate stages (dozens of them, mostly with a `_RL` readloc filter). Targeted debugging only — dumping every field makes runs crawl and fills disks. |
 
-Anything that reads an environment variable inside a per-line or per-sample loop must go through `envflag::CachedVar`/`CachedFlag`: uncached `std::env::var_os` calls in `compute_line_bursts` and the zero-crossing path cost 1.15 ms of wall time per field before they were cached, because on Windows every lookup takes a process-global lock.
+Anything that reads an environment variable inside a per-line or per-sample loop must go through `envflag::CachedVar`/`CachedFlag`: uncached `std::env::var_os` calls in `compute_line_bursts` and the zero-crossing path cost 1.15 ms of wall time per field before they were cached, because every lookup takes a process-global lock (and a `GetEnvironmentVariableW` syscall on Windows).
 
 The full list, with the readloc filters and their formats, is in the source
 (`crates/ld-decode/src/decode/` and `crates/ld-decode-cli/src/`).
@@ -243,47 +256,73 @@ Two known release-only fidelity failures exist in the notes for
 drift in `gen_bpf_supergauss`, ~1.4e-14); the tolerances sit at 1e-12 and the
 debug profile passes exactly.
 
-CI (`.github/workflows/`) is Windows x86-64 only and does what CI can do without
-the captures: release build, the test suite in both the debug and the release
-profile, and a smoke decode of a zero-signal file that must exit cleanly and
-write all six output artifacts. `ffmpeg` is installed in CI because the `.ldf`
-container-sniffing smoke test shells out to it to build a bare-FLAC fixture. The
-`b3sum` 4/4 gate needs the capture files and hours of runtime, so it stays a
-local, manual check. The Rust toolchain is pinned in CI to the nightly the parity
-tolerances are calibrated against; do not set `RUSTFLAGS` in a workflow, because
-that would replace the `target-cpu=x86-64-v3` setting in `.cargo/config.toml`.
+CI (`.github/workflows/ci.yml`) runs the same job on **Windows x86-64 and Linux
+x86-64** and does what CI can do without the captures: release build, the test
+suite in both the debug and the release profile, and the shared smoke test
+(`.github/scripts/smoke.sh`, used by every workflow) — a zero-signal decode that
+must exit cleanly and write all six output artifacts, plus the `.ldf`
+container-sniffing, pipe-to-stdout and argument-parsing paths. `ffmpeg` is
+installed in CI because the `.ldf` smoke test shells out to it to build a
+bare-FLAC fixture. The `b3sum` 4/4 gate needs the capture files and hours of
+runtime, so it stays a local, manual check. The Rust toolchain is pinned in CI to
+the nightly the parity tolerances are calibrated against; do not set `RUSTFLAGS`
+in a workflow, because that would replace the `target-cpu=x86-64-v3` setting in
+`.cargo/config.toml`.
 
-## Why Windows only
+`build.yml` is the dispatchable artifact build (Windows `.zip` + Linux
+`.tar.gz`) and `release.yml` publishes those archives on a `v*` tag. Both build
+the Linux artifacts on `ubuntu-22.04` rather than `ubuntu-latest`, so the
+released binary links against glibc 2.35 and runs on older distributions.
 
-The build is not portable as it stands, and that is intentional rather than
-unfinished work:
+## Platform support
 
-- **The parity target is a specific Windows wheel.** `scipy.fft` dispatches to
-  ducc0, and the shipped scipy 1.18.0 wheel for Windows x86-64 is built with the
-  "homegrown SIMD" path using SSE2 only and single-threaded. The vendored ducc0
-  in `vendor/` is compiled the same way (`crates/ld-decode/build.rs`) so its
-  rounding matches bit-for-bit. AVX2 builds of the same source are linked in as
-  well and are bit-identical on every golden and end-to-end, but they measure
-  **~21% slower** in situ at `-j 9` (34.0/33.7 FPS against 43.1/43.0) — the
-  isolated microbenchmark that once showed all engines equal was measuring one
-  transform on an idle core. So `sse2` stays the default for parity *and*
-  speed, and any codegen change needs an in-situ A/B before it can be called
-  neutral. (The Rust code's own `target-cpu=x86-64-v3` does not show the effect;
-  a `x86-64-v2` build of the same source is slower, so v3 stays too.)
-- **The compiler is part of the recipe.** `build.rs` drives `clang-cl` to emit
-  MSVC-ABI COFF objects: matching rounding needs the same library build, and
-  MSVC ABI/STL keeps the objects linkable by rustc's MSVC linker.
-- **Some numerics are OS library calls.** Complex `pow` on Windows goes straight
-  to `ucrtbase!cpow` through a `raw-dylib` declaration, because the UCRT
-  implementation differs from any naive `exp`/`log` chain in the last bits.
-- **The release configuration assumes Windows.** `.cargo/config.toml` sets
-  `target-cpu=x86-64-v3` for the Rust code, the release profile keeps debug
-  symbols deliberately, and the writer relies on Windows file semantics in one
-  place (a `.tbc.json` whose header is rewritten at close needs read+write).
+**Windows x86-64 and Linux x86-64 are both supported**, and both are held to the
+same bar: byte-identical output files against the Python reference *on that
+platform*. What makes that portable is that the parity-critical pieces are
+platform-independent, or have exact per-platform equivalents:
 
-Porting to Linux or macOS is possible but is a project in itself: it would need a
-ducc0 toolchain that reproduces the wheel used as ground truth on that platform,
-plus a decision about which reference outputs count as canonical there.
+- **The FFT is the vendored ducc0 source, at a fixed SIMD width.** `scipy.fft`
+  dispatches to ducc0; the shipped scipy 1.18.0 wheel for Windows x86-64 uses
+  the "homegrown SIMD" path at the 128-bit (SSE2) width, single-threaded.
+  `crates/ld-decode/build.rs` compiles the vendored copy the same way on both
+  platforms — clang-cl/MSVC on Windows, clang++ or g++ on Linux — with no
+  AVX/FMA, so the same kernels are selected and the same rounding comes out.
+  ducc0 picks its SIMD width from compiler predefined macros (`__SSE2__`,
+  `__AVX2__`), not from the operating system, and the FFT's operation order is
+  defined by ducc0's source, not by the compiler. The `engine_simd_widths` test
+  asserts the compiled lane widths, so a silently dropped or added ISA flag
+  fails the suite rather than quietly changing results.
+- **AVX2 builds are linked in but not used.** `avx2`/`avx2fma` engines are
+  runtime-selectable via `LD_FFT_ENGINE`; they are bit-identical on every golden
+  and end-to-end, but measure **~21% slower** in situ at `-j 9` (34.0/33.7 FPS
+  against 43.1/43.0) — the isolated microbenchmark that once showed all engines
+  equal was measuring one transform on an idle core. So `sse2` stays the default
+  for parity *and* speed, and any codegen change needs an in-situ A/B before it
+  can be called neutral. Off x86 they are compiled from the same portable TU and
+  the runtime feature gate never selects them.
+- **Some numerics are OS library calls, bound per platform.** `atan2` and C99
+  complex `pow` are declared against the platform C runtime — `ucrtbase.dll`
+  (`raw-dylib`) on Windows, the system libm (`-lm`, glibc/musl/libSystem) on
+  unix — because numpy calls the C library too and neither is bit-identical to a
+  naive `exp`/`log` chain. The same source therefore tracks the same library the
+  reference uses on each platform instead of approximating it.
+- **The Rust code is `target-cpu=x86-64-v3` on x86-64 only.**
+  `.cargo/config.toml` scopes that to `cfg(target_arch = "x86_64")`, since the
+  CPU name is invalid elsewhere. A `x86-64-v2` build of the same source is
+  slower, so v3 stays.
+
+One field is expected to differ between platforms: the `system` string in
+`.tbc.json`, which mirrors Python's
+`platform.system():platform.release():platform.version()`. On Windows it comes
+from `ver`, on unix from `uname -r`/`uname -v` — exactly as the Python reference
+does on those platforms. The parity hashes are therefore recorded per platform:
+the Windows hashes in `F:\DdD\benchmark` are Windows hashes.
+
+Building on other architectures (aarch64, macOS) is untested: it compiles and
+runs best-effort, but the parity claim does not extend there — the reference
+wheel for those platforms uses NEON/AVX2 kernels, which is a different rounding.
+Note also that `-mavx2 -mfma` is x86-only, so on such targets the three engine
+names are built from one portable TU.
 
 ## Why the code looks strange
 
@@ -352,14 +391,17 @@ crates/ld-decode-cli/   the `ld-decode` binary
   async_writer.rs       background writer thread
   async_db.rs           background `.tbc.db` thread
   prefetch.rs           window/refill loop
-vendor/ducc0/           vendored FFT library, built by clang-cl
+vendor/ducc0/           vendored FFT library, built by build.rs
 vendor/ducc_ffi.cc      the C shim (compiled once per engine)
 scripts/                Python reference generators and dev tools
 ```
 
-`build.rs` compiles ducc0's header-only templates three times (SSE2, AVX2, and
-AVX2 with FP contraction off) into one binary. Only `sse2` is used by default —
-see [Why Windows only](#why-windows-only).
+`build.rs` compiles ducc0's header-only templates three times (the 128-bit
+baseline engine, AVX2, and AVX2 with FP contraction off) into one binary, using
+clang-cl on Windows and clang++/g++ on Linux/macOS. Only the baseline engine is
+used by default — see [Platform support](#platform-support). Set
+`LD_SKIP_VENDOR_FFT=1` to skip that native build for a `cargo check` on a host
+without a C++ toolchain (check-only: it will not link).
 
 ## Performance work
 

@@ -1,2 +1,12 @@
-[build]
+# The Rust code is built for the x86-64-v3 microarchitecture level (AVX2/FMA).
+# This is verified configuration: it is what the release benchmarks and the
+# bit-parity gates were measured with. It is deliberately scoped to x86_64
+# because `target-cpu=x86-64-v3` is not a valid CPU name on any other
+# architecture (aarch64 builds would fail outright).
+#
+# The vendored ducc0 FFT is compiled separately by crates/ld-decode/build.rs
+# and stays at the 128-bit baseline ISA on purpose -- that is a parity
+# requirement, not an oversight. Do not set RUSTFLAGS in a workflow: an env
+# RUSTFLAGS replaces this section.
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]

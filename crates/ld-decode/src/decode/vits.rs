@@ -201,7 +201,7 @@ impl<'a> CombNtsc<'a> {
 
         let si_mean = mean(&si_sl.iter().map(|&v| f64::from(v)).collect::<Vec<_>>());
         let sq_mean = mean(&sq_sl.iter().map(|&v| f64::from(v)).collect::<Vec<_>>());
-        let mut phase = crate::spec::ucrt_atan2::call(si_mean, sq_mean) * 180.0 / std::f64::consts::PI;
+        let mut phase = crate::spec::libm_atan2::call(si_mean, sq_mean) * 180.0 / std::f64::consts::PI;
         if phase < 0.0 {
             phase += 360.0;
         }

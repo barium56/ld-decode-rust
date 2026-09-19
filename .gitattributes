@@ -1,0 +1,7 @@
+# Shell scripts and workflow YAML must keep LF endings on every platform: CRLF
+# breaks a script's shebang and makes bash choke on `set -euo pipefail` when
+# GitHub's Linux runners execute it, and this repository is developed on
+# Windows (where the Rust sources are CRLF, which rustc accepts either way).
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,8 +1,12 @@
 name: "Build and release binary"
 
 # Tag a commit `v<version>` (or dispatch this workflow with a release_tag) to
-# publish `ld-decode.exe` as a versioned ZIP on a GitHub release. Mirrors the
-# release side of the sibling tape-decode-gui project's build.yml.
+# publish the decoder as versioned archives on a GitHub release: a Windows
+# `.zip` and a Linux `.tar.gz`, both x86-64. Mirrors the release side of the
+# sibling tape-decode-gui project's build.yml.
+#
+# See build.yml for why the Linux runner is pinned to ubuntu-22.04 (glibc 2.35
+# floor) and why the vendored ducc0 FFT stays at the 128-bit baseline ISA.
 
 on:
   workflow_dispatch:
@@ -27,17 +31,23 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  windows-decode:
-    name: Build ld-decode.exe (${{ matrix.arch }})
+  build-decode:
+    name: Build decoder (${{ matrix.os }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - os: windows
             runner: windows-2022
+            arch: x86_64
             target: x86_64-pc-windows-msvc
-            artifact_suffix: x86_64
+            bin: ld-decode.exe
+          - os: linux
+            runner: ubuntu-22.04
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            bin: ld-decode
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -70,6 +80,23 @@ jobs:
           toolchain: nightly-2026-08-29
           targets: ${{ matrix.target }}
 
+      - name: Install C++ toolchain and FFmpeg
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang ffmpeg
+          clang++ --version | head -1
+
+      - name: Install FFmpeg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install ffmpeg --yes --no-progress
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            throw 'FFmpeg was not added to PATH'
+          }
+
       - name: Build release
         shell: bash
         run: cargo build --release --workspace --target "${{ matrix.target }}"
@@ -82,43 +109,40 @@ jobs:
 
       - name: Smoke test the decoder
         shell: bash
+        run: bash .github/scripts/smoke.sh "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+
+      - name: Package versioned archive (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/ld-decode.exe"
-          if [ ! -f "$BIN" ]; then
-            echo "No decoder binary at $BIN"
-            exit 1
-          fi
+          VERSION='${{ steps.version.outputs.version }}'
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          [ -f "$SRC" ] || { echo "missing $SRC" >&2; exit 1; }
+          mkdir -p dist
+          cp "$SRC" "dist/ld-decode"
+          ARCHIVE="ld-decode-linux_${VERSION}_${{ matrix.arch }}.tar.gz"
+          tar -czf "$ARCHIVE" -C dist ld-decode
+          ENTRIES="$(tar -tzf "$ARCHIVE")"
+          echo "$ENTRIES"
+          [ "$(printf '%s\n' "$ENTRIES" | wc -l)" -eq 1 ] || {
+            echo "Expected 1 entry in $ARCHIVE" >&2; exit 1; }
+          [ "$ENTRIES" = "ld-decode" ] || {
+            echo "Archive entry is nested; expected flat layout: $ENTRIES" >&2; exit 1; }
+          ls -l "$ARCHIVE"
 
-          "$BIN" --help > release-help.txt
-          grep -q -- "--start" release-help.txt
-          grep -q -- "--threads" release-help.txt
-
-          mkdir -p smoke
-          head -c 40000000 /dev/zero > smoke/zeros.s16
-          "$BIN" -j 4 -l 4 smoke/zeros.s16 smoke/out
-
-          for ext in tbc pcm efm tbc.json tbc.db log; do
-            if [ ! -f "smoke/out.$ext" ]; then
-              echo "Missing output: smoke/out.$ext"
-              ls -la smoke
-              exit 1
-            fi
-          done
-          grep -q '"fields":\[\]' smoke/out.tbc.json
-          grep -q "Decode finished" smoke/out.log
-
-      - name: Package versioned Windows ZIP
+      - name: Package versioned ZIP (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $Version = '${{ steps.version.outputs.version }}'
-          $BinPath = "target\${{ matrix.target }}\release\ld-decode.exe"
+          $BinPath = "target\${{ matrix.target }}\release\${{ matrix.bin }}"
           if (-not (Test-Path $BinPath)) { throw "missing $BinPath" }
-          $ExeName = "ld-decode-windows_${Version}_${{ matrix.artifact_suffix }}.exe"
+          $ExeName = "ld-decode-windows_${Version}_${{ matrix.arch }}.exe"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item -Path $BinPath -Destination "dist\$ExeName" -Force
-          $ZipName = "ld-decode-windows_${Version}_${{ matrix.artifact_suffix }}.zip"
+          $ZipName = "ld-decode-windows_${Version}_${{ matrix.arch }}.zip"
           Compress-Archive -Path @("dist\$ExeName") -DestinationPath $ZipName -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipName))
@@ -136,16 +160,18 @@ jobs:
           }
           Get-Item $ZipName | Format-List Name, Length
 
-      - name: Upload Windows ZIP
+      - name: Upload versioned archive
         uses: actions/upload-artifact@v7
         with:
-          name: ld-decode-windows-${{ matrix.arch }}
-          path: ld-decode-windows_*.zip
+          name: ld-decode-release-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ld-decode-windows_*.zip
+            ld-decode-linux_*.tar.gz
           if-no-files-found: error
 
   release:
     name: Create GitHub release
-    needs: [windows-decode]
+    needs: [build-decode]
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
     runs-on: ubuntu-latest
     permissions:
@@ -246,7 +272,7 @@ jobs:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          ASSETS="$(find artifacts -type f -name '*.zip')"
+          ASSETS="$(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \))"
           if [ -z "$ASSETS" ]; then
             echo "No release assets found under artifacts/" >&2
             exit 1
