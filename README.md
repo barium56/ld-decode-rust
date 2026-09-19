@@ -303,12 +303,17 @@ platform-independent, or have exact per-platform equivalents:
   for parity *and* speed, and any codegen change needs an in-situ A/B before it
   can be called neutral. Off x86 they are compiled from the same portable TU and
   the runtime feature gate never selects them.
-- **Some numerics are OS library calls, bound per platform.** `atan2` and C99
-  complex `pow` are declared against the platform C runtime — `ucrtbase.dll`
-  (`raw-dylib`) on Windows, the system libm (`-lm`, glibc/musl/libSystem) on
-  unix — because numpy calls the C library too and neither is bit-identical to a
-  naive `exp`/`log` chain. The same source therefore tracks the same library the
-  reference uses on each platform instead of approximating it.
+- **Some numerics are OS library calls, bound per platform.** `atan2`, C99
+  complex `pow`, and the combined `sincos` that numpy's complex `exp` uses are
+  declared against the platform C runtime — `ucrtbase.dll` (`raw-dylib`) on
+  Windows, the system libm (`-lm`, glibc) on Linux — because numpy calls the C
+  library too and none of them is bit-identical to a naive replacement. The same
+  source therefore tracks the same library the reference uses on each platform
+  instead of approximating it. `sincos` is the sharpest case: on glibc it is
+  *not* the same number as `cos`/`sin`, and `np.exp(-1j*w)` follows it (all
+  32768 bins of the `freqz` grid) where `np.cos`/`np.sin` follow the separate
+  calls — so the choice is written explicitly instead of left to whether the
+  optimizer happens to merge an adjacent `cos`/`sin` pair.
 - **The Rust code is `target-cpu=x86-64-v3` on x86-64 only.**
   `.cargo/config.toml` scopes that to `cfg(target_arch = "x86_64")`, since the
   CPU name is invalid elsewhere. A `x86-64-v2` build of the same source is
@@ -320,6 +325,24 @@ One field is expected to differ between platforms: the `system` string in
 from `ver`, on unix from `uname -r`/`uname -v` — exactly as the Python reference
 does on those platforms. The parity hashes are therefore recorded per platform:
 the Windows hashes in `F:\DdD\benchmark` are Windows hashes.
+
+Because the reference's own FFT twiddles come from the platform libm, the two
+platforms' decoders do not agree with each other to the last bit, and neither do
+their scipy reference files. The measured size of that gap (same s16 window,
+2000 fields, Windows Python reference vs the Linux build) is small and
+characterized: `.efm` is **byte-identical**, `.tbc` differs in **9 bytes of
+957 MB** (isolated luma values off by 1-3 LSB), `.pcm` differs by **±1 LSB on
+about 7% of samples**, and `.tbc.json` differs only in `osInfo`. Every other input
+path measured gives the same shape — `.ldf` (`.efm` byte-identical, `.tbc` 6 bytes
+of 957 MB), `.flac` through **two different ffmpeg builds** (0 `.efm` bytes, 14
+`.tbc` bytes), and `.flac` through claxon — so the gap is format-independent, and
+neither the FLAC container nor the ffmpeg version is a parity risk. The hermetic
+FFT/filter goldens in `crates/ld-decode/tests/data` are consequently
+**per-platform**: the committed set is the Windows one (the Windows CI job
+re-verifies it with `scripts/gen_scipy_fft_goldens.py --verify`), and the Linux
+job regenerates them from the same committed inputs before running the tests.
+The 1024-point canary is `include!`d as a Rust literal, so the regeneration
+rewrites those literals too.
 
 Building on other architectures (aarch64, macOS) is untested: it compiles and
 runs best-effort, but the parity claim does not extend there — the reference

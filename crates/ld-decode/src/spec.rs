@@ -206,7 +206,9 @@ fn genwave(rate: &[f64], freq: f64, initial_phase: f64) -> Vec<f64> {
 }
 
 fn polar2z(r: f64, theta: f64) -> Complex64 {
-    Complex64::from_polar(r, theta)
+    // utils.py: `polar2z = lambda r, theta: r * np.exp(1j * theta)`.
+    let (s, c) = numpy_sincos(theta);
+    Complex64::new(r * c, r * s)
 }
 
 /// Port of `sps.zpk2tf([], [z1, z2], 1)`: b = [1], a = poly of the poles.
@@ -292,7 +294,10 @@ fn filtfft(b: &[f64], a: &[f64], block_len: usize) -> Vec<Complex64> {
         (0..block_len)
             .map(|k| {
                 let omega = TAU * k as f64 / block_len as f64;
-                let z = Complex64::new(omega.cos(), -omega.sin());
+                // scipy's freqz uses `z = np.exp(-1j * omega)`: a complex
+                // `exp`, so the pair comes from the C runtime's `sincos`.
+                let (s, c) = numpy_sincos(omega);
+                let z = Complex64::new(c, -s);
                 cdiv(polyval(z, b), polyval(z, a))
             })
             .collect()
@@ -957,6 +962,48 @@ fn np_csqrt(z: Complex64) -> Complex64 {
     }
 }
 
+/// The platform C runtime's combined sin/cos entry point, as a `(sin, cos)`
+/// pair.
+///
+/// numpy's complex `exp` evaluates the sine and cosine of the same argument in
+/// one expression, and its compiler merges that pair into the C runtime's
+/// `sincos`. On glibc, `sincos` is **not** bit-identical to a separate
+/// `cos` + `sin` pair: on the `filtfft` grid (32768 bins) 24 bins differ by
+/// 1 ulp. Measured directly: `np.exp(-1j*w)` reproduces glibc's `sincos` for
+/// all 32768 bins, while `np.cos(w)`/`np.sin(w)` reproduce libm's separate
+/// `cos`/`sin` -- so which entry point is used *is* a parity decision, per
+/// numpy expression.
+///
+/// This has to be an explicit call rather than "write cos and sin next to each
+/// other": LLVM merges an adjacent pair into `sincos` at -O (release) but not
+/// in a debug build, so the same expression gave *two different answers per
+/// profile* on Linux. `filtfft`'s IIR path caught exactly that -- the release
+/// build matched the scipy golden bit-for-bit while the debug build was 1 ulp
+/// off at bin 3319, purely because of the merge. Calling this makes the choice
+/// part of the source instead of an optimizer accident.
+///
+/// Windows has no `sincos` symbol to bind and shows no profile split (both
+/// profiles match the Windows scipy goldens), so the separate calls -- which
+/// are what numpy's Windows wheel uses -- are kept there.
+#[cfg(target_os = "linux")]
+#[inline]
+fn numpy_sincos(x: f64) -> (f64, f64) {
+    // glibc's `sincos`, in libm. Returns the pair through out-pointers.
+    #[link(name = "m")]
+    extern "C" {
+        fn sincos(x: f64, s: *mut f64, c: *mut f64);
+    }
+    let (mut s, mut c) = (0.0f64, 0.0f64);
+    unsafe { sincos(x, &mut s, &mut c) };
+    (s, c)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn numpy_sincos(x: f64) -> (f64, f64) {
+    (x.sin(), x.cos())
+}
+
 /// The platform C runtime's `atan2`: UCRT (ucrtbase.dll) on Windows, the
 /// system libm (glibc/musl/libSystem) elsewhere.
 ///
@@ -1132,7 +1179,9 @@ fn butter_ba(order: usize, wn: &[f64], band_type: FilterBandType) -> Result<(Vec
         .step_by(2)
         .map(|m| {
             let th = (PI * (m as f64)) * scl;
-            Complex64::new(-th.cos(), -th.sin())
+            // scipy's buttap: `p = -exp(1j*pi*m/(2*N))` -- complex `exp`.
+            let (s, c) = numpy_sincos(th);
+            Complex64::new(-c, -s)
         })
         .collect();
 
@@ -2138,7 +2187,9 @@ fn build_groupdelay_equalizer(
 
     let mut eq = vec![Complex64::new(1.0, 0.0); blocklen];
     for (i, &p) in dphi.iter().enumerate() {
-        eq[i] = Complex64::from_polar(1.0, p);
+        // core.py: `eq[:half+1] = np.exp(1j * dphi)`.
+        let (s, c) = numpy_sincos(p);
+        eq[i] = Complex64::new(c, s);
     }
     for i in 0..half - 1 {
         // eq[half+1:] = conj(eq[1:half][::-1])
