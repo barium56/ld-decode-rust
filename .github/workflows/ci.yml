@@ -77,8 +77,9 @@ jobs:
         run: bash .github/scripts/smoke.sh target/release/ld-decode.exe
 
       - name: Upload decoder binary
-        # Pull requests do not need a downloadable binary; the dispatchable
-        # build.yml is the artifact-producing workflow.
+        # Pull requests do not need a downloadable binary; release.yml is the
+        # workflow that produces versioned archives (dispatch it with
+        # create_release=false for artifacts and no release).
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:

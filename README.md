@@ -269,10 +269,13 @@ the nightly the parity tolerances are calibrated against; do not set `RUSTFLAGS`
 in a workflow, because that would replace the `target-cpu=x86-64-v3` setting in
 `.cargo/config.toml`.
 
-`build.yml` is the dispatchable artifact build (Windows `.zip` + Linux
-`.tar.gz`) and `release.yml` publishes those archives on a `v*` tag. Both build
-the Linux artifacts on `ubuntu-22.04` rather than `ubuntu-latest`, so the
-released binary links against glibc 2.35 and runs on older distributions.
+`release.yml` is the only distributable-artifact recipe (there is no separate
+build-only workflow to drift out of sync): its `build-decode` job runs on every
+dispatch and produces a versioned Windows `.zip` plus a Linux `.tar.gz` as run
+artifacts, while the `release` job that publishes them is gated on a `v*` tag or
+`create_release=true`. Linux artifacts are built on `ubuntu-22.04` rather than
+`ubuntu-latest`, so the released binary links against glibc 2.35 and runs on
+older distributions.
 
 ## Platform support
 

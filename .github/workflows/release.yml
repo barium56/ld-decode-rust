@@ -2,15 +2,27 @@ name: "Build and release binary"
 
 # Tag a commit `v<version>` (or dispatch this workflow with a release_tag) to
 # publish the decoder as versioned archives on a GitHub release: a Windows
-# `.zip` and a Linux `.tar.gz`, both x86-64. Mirrors the release side of the
-# sibling tape-decode-gui project's build.yml.
+# `.zip` and a Linux `.tar.gz`, both x86-64.
 #
-# See build.yml for why the Linux runner is pinned to ubuntu-22.04 (glibc 2.35
-# floor) and why the vendored ducc0 FFT stays at the 128-bit baseline ISA.
+# This is the single build recipe for distributable artifacts. The `release`
+# job is gated on a tag or on `create_release=true`, but `build-decode` is not:
+# dispatching with the defaults produces the archives as run artifacts and
+# publishes nothing, which is the "just give me a binary" path (there is no
+# separate build-only workflow to drift out of sync with this one).
+#
+# The Linux runner is pinned to ubuntu-22.04 rather than ubuntu-latest so the
+# released binary links against glibc 2.35 and runs on older distributions; the
+# vendored ducc0 FFT stays at the 128-bit baseline ISA because that is the
+# parity requirement, not an oversight (see crates/ld-decode/build.rs).
 
 on:
   workflow_dispatch:
     inputs:
+      toolchain:
+        description: "Rust toolchain to build with"
+        required: false
+        type: string
+        default: "nightly-2026-08-29"
       release_tag:
         description: "Tag to release when manually dispatched (example: v0.2.0)"
         required: false
@@ -74,10 +86,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          # Pinned to the nightly this port is developed and verified with.
-          # Several tests assert bit-level agreement with scipy 1.18.0
-          # references, and codegen drift between nightlies moves them.
-          toolchain: nightly-2026-08-29
+          # Defaults to the nightly this port is developed and verified with:
+          # several tests assert bit-level agreement with scipy 1.18.0
+          # references, and codegen drift between nightlies moves them. The
+          # dispatch input exists so an artifact can be built with another
+          # toolchain on purpose -- it is empty on a tag push, hence the
+          # fallback.
+          toolchain: ${{ github.event.inputs.toolchain || 'nightly-2026-08-29' }}
           targets: ${{ matrix.target }}
 
       - name: Install C++ toolchain and FFmpeg
