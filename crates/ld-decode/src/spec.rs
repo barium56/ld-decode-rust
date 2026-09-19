@@ -1002,16 +1002,20 @@ fn numpy_sincos(x: f64) -> (f64, f64) {
     )
 }
 
-/// The platform C runtime's `atan2`: UCRT (ucrtbase.dll) on Windows, the
-/// system libm (glibc/musl/libSystem) elsewhere.
+/// The reference's `atan2`: UCRT (ucrtbase.dll) on Windows, and on other
+/// platforms the bit-exact UCRT port in `optimized::ucrt_atan2`.
 ///
 /// Rust's std `f64::atan2` is not bit-identical to the C runtime on Windows
 /// (it deviates by 1-2 ulp on a few percent of arguments), while numpy's
 /// `np.arctan2` calls the C library's `atan2` exactly, so the demod
-/// (unwrap_hilbert) and VITS phase must call this to stay bit-exact. On unix
-/// the two agree in practice (`f64::atan2` lowers to the same libm symbol),
-/// but binding the C symbol explicitly is what makes the parity contract
-/// platform-independent, so both paths go through a real libm call.
+/// (unwrap_hilbert) and VITS phase must call this to stay bit-exact.
+///
+/// This is the **hottest parity call in the decoder** -- one per demod sample,
+/// ~700 000 per field -- so on Linux it cannot simply bind glibc: UCRT and
+/// glibc disagree by 1 ulp on ~0.2% of arguments, which is enough to move a
+/// marginal pixel over a long run. The port is used where it covers the
+/// operand class and glibc only as a documented fallback (NaN/inf operands and
+/// subnormal operands, neither of which the decoder can produce).
 #[cfg(target_os = "windows")]
 pub(crate) mod libm_atan2 {
     #[link(name = "ucrtbase", kind = "raw-dylib")]
@@ -1025,12 +1029,9 @@ pub(crate) mod libm_atan2 {
         unsafe { atan2(y, x) }
     }
 
-    /// Whole-slice variant: lets the compiler amortize the FFI transition
-    /// across the loop (one extern call per ~8 inputs via batching inside the
-    /// extern fn is not possible for atan2, but keeping the loop in one
-    /// #[inline(never)] function avoids re-loading closure state and lets
-    /// LLVM keep `d`/`scale` in registers). Same per-element calls and
-    /// results as `call` in a loop.
+    /// Whole-slice variant: keeping the loop in one function lets LLVM keep
+    /// `d`/`scale` in registers and avoids re-loading closure state. Same
+    /// per-element calls and results as `call` in a loop.
     pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
         assert_eq!(out.len(), pim.len());
         assert_eq!(out.len(), pre.len());
@@ -1042,23 +1043,29 @@ pub(crate) mod libm_atan2 {
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) mod libm_atan2 {
-    // C99 `atan2` from the system math library. rustc links `-lm` on the unix
-    // targets that matter (linux, macOS), so the symbol is always present.
+    // Fallback for the operand classes the port deliberately does not cover;
+    // rustc links `-lm` on the unix targets that matter, so the symbol is
+    // always present.
     #[link(name = "m")]
     extern "C" {
-        pub fn atan2(y: f64, x: f64) -> f64;
+        #[link_name = "atan2"]
+        fn atan2_glibc(y: f64, x: f64) -> f64;
     }
 
+    /// Exact UCRT `atan2` for one pair.
     #[inline]
     pub fn call(y: f64, x: f64) -> f64 {
-        unsafe { atan2(y, x) }
+        match crate::optimized::ucrt_atan2::atan2(y, x) {
+            Some(v) => v,
+            None => unsafe { atan2_glibc(y, x) },
+        }
     }
 
     pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
         assert_eq!(out.len(), pim.len());
         assert_eq!(out.len(), pre.len());
         for i in 0..out.len() {
-            out[i] = unsafe { atan2(pim[i], pre[i]) };
+            out[i] = call(pim[i], pre[i]);
         }
     }
 }

@@ -328,7 +328,8 @@ fn pipe_cf(v: &[Complex64]) -> Vec<u8> {
 /// `collect` preserves order, so the result is bit-identical to a serial loop.
 pub(crate) fn compute_mtf_pow(mtf: &[Complex64], mtf_level: f64) -> Vec<Complex64> {
     use rayon::prelude::*;
-    mtf.par_iter()
+    let out: Vec<Complex64> = mtf
+        .par_iter()
         .map(|f| {
             if mtf_level == 0.0 {
                 Complex64::new(1.0, 0.0)
@@ -336,7 +337,49 @@ pub(crate) fn compute_mtf_pow(mtf: &[Complex64], mtf_level: f64) -> Vec<Complex6
                 np_cpow(*f, Complex64::new(mtf_level, 0.0))
             }
         })
-        .collect()
+        .collect();
+    // Parity-debug instrumentation: dump the filter this call consumed and the
+    // `cpow` result, so a cross-platform run can be diffed bit-for-bit. This is
+    // the only platform-bound call left on the MTF path (raw-dylib `ucrtbase!cpow`
+    // on Windows, libm elsewhere), so a `mtf` match plus a `pow` mismatch is the
+    // signature of a `cpow` divergence. One lookup per call (~0.5 per field), not
+    // per element.
+    static DUMP_DIR: crate::envflag::CachedVar =
+        crate::envflag::CachedVar::new("LD_DUMP_MTFPOW");
+    if let Some(dir) = DUMP_DIR.get() {
+        let dir = dir.to_string_lossy();
+        dump_cf(&dir, mtf, mtf_level, false);
+        dump_cf(&dir, &out, mtf_level, true);
+    }
+    out
+}
+
+/// Write a `[Complex64]` as raw little-endian re/im f64 pairs, keyed by call
+/// index and MTF level (see `compute_mtf_pow`). Enabled only by
+/// `LD_DUMP_MTFPOW`, which takes a directory path ending in a separator.
+fn dump_cf(dir: &str, v: &[Complex64], mtf_level: f64, out: bool) {
+    use std::io::Write;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let k = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) / 2;
+    let tag = if out { "pow" } else { "mtf" };
+    let path = format!("{}{}{:03}.bin", dir, tag, k);
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let mut bytes = Vec::with_capacity(v.len() * 16);
+        for c in v {
+            bytes.extend_from_slice(&c.re.to_le_bytes());
+            bytes.extend_from_slice(&c.im.to_le_bytes());
+        }
+        let _ = f.write_all(&bytes);
+    }
+    if out {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}levels.txt", dir))
+        {
+            let _ = writeln!(f, "{:03} {:.17e} {}", k, mtf_level, v.len());
+        }
+    }
 }
 
 /// Demodulate one block (port of `demodblock_cpu`).

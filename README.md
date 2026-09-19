@@ -282,9 +282,10 @@ older distributions.
 ## Platform support
 
 **Windows x86-64 and Linux x86-64 are both supported**, and both are held to the
-same bar: byte-identical output files against the Python reference *on that
-platform*. What makes that portable is that the parity-critical pieces are
-platform-independent, or have exact per-platform equivalents:
+same bar: byte-identical output files against the Windows Python 7.3.0 reference
+— the same hashes on both platforms, not "close on each". What makes that
+portable is that the parity-critical pieces are either platform-independent or
+served by bit-exact ports of the one platform's math library:
 
 - **The FFT is the vendored ducc0 source, at a fixed SIMD width.** `scipy.fft`
   dispatches to ducc0; the shipped scipy 1.18.0 wheel for Windows x86-64 uses
@@ -305,62 +306,77 @@ platform-independent, or have exact per-platform equivalents:
   for parity *and* speed, and any codegen change needs an in-situ A/B before it
   can be called neutral. Off x86 they are compiled from the same portable TU and
   the runtime feature gate never selects them.
-- **Some numerics are OS library calls, bound per platform.** `atan2`, C99
-  complex `pow`, and the combined `sincos` that numpy's complex `exp` uses are
-  declared against the platform C runtime — `ucrtbase.dll` (`raw-dylib`) on
-  Windows, the system libm (`-lm`, glibc) on Linux — because numpy calls the C
-  library too and none of them is bit-identical to a naive replacement. The same
-  source therefore tracks the same library the reference uses on each platform
-  instead of approximating it. `sincos` is the sharpest case: on glibc it is
-  *not* the same number as `cos`/`sin`, and `np.exp(-1j*w)` follows it (all
-  32768 bins of the `freqz` grid) where `np.cos`/`np.sin` follow the separate
-  calls — so the choice is written explicitly instead of left to whether the
-  optimizer happens to merge an adjacent `cos`/`sin` pair.
+- **The reference's libm calls are the parity target, and Linux does not call
+  glibc for them.** `sin`/`cos` come from bit-exact ports of UCRT
+  (`optimized/ucrt_math.rs`), because UCRT and glibc disagree by 1-2 ulp on a few
+  percent of arguments and those values are baked into every FFT twiddle. The
+  port reproduces the FMA variant, which is the one UCRT dispatches to on the CPU
+  that produced the reference corpus, and is validated against the real UCRT over
+  1.1 million arguments with 0 mismatches. **`atan2` is ported the same way**
+  (`optimized/ucrt_atan2.rs`, 0 mismatches over 2.05 million arguments): it is the
+  hottest parity call in the decoder at ~700 000 calls per field, and UCRT and
+  glibc disagree on ~0.2% of arguments, so Linux must not call glibc there. The
+  port costs nothing — 16.28 ns/call against glibc's 16.89 ns — and covers every
+  operand class the decoder can produce, falling back to the platform library for
+  NaN/inf and subnormal operands, which it cannot. C99 `cpow` (numpy's complex
+  power, used for `MTF ** level` and for the de-emphasis exponent in the video
+  filter) is the one remaining platform-bound call, and it is **measured to be
+  the residual**: `LD_DUMP_MTFPOW` dumps the filter and the `cpow` result, and a
+  cross-platform diff shows the MTF filter bit-identical while `cpow` differs on
+  39% of its 32768 elements, by up to 3 ulp, for every level used. That leaves
+  **one differing byte per 20 000 fields** (a 1-LSB luma value) in a full-disc
+  Linux run, with `.efm` and `.pcm` byte-identical. Removing it needs UCRT's
+  `clogl`/`cexp` (and the `log`/`exp`/`hypot` beneath them) ported the same way;
+  UCRT computes `cexp(clog(z) * w)` where glibc uses a `pow` on the modulus,
+  which is why they disagree by more than rounding.
+  `numpy_sincos` (numpy's complex `exp`) is another explicit choice rather than an
+  optimizer accident: on glibc `sincos` is *not* the same number as `cos`/`sin`,
+  and `np.exp(-1j*w)` follows it across all 32768 bins of the `freqz` grid.
 - **The Rust code is `target-cpu=x86-64-v3` on x86-64 only.**
   `.cargo/config.toml` scopes that to `cfg(target_arch = "x86_64")`, since the
   CPU name is invalid elsewhere. A `x86-64-v2` build of the same source is
   slower, so v3 stays.
 
-One field is expected to differ between platforms: the `system` string in
+One field is expected to differ between platforms: the `osInfo` string in
 `.tbc.json`, which mirrors Python's
 `platform.system():platform.release():platform.version()`. On Windows it comes
 from `ver`, on unix from `uname -r`/`uname -v` — exactly as the Python reference
-does on those platforms. The parity hashes are therefore recorded per platform:
-the Windows hashes in `F:\DdD\benchmark` are Windows hashes.
+does on those platforms. Everything else is common: `.tbc`, `.pcm` and `.efm`
+carry the same bytes, and therefore the same hashes, on both.
 
-Because the reference's own FFT twiddles come from the platform libm, the two
-platforms' decoders do not agree with each other to the last bit, and neither do
-their scipy reference files. The measured size of that gap (same s16 window,
-2000 fields, Windows Python reference vs the Linux build) is small and
-characterized: `.efm` is **byte-identical**, `.tbc` differs in **9 bytes of
-957 MB** (isolated luma values off by 1-3 LSB), `.pcm` differs by **±1 LSB on
-about 7% of samples**, and `.tbc.json` differs only in `osInfo`. Every other input
-path measured gives the same shape — `.ldf` (`.efm` byte-identical, `.tbc` 6 bytes
-of 957 MB), `.flac` through **two different ffmpeg builds** (0 `.efm` bytes, 14
-`.tbc` bytes), and `.flac` through claxon — so the gap is format-independent, and
-neither the FLAC container nor the ffmpeg version is a parity risk. The hermetic
-FFT/filter goldens live in `crates/ld-decode/tests/data` as **one committed set
-for both platforms**, holding the values scipy 1.18.0 produces on Windows — the
-parity target. They are generated from committed, platform-independent inputs by
-`scripts/gen_scipy_fft_goldens.py`, so `cargo test` needs no Python, no setup and
-no regeneration on either platform, including in `release.yml`, whose two runners
-run the same command. `--verify` is the gate: it recomputes the set and fails if
-the recipes or the pinned wheels have drifted from the committed values (run it
-on Windows; elsewhere the local scipy's own drift makes a mismatch expected, which
-is what `--census` measures instead).
+Measured on all four input paths (same window per path, sha256 of the raw
+outputs, Linux build vs the Windows Python reference):
 
-Linux reproduces that Windows set exactly rather than by luck. The reference's
-twiddles and `np.exp(1j*x)` values come from the platform C library, and UCRT and
-glibc disagree in the last bits on a few percent of arguments, so a Linux build
-calling glibc cannot match a Windows reference. Non-Windows targets therefore call
-**bit-exact ports of the UCRT functions** (`crates/ld-decode/src/optimized/ucrt_math.rs`,
-wired into the vendored FFT by `build.rs` via `DUCC_UCRT_SHIM`) instead of the
-platform libm. Those ports are reconstructed from `ucrtbase.dll`'s disassembly and
-validated against the real UCRT on Windows over 1.1 million arguments, 0
-mismatches; the range currently covered is `sin`/`cos`, which is everything the
-FFT, `freqz` and filter-design paths need. UCRT dispatches on CPU features at run
-time, so the port reproduces the FMA variant, which is the one the reference corpus
-was produced with.
+| path | window | `.tbc` (957 MB) | `.pcm` (2 942 940 samples) | `.efm` |
+|---|---|---|---|---|
+| s16 | `-s 1000 -l 1000` | identical | identical | identical |
+| `.ldf` | `-s 300 -l 1000` | identical | identical | identical |
+| `.flac` (ffmpeg) | `-s 300 -l 1000` | identical | identical | identical |
+| `.flac` (claxon) | `-s 300 -l 1000` | identical | identical | identical |
+
+The `.flac` rows used **different ffmpeg builds** (Ubuntu 4.4.2 vs the gyan
+`N-112134` build on Windows), and the outputs are still byte-identical, so neither
+the FLAC container nor the ffmpeg version is a parity risk. Before the UCRT ports
+this table read 9 / 6 / 14 differing `.tbc` bytes (isolated luma values off by 1-3
+LSB) and a ±1 LSB `.pcm` dither on about 7% of samples — `.efm` was already
+identical everywhere, being hard-decision and drift-free.
+
+Those rows are windowed runs. Over a long run the one unported call shows up: a
+40 000-field Linux decode of the s16 capture differs from the Windows reference
+in **one byte of 19 GB** of `.tbc` (field 11 656, line 126, a 1-LSB luma value),
+with `.efm` and `.pcm` still identical. `LD_DUMP_MTFPOW` identifies it as `cpow`
+(see the bullet above); everything else on the video path, including the MTF
+filter it is applied to, is bit-identical across the two platforms.
+
+The hermetic FFT/filter goldens live in `crates/ld-decode/tests/data` as **one
+committed set for both platforms**, holding the values scipy 1.18.0 produces on
+Windows — the parity target. They are generated from committed,
+platform-independent inputs by `scripts/gen_scipy_fft_goldens.py`, so `cargo test`
+needs no Python, no setup and no regeneration on either platform, including in
+`release.yml`, whose two runners run the same command. `--verify` is the gate: it
+recomputes the set and fails if the recipes or the pinned wheels have drifted from
+the committed values (run it on Windows; elsewhere the local scipy's own drift
+makes a mismatch expected, which is what `--census` measures instead).
 
 Building on other architectures (aarch64, macOS) is untested: it compiles and
 runs best-effort, but the parity claim does not extend there — the reference
@@ -375,7 +391,8 @@ not what is mathematically equivalent. Some consequences, all deliberate:
 
 - FFTs go through the vendored ducc0, never `rustfft`, in the hot paths.
 - Complex multiply uses numpy's FMA kernel and Smith's division-by-reciprocal;
-  complex `pow` uses the UCRT via FFI.
+  complex `pow` is a direct FFI call to the platform C library (UCRT on Windows),
+  never an `exp(b*log(a))` chain.
 - The Hilbert-unwrap path uses numba's plain four-product multiply, *not* numpy's
   FMA version — both are correct and they round differently.
 - Summation of `bw_ratios` uses a bit-port of numpy's pairwise summation, because
