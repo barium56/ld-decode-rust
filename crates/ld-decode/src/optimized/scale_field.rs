@@ -33,6 +33,80 @@ fn median_f64(values: &mut [f64]) -> f64 {
     }
 }
 
+/// Four independent 16-tap gathers, each accumulated in the exact serial f64
+/// order the scalar loop uses.
+///
+/// The per-tap weight blend (`ws + alpha * (wt - ws)`) and the f32 product are
+/// pure per-lane arithmetic, so computing them eight taps at a time with AVX2
+/// yields bit-identical values to the scalar form — no reassociation, no
+/// contraction, and each f32 op keeps its own rounding. Only the *loads* are
+/// vectorized, which is the point: the scalar shape issues three loads per tap
+/// (two LUT rows plus the sample), i.e. 48 loads per output sample against
+/// Zen's three load ports, and the loop measures ~4.8 cycles/tap. Widening with
+/// `cvtps_pd` is exact (f32 to f64 is lossless), and the accumulation then
+/// replays t = 0..15 into four independent chains, so every f64 add rounds
+/// exactly as before.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn gather_lanes_16(
+    buf: &[f32],
+    sinc_lut: &[f32],
+    start: &[usize; 4],
+    alpha: &[f32; 4],
+    rowoff: &[usize; 4],
+) -> [f64; 4] {
+    use std::arch::x86_64::*;
+    let mut prod = [[0.0f64; SINC_TAP_COUNT]; 4];
+    for k in 0..4 {
+        let a = _mm256_set1_ps(*alpha.get_unchecked(k));
+        let lut = sinc_lut.as_ptr().add(*rowoff.get_unchecked(k));
+        let b = buf.as_ptr().add(*start.get_unchecked(k));
+        let dst = prod[k].as_mut_ptr();
+        let mut t = 0;
+        while t < SINC_TAP_COUNT {
+            let ws = _mm256_loadu_ps(lut.add(t));
+            let wt = _mm256_loadu_ps(lut.add(SINC_TAP_COUNT + t));
+            let w = _mm256_add_ps(ws, _mm256_mul_ps(a, _mm256_sub_ps(wt, ws)));
+            let p = _mm256_mul_ps(_mm256_loadu_ps(b.add(t)), w);
+            let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(p));
+            let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(p, 1));
+            _mm256_storeu_pd(dst.add(t), lo);
+            _mm256_storeu_pd(dst.add(t + 4), hi);
+            t += 8;
+        }
+    }
+    let mut r = [0.0f64; 4];
+    for t in 0..SINC_TAP_COUNT {
+        r[0] += *prod[0].get_unchecked(t);
+        r[1] += *prod[1].get_unchecked(t);
+        r[2] += *prod[2].get_unchecked(t);
+        r[3] += *prod[3].get_unchecked(t);
+    }
+    r
+}
+
+/// Scalar fallback for targets without AVX2 — the original per-tap form.
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn gather_lanes_16(
+    buf: &[f32],
+    sinc_lut: &[f32],
+    start: &[usize; 4],
+    alpha: &[f32; 4],
+    rowoff: &[usize; 4],
+) -> [f64; 4] {
+    let mut r = [0.0f64; 4];
+    for t in 0..SINC_TAP_COUNT {
+        for k in 0..4 {
+            let ws = *sinc_lut.get_unchecked(rowoff[k] + t);
+            let w = ws + alpha[k]
+                * (*sinc_lut.get_unchecked(rowoff[k] + SINC_TAP_COUNT + t) - ws);
+            r[k] += f64::from(*buf.get_unchecked(start[k] + t) * w);
+        }
+    }
+    r
+}
+
 /// Parameters for one [`scale_field_sinc`] call.
 #[derive(Clone, Copy)]
 pub(crate) struct SincScaleParams {
@@ -160,10 +234,6 @@ pub(crate) fn scale_field_sinc(
             // serial loop; the lanes only overlap in execution.
             let mut j = 0usize;
             while j + 4 <= n {
-                let mut r0 = 0.0f64;
-                let mut r1 = 0.0f64;
-                let mut r2 = 0.0f64;
-                let mut r3 = 0.0f64;
                 let mut coord = [0.0f32; 4];
                 let mut start = [0usize; 4];
                 let mut alpha = [0.0f32; 4];
@@ -206,33 +276,14 @@ pub(crate) fn scale_field_sinc(
                         rowoff[k] = phase_start * SINC_TAP_COUNT;
                         start[k] = coord_int - half_taps_m1;
                     }
-                    for t in 0..SINC_TAP_COUNT {
-                        // Lane k: blend the t-th weight of its row pair, f32
-                        // product with buf, widen, add to lane k's own f64
-                        // chain (exact per-sample order preserved).
-                        let ws0 = *sinc_lut.get_unchecked(rowoff[0] + t);
-                        let w0 = ws0 + alpha[0] * (*sinc_lut.get_unchecked(rowoff[0] + SINC_TAP_COUNT + t) - ws0);
-                        r0 += f64::from(*buf.get_unchecked(start[0] + t) * w0);
-
-                        let ws1 = *sinc_lut.get_unchecked(rowoff[1] + t);
-                        let w1 = ws1 + alpha[1] * (*sinc_lut.get_unchecked(rowoff[1] + SINC_TAP_COUNT + t) - ws1);
-                        r1 += f64::from(*buf.get_unchecked(start[1] + t) * w1);
-
-                        let ws2 = *sinc_lut.get_unchecked(rowoff[2] + t);
-                        let w2 = ws2 + alpha[2] * (*sinc_lut.get_unchecked(rowoff[2] + SINC_TAP_COUNT + t) - ws2);
-                        r2 += f64::from(*buf.get_unchecked(start[2] + t) * w2);
-
-                        let ws3 = *sinc_lut.get_unchecked(rowoff[3] + t);
-                        let w3 = ws3 + alpha[3] * (*sinc_lut.get_unchecked(rowoff[3] + SINC_TAP_COUNT + t) - ws3);
-                        r3 += f64::from(*buf.get_unchecked(start[3] + t) * w3);
-                    }
+                    let r = gather_lanes_16(buf, sinc_lut, &start, &alpha, &rowoff);
                     // The final level_adjust * result multiply happens in f64
                     // and rounds to f32 on the store. Reuses adj[] computed above
                     // (same arithmetic, no redundant recompute).
-                    *out.get_unchecked_mut(j) = (adj[0] * r0) as f32;
-                    *out.get_unchecked_mut(j + 1) = (adj[1] * r1) as f32;
-                    *out.get_unchecked_mut(j + 2) = (adj[2] * r2) as f32;
-                    *out.get_unchecked_mut(j + 3) = (adj[3] * r3) as f32;
+                    *out.get_unchecked_mut(j) = (adj[0] * r[0]) as f32;
+                    *out.get_unchecked_mut(j + 1) = (adj[1] * r[1]) as f32;
+                    *out.get_unchecked_mut(j + 2) = (adj[2] * r[2]) as f32;
+                    *out.get_unchecked_mut(j + 3) = (adj[3] * r[3]) as f32;
                 }
                 j += 4;
             }
