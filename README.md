@@ -339,18 +339,28 @@ path measured gives the same shape — `.ldf` (`.efm` byte-identical, `.tbc` 6 b
 of 957 MB), `.flac` through **two different ffmpeg builds** (0 `.efm` bytes, 14
 `.tbc` bytes), and `.flac` through claxon — so the gap is format-independent, and
 neither the FLAC container nor the ffmpeg version is a parity risk. The hermetic
-FFT/filter goldens in `crates/ld-decode/tests/data` are consequently
-**per-platform, and both sets are committed**: the Windows reference values live
-in `tests/data/`, the Linux ones in `tests/data/linux/` (generated from the same
-committed, platform-independent inputs by
-`scripts/gen_scipy_fft_goldens.py`). The tests pick the set for the platform they
-are built for, so `cargo test` needs no Python, no setup and no regeneration on
-either platform — including in `release.yml`, whose two runners run the same
-command. `--verify` is the gate: it recomputes the set and fails if the local
-libm/wheels have drifted from the committed values, and it runs on both CI jobs
-(the windows leg against the Windows set, the Linux leg against the Linux one).
-The 1024-point canary is `include!`d as a Rust literal, so it is committed per
-platform too, and the platform choice there is made by `cfg`.
+FFT/filter goldens live in `crates/ld-decode/tests/data` as **one committed set
+for both platforms**, holding the values scipy 1.18.0 produces on Windows — the
+parity target. They are generated from committed, platform-independent inputs by
+`scripts/gen_scipy_fft_goldens.py`, so `cargo test` needs no Python, no setup and
+no regeneration on either platform, including in `release.yml`, whose two runners
+run the same command. `--verify` is the gate: it recomputes the set and fails if
+the recipes or the pinned wheels have drifted from the committed values (run it
+on Windows; elsewhere the local scipy's own drift makes a mismatch expected, which
+is what `--census` measures instead).
+
+Linux reproduces that Windows set exactly rather than by luck. The reference's
+twiddles and `np.exp(1j*x)` values come from the platform C library, and UCRT and
+glibc disagree in the last bits on a few percent of arguments, so a Linux build
+calling glibc cannot match a Windows reference. Non-Windows targets therefore call
+**bit-exact ports of the UCRT functions** (`crates/ld-decode/src/optimized/ucrt_math.rs`,
+wired into the vendored FFT by `build.rs` via `DUCC_UCRT_SHIM`) instead of the
+platform libm. Those ports are reconstructed from `ucrtbase.dll`'s disassembly and
+validated against the real UCRT on Windows over 1.1 million arguments, 0
+mismatches; the range currently covered is `sin`/`cos`, which is everything the
+FFT, `freqz` and filter-design paths need. UCRT dispatches on CPU features at run
+time, so the port reproduces the FMA variant, which is the one the reference corpus
+was produced with.
 
 Building on other architectures (aarch64, macOS) is untested: it compiles and
 runs best-effort, but the parity claim does not extend there — the reference

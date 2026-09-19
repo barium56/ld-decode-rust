@@ -344,21 +344,17 @@ mod tests {
     // Reference outputs were produced by `scipy.fft` (scipy 1.18.0 in the
     // bundled 7.3.0 release python). The FFI must reproduce them bit-for-bit.
     //
-    // "Them" is per platform: ducc0 computes its unity roots from the platform
-    // C library's sin/cos (vendor/ducc0/math/unity_roots.h), so the reference
-    // values differ by 1-2 ulp between Windows (UCRT) and Linux (glibc). Each
-    // platform's set is committed -- Windows in `tests/data`, Linux in
-    // `tests/data/linux` -- which is why the loaders below resolve a path
-    // twice. Regenerate with `scripts/gen_scipy_fft_goldens.py`; that script
-    // also owns the explanation.
+    // One set, both platforms: ducc0 would otherwise compute its unity roots
+    // from the platform C library's sin/cos (vendor/ducc0/math/unity_roots.h),
+    // and UCRT and glibc disagree by 1-2 ulp on a few percent of arguments.
+    // `optimized::ucrt_math` supplies UCRT's values on Linux, so the values
+    // below are reproducible everywhere. Regenerate with
+    // `scripts/gen_scipy_fft_goldens.py`; that script owns the explanation.
     const SCI_PY_IN_1024: &[[f64; 2]] = include!("../tests/data/scipy_in_1024.rs");
-    // The 1024-point canary is consumed at *compile* time, so the platform
-    // choice has to be made by `cfg`, not at run time.
-    #[cfg(not(target_os = "linux"))]
+    // Consumed at *compile* time. There is one golden set for both platforms:
+    // since the twiddles are built from the ported UCRT `cos`/`sin`
+    // (`optimized::ucrt_math`), Linux produces the Windows values exactly.
     const SCI_PY_OUT_1024: &[[f64; 2]] = include!("../tests/data/scipy_out_1024.rs");
-    #[cfg(target_os = "linux")]
-    const SCI_PY_OUT_1024: &[[f64; 2]] =
-        include!("../tests/data/linux/scipy_out_1024.rs");
 
     fn to_complex(data: &[[f64; 2]]) -> Vec<Complex64> {
         data.iter().map(|d| Complex64::new(d[0], d[1])).collect()
@@ -490,18 +486,16 @@ mod tests {
     // against the reference library. Goldens: `scripts/gen_fft32768_ref.py`
     // under the bundled 7.3.0 python (scipy 1.18.0, numpy 2.4.6), raw
     // little-endian f64, complex files interleaved re/im.
-    // Platform-dependent goldens win over the shared ones when a platform copy
-    // exists (only the libm-derived outputs have one; see the note above).
+    // One golden set for every platform: these values are what scipy 1.18.0
+    // produces on Windows, and since the FFT twiddles now come from the ported
+    // UCRT `cos`/`sin` (`optimized::ucrt_math`) rather than from the platform
+    // libm, Linux reproduces them exactly. There is deliberately no per-platform
+    // fallback -- a second set would be a way for the two platforms to disagree
+    // silently.
     fn data_path(name: &str) -> std::path::PathBuf {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-        #[cfg(target_os = "linux")]
-        {
-            let alt = root.join("linux").join(name);
-            if alt.exists() {
-                return alt;
-            }
-        }
-        root.join(name)
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(name)
     }
 
     fn read_f64s(name: &str) -> Vec<f64> {

@@ -54,6 +54,14 @@ fn main() {
     let vendor = "../../vendor";
     let out = std::env::var("OUT_DIR").unwrap();
 
+    // Outside MSVC, ducc's twiddle generation would call glibc's `cos`/`sin`,
+    // which disagree with UCRT's by 1-2 ulp on a few percent of arguments --
+    // enough to move FFT output. Defining DUCC_UCRT_SHIM routes those calls to
+    // the bit-exact UCRT ports in src/optimized/ucrt_math.rs, so both platforms
+    // build identical twiddles from identical numbers. Windows keeps the
+    // platform libm, which already *is* UCRT.
+    let ucrt_shim = !msvc;
+
     // Engine-independent ducc translation units (no SIMD, compiled once).
     let mut base = cc::Build::new();
     base.cpp(true)
@@ -63,6 +71,9 @@ fn main() {
         .include(vendor)
         .file(format!("{vendor}/ducc0/infra/threading.cc"))
         .file(format!("{vendor}/ducc0/infra/string_utils.cc"));
+    if ucrt_shim {
+        base.define("DUCC_UCRT_SHIM", None);
+    }
     language_flags(&mut base, msvc);
     if let Some(cxx) = find_cxx(msvc) {
         base.compiler(cxx);
@@ -104,6 +115,9 @@ fn main() {
             .warnings(false)
             .include(vendor)
             .file(&src);
+        if ucrt_shim {
+            b.define("DUCC_UCRT_SHIM", None);
+        }
         language_flags(&mut b, msvc);
         // `/O2`, and it stays `/O2`: an `/O3` shim (bit-identical by
         // construction — clang-cl's `/O3` implies no fast-math — and 4/4 on

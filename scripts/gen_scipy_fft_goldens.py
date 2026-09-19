@@ -1,48 +1,46 @@
-# Regenerates -- or measures -- the platform-dependent scipy reference outputs
-# that the hermetic FFT and filter tests compare against.
+# Regenerates -- or measures -- the scipy reference outputs that the hermetic
+# FFT and filter tests compare against.
 #
-# Why the goldens are platform-dependent at all:
+# There is exactly ONE golden set, shared by every platform, and its values are
+# what scipy 1.18.0 produces on Windows (UCRT). That is deliberate: the parity
+# target of this project is the Windows Python reference.
+#
+# Why one set needs no platform conditionals any more:
 #
 # The vendored ducc0 computes its unity roots (twiddle factors) at plan time from
-# the *platform C library's* sin/cos (`vendor/ducc0/math/unity_roots.h`, e.g.
-# `v1[i] = {cos(i*ang), sin(i*ang)}`). UCRT's and glibc's sin/cos differ in the
-# last bit or two, so the same FFT source produces results that differ by 1-2 ulp
-# between Windows and Linux. Everything else about the FFT is identical (same
-# source, same 128-bit SIMD width, same operation order), which is why the
-# Windows build reproduces the Windows scipy wheel bit-for-bit and the Linux
-# build reproduces the Linux scipy wheel bit-for-bit -- but the two platforms'
-# goldens are NOT interchangeable.
+# the *platform C library's* sin/cos (`vendor/ducc0/math/unity_roots.h`). UCRT
+# and glibc differ in the last bit or two on a few percent of arguments (and by
+# far more on `cpow`), so the same FFT source produced different results on the
+# two platforms -- historically making a second, Linux-specific golden set
+# necessary. The port now removes the dependency instead: the twiddles and
+# `numpy_sincos` are served on non-Windows targets by bit-exact ports of the UCRT
+# functions (`crates/ld-decode/src/optimized/ucrt_math.rs`, wired in by
+# `build.rs` via DUCC_UCRT_SHIM), so Linux reproduces these values exactly and
+# `cargo test` needs no Python on either platform.
 #
 # The *inputs* (fft32768_in, rfft32768_in, scipy_in_1024, freqz_fir_taps,
 # freqz_iir_ba) are committed data and platform-independent. Only the *outputs*
 # are recomputed here, with the same scipy calls that produced the committed
-# Windows versions.
-#
-# Layout: because the two platforms' outputs are different values, each
-# platform's *output* set is committed. The Windows set is the shared root
-# (where it has always been, so its files and hashes are unchanged) and the
-# Linux set lives in a `linux/` subdirectory next to it; the platform is chosen
-# from `sys.platform` unless --platform overrides it. The 1024-point *input*
-# literal is emitted to the shared root on every platform, so the two sets
-# cannot drift apart in the one file that must be identical.
+# versions.
 #
 # Modes:
-#   --verify   compare the computed values against this platform's committed
-#              set, exit non-zero on any mismatch. Run this on each platform:
-#              it proves the recipes below still reproduce them byte-for-byte,
-#              which is what makes a committed platform set trustworthy.
-#   --census   same comparison, but reports *how far* the local (Linux) scipy is
-#              from the reference -- cells, ulp, first divergent indices with
-#              both bit patterns -- and always exits 0. This measures the Python
-#              reference's own cross-platform drift, which is why the port
-#              cannot match a single platform-independent golden set. It does
-#              NOT involve the Rust decoder. Use --ref to point it at the other
-#              platform's set (CI passes the Windows root explicitly).
-#   (default)  write this platform's goldens into --out.
+#   --verify   compare the computed values against the committed set, exit
+#              non-zero on any mismatch. This proves the recipes below still
+#              reproduce the set byte-for-byte, so an accidental edit to a
+#              golden fails instead of silently widening a parity gate. Run it
+#              on Windows, where the set was produced: on another platform the
+#              local scipy's own drift makes a mismatch the expected result (use
+#              --census for that instead).
+#   --census   report *how far* the local scipy is from the committed set --
+#              cells, ulp, first divergent indices with both bit patterns -- and
+#              always exit 0. This measures the Python reference's own
+#              cross-platform drift, i.e. exactly the quantity the UCRT ports
+#              exist to neutralise. It does NOT involve the Rust decoder.
+#   (default)  write the goldens into --out.
 #
 # Usage:
-#   python3 scripts/gen_scipy_fft_goldens.py --verify --out crates/ld-decode/tests/data
-#   python3 scripts/gen_scipy_fft_goldens.py --census --ref crates/ld-decode/tests/data
+#   python3 scripts/gen_scipy_fft_goldens.py --verify            # on Windows
+#   python3 scripts/gen_scipy_fft_goldens.py --census            # elsewhere
 #   python3 scripts/gen_scipy_fft_goldens.py --out crates/ld-decode/tests/data
 import argparse
 import os
@@ -259,66 +257,28 @@ def census(out_dir):
     return 0
 
 
-def platform_name(requested):
-    """Resolve `--platform`: `auto` means "the machine running this script"."""
-    if requested != "auto":
-        return requested
-    if sys.platform.startswith("linux"):
-        return "linux"
-    if sys.platform.startswith("win"):
-        return "windows"
-    return sys.platform
-
-
-def platform_subdir(platform):
-    """Subdirectory holding this platform's outputs, under the golden root.
-
-    Windows lives in the shared root: that is where the original set was
-    committed, and keeping it there leaves those files (and their hashes)
-    untouched.
-    """
-    return "linux" if platform == "linux" else ""
-
-
 def main():
     ap = argparse.ArgumentParser(
-        description="Regenerate or measure the platform-dependent scipy goldens."
+        description="Regenerate or measure the scipy reference goldens."
     )
-    ap.add_argument("--out", default=DATA, help="golden root to write into")
-    ap.add_argument(
-        "--ref",
-        default=None,
-        help="explicit reference directory to compare against (default: this "
-        "platform's directory under --out)",
-    )
-    ap.add_argument(
-        "--platform",
-        default="auto",
-        choices=("auto", "windows", "linux"),
-        help="which platform's set to write/compare (default: auto-detect)",
-    )
+    ap.add_argument("--out", default=DATA, help="golden directory to write into")
     ap.add_argument("--verify", action="store_true", help="compare, fail on mismatch")
     ap.add_argument("--census", action="store_true", help="report drift, never fail")
     args = ap.parse_args()
 
-    platform = platform_name(args.platform)
-    subdir = platform_subdir(platform)
-    out_dir = os.path.join(args.out, subdir) if subdir else args.out
-    ref_dir = args.ref if args.ref else out_dir
+    out_dir = args.out
+    ref_dir = out_dir
 
     if args.census:
         return census(ref_dir)
 
     files = golden_files()
     print(f"scipy {scipy.__version__} numpy {np.__version__}")
-    print(f"platform {platform}: goldens {os.path.normpath(out_dir)}")
+    print(f"local platform {sys.platform}: goldens {os.path.normpath(out_dir)}")
     if args.verify:
-        print(f"platform {platform}: reference {os.path.normpath(ref_dir)}")
+        print("  (verifying against the committed set)")
     else:
-        print(
-            "  (writing: platform-independent inputs stay in the shared root, "
-            "this platform's outputs go to the directory above)"
-        )
+        print("  (writing: the committed set lives in one directory)")
     bad = []
     for name in sorted(files):
         want = files[name]
@@ -352,20 +312,23 @@ def main():
             f"FAILED: {len(bad)} golden(s) not reproduced: {', '.join(bad)}",
             file=sys.stderr,
         )
-        if platform == "linux":
+        if sys.platform.startswith("win"):
             print(
-                "If this host's libm is not the one the committed set was "
-                "generated with (the CI runner is ubuntu-22.04, glibc 2.35, "
-                "CPython 3.12 with the pinned wheels), regenerate the set "
-                "with the same script and no --verify.",
+                "The recipes and the pinned wheels have drifted from the "
+                "committed set; regenerate with the same script and no "
+                "--verify only after understanding why.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Expected outside Windows: the reference's own twiddles come "
+                "from the platform libm, so this host's scipy differs from the "
+                "committed set. Use --census to see by how much.",
                 file=sys.stderr,
             )
         return 1
     if args.verify:
-        print(
-            f"OK: every computed golden reproduces the committed {platform} file "
-            "byte-for-byte"
-        )
+        print("OK: every computed golden reproduces the committed file byte-for-byte")
     return 0
 
 

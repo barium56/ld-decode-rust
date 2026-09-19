@@ -982,26 +982,24 @@ fn np_csqrt(z: Complex64) -> Complex64 {
 /// off at bin 3319, purely because of the merge. Calling this makes the choice
 /// part of the source instead of an optimizer accident.
 ///
-/// Windows has no `sincos` symbol to bind and shows no profile split (both
-/// profiles match the Windows scipy goldens), so the separate calls -- which
-/// are what numpy's Windows wheel uses -- are kept there.
-#[cfg(target_os = "linux")]
-#[inline]
-fn numpy_sincos(x: f64) -> (f64, f64) {
-    // glibc's `sincos`, in libm. Returns the pair through out-pointers.
-    #[link(name = "m")]
-    extern "C" {
-        fn sincos(x: f64, s: *mut f64, c: *mut f64);
-    }
-    let (mut s, mut c) = (0.0f64, 0.0f64);
-    unsafe { sincos(x, &mut s, &mut c) };
-    (s, c)
-}
-
-#[cfg(not(target_os = "linux"))]
+/// The parity target is the **Windows** reference, which resolves these to
+/// UCRT, so Linux takes its values from the bit-exact UCRT ports in
+/// `optimized::ucrt_math` instead of from glibc: UCRT and glibc agree on only
+/// ~97% of arguments, and one of the four call sites maps over the whole freqz
+/// grid. Windows keeps the platform calls, because there they *are* UCRT.
+#[cfg(target_os = "windows")]
 #[inline]
 fn numpy_sincos(x: f64) -> (f64, f64) {
     (x.sin(), x.cos())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn numpy_sincos(x: f64) -> (f64, f64) {
+    (
+        crate::optimized::ucrt_math::sin_or_libm(x),
+        crate::optimized::ucrt_math::cos_or_libm(x),
+    )
 }
 
 /// The platform C runtime's `atan2`: UCRT (ucrtbase.dll) on Windows, the
@@ -2430,24 +2428,17 @@ mod tests {
 
     // --- Audio + EFM filters vs the reference dump (scripts/py_audio_ref.py) ---
 
-    /// Resolve a golden path, preferring this platform's committed set.
+    /// Resolve a committed golden path.
     ///
-    /// scipy's own twiddles come from the platform libm, so the values it
-    /// produces on Linux differ from the committed Windows goldens by 1-2 ulp
-    /// (see `scripts/gen_scipy_fft_goldens.py`); the Linux set lives in
-    /// `tests/data/linux/`. Anything that is *not* platform-dependent -- the
-    /// committed inputs, the f32 filter references -- has no Linux copy and
-    /// falls through to the shared file.
+    /// There is exactly one golden set for both platforms. The values come from
+    /// scipy 1.18.0 on Windows (UCRT), and Linux reproduces them because every
+    /// platform-libm call on the path -- the ducc0 twiddles
+    /// (`vendor/ducc0/math/unity_roots.h`) and `numpy_sincos` -- is served by
+    /// the bit-exact UCRT ports in `optimized::ucrt_math`. See
+    /// `scripts/gen_scipy_fft_goldens.py` for how a set is produced and
+    /// verified.
     fn golden_path(path: &str) -> std::path::PathBuf {
-        let p = std::path::Path::new(path);
-        #[cfg(target_os = "linux")]
-        if let (Some(dir), Some(name)) = (p.parent(), p.file_name()) {
-            let alt = dir.join("linux").join(name);
-            if alt.exists() {
-                return alt;
-            }
-        }
-        p.to_path_buf()
+        std::path::Path::new(path).to_path_buf()
     }
 
     fn read_f32(path: &str) -> Vec<f32> {

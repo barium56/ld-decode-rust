@@ -60,6 +60,28 @@ namespace detail_unity_roots {
 
 using namespace std;
 
+// Platform-independent twiddle evaluation.
+//
+// Upstream calls the platform libm's `cos`/`sin` here. Outside MSVC that is
+// glibc, whose results differ from UCRT's by 1-2 ulp on a few percent of
+// arguments -- and because twiddles are baked into every transform, that is the
+// dominant source of Linux-vs-Windows FFT drift. When DUCC_UCRT_SHIM is defined
+// (build.rs does that for every non-MSVC target) these helpers call bit-exact
+// ports of the UCRT functions instead, so both platforms build identical
+// twiddles from identical numbers. Windows keeps the platform libm, which *is*
+// UCRT, so nothing changes there.
+#if defined(DUCC_UCRT_SHIM)
+// Implemented in crates/ld-decode/src/optimized/ucrt_math.rs; the C ABI keeps
+// the vendored header free of any Rust dependency at compile time.
+extern "C" double ld_ucrt_cos(double);
+extern "C" double ld_ucrt_sin(double);
+template<typename U> inline U twiddle_cos(U x) { return U(ld_ucrt_cos(double(x))); }
+template<typename U> inline U twiddle_sin(U x) { return U(ld_ucrt_sin(double(x))); }
+#else
+template<typename U> inline U twiddle_cos(U x) { return cos(x); }
+template<typename U> inline U twiddle_sin(U x) { return sin(x); }
+#endif
+
 template<typename T, typename Tc> class UnityRoots
   {
   private:
@@ -75,14 +97,14 @@ template<typename T, typename Tc> class UnityRoots
         {
         if (x<2*n) // first quadrant
           {
-          if (x<n) return {cos(Thigh(x)*ang), sin(Thigh(x)*ang)};
-          return {sin(Thigh(2*n-x)*ang), cos(Thigh(2*n-x)*ang)};
+          if (x<n) return {twiddle_cos(Thigh(x)*ang), twiddle_sin(Thigh(x)*ang)};
+          return {twiddle_sin(Thigh(2*n-x)*ang), twiddle_cos(Thigh(2*n-x)*ang)};
           }
         else // second quadrant
           {
           x-=2*n;
-          if (x<n) return {-sin(Thigh(x)*ang), cos(Thigh(x)*ang)};
-          return {-cos(Thigh(2*n-x)*ang), sin(Thigh(2*n-x)*ang)};
+          if (x<n) return {-twiddle_sin(Thigh(x)*ang), twiddle_cos(Thigh(x)*ang)};
+          return {-twiddle_cos(Thigh(2*n-x)*ang), twiddle_sin(Thigh(2*n-x)*ang)};
           }
         }
       else
@@ -90,14 +112,14 @@ template<typename T, typename Tc> class UnityRoots
         x=8*n-x;
         if (x<2*n) // third quadrant
           {
-          if (x<n) return {cos(Thigh(x)*ang), -sin(Thigh(x)*ang)};
-          return {sin(Thigh(2*n-x)*ang), -cos(Thigh(2*n-x)*ang)};
+          if (x<n) return {twiddle_cos(Thigh(x)*ang), -twiddle_sin(Thigh(x)*ang)};
+          return {twiddle_sin(Thigh(2*n-x)*ang), -twiddle_cos(Thigh(2*n-x)*ang)};
           }
         else // fourth quadrant
           {
           x-=2*n;
-          if (x<n) return {-sin(Thigh(x)*ang), -cos(Thigh(x)*ang)};
-          return {-cos(Thigh(2*n-x)*ang), -sin(Thigh(2*n-x)*ang)};
+          if (x<n) return {-twiddle_sin(Thigh(x)*ang), -twiddle_cos(Thigh(x)*ang)};
+          return {-twiddle_cos(Thigh(2*n-x)*ang), -twiddle_sin(Thigh(2*n-x)*ang)};
           }
         }
       }
@@ -164,8 +186,24 @@ template<typename T, typename Tc> class UnityRoots
     UnityRoots(size_t n)
       : N(n)
       {
-      constexpr auto pi = 3.141592653589793238462643383279502884197L;
-      Thigh ang = Thigh(0.25L*pi/n);
+      // The twiddle argument is evaluated in `double`, not `long double`.
+      //
+      // Upstream writes this as `Thigh(0.25L*pi/n)` with a `long double`
+      // literal, which makes the argument platform-dependent: MSVC defines
+      // `long double` as 64-bit, but g++/clang on Linux use x87 80-bit
+      // extended, so Linux rounds twice -- 80-bit intermediate, then to
+      // `Thigh` -- and lands 1 ulp away from the Windows value whenever n is
+      // not a power of two (measured: n = 3, 6, 12, 15 differ; powers of two
+      // are exact scalings and agree). ducc builds a `UnityRoots` per
+      // prime-factor stage, so radix-3/5/7 plans hit the odd n case, not a
+      // corner case.
+      //
+      // On Windows this change is a no-op by construction (the `L` literal
+      // already collapsed to `double` there, verified: sizeof(long double) ==
+      // 8 and 34/34 sizes agreed before the change), so it only moves Linux
+      // onto the Windows values.
+      static constexpr double pi = 3.141592653589793238462643383279502884197;
+      Thigh ang = Thigh(0.25*pi/n);
       size_t nval = (n+2)/2;
       shift = 1;
       while((size_t(1)<<shift)*(size_t(1)<<shift) < nval) ++shift;
@@ -216,11 +254,11 @@ template<typename T, typename Tc> class MultiExp
       v1.resize(mask+1);
       v1[0]={Thigh(1), Thigh(0)};
       for (size_t i=1; i<v1.size(); ++i)
-        v1[i] = {cos(i*ang), sin(i*ang)};
+        v1[i] = {twiddle_cos(i*ang), twiddle_sin(i*ang)};
       v2.resize((nval+mask)/(mask+1));
       v2[0]={Thigh(1), Thigh(0)};
       for (size_t i=1; i<v2.size(); ++i)
-        v2[i] = {cos((i*(mask+1))*ang), sin((i*(mask+1))*ang)};
+        v2[i] = {twiddle_cos((i*(mask+1))*ang), twiddle_sin((i*(mask+1))*ang)};
       }
 
     size_t size() const { return N; }
