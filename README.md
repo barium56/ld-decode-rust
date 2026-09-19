@@ -239,8 +239,10 @@ scipy 1.18.0 spectra (1024 and 32768, the size the pipeline actually
 transforms), numpy's pairwise summation and `std` against generated cases,
 `butter`/`firwin`/`filtfft`/emphasis filters against scipy coefficients, the
 sinc LUT against its reference table, and the batched inverse FFT against the
-per-transform scalar form it replaced. Expect **36 passed, 3 ignored**, plus one
-test that is filtered out or skipped:
+per-transform scalar form it replaced. The stored spectra are committed per
+platform (see [Platform support](#platform-support)), so the suite runs
+unchanged on Windows and Linux with no extra tooling. Expect **36 passed, 3
+ignored**, plus one test that is filtered out or skipped:
 
 - `pll_matches_stock_field_stream` needs `LD_PLL_DIR` pointing at a golden
   field stream dumped from a stock Python run; it fails loudly without it, so
@@ -338,11 +340,17 @@ of 957 MB), `.flac` through **two different ffmpeg builds** (0 `.efm` bytes, 14
 `.tbc` bytes), and `.flac` through claxon — so the gap is format-independent, and
 neither the FLAC container nor the ffmpeg version is a parity risk. The hermetic
 FFT/filter goldens in `crates/ld-decode/tests/data` are consequently
-**per-platform**: the committed set is the Windows one (the Windows CI job
-re-verifies it with `scripts/gen_scipy_fft_goldens.py --verify`), and the Linux
-job regenerates them from the same committed inputs before running the tests.
-The 1024-point canary is `include!`d as a Rust literal, so the regeneration
-rewrites those literals too.
+**per-platform, and both sets are committed**: the Windows reference values live
+in `tests/data/`, the Linux ones in `tests/data/linux/` (generated from the same
+committed, platform-independent inputs by
+`scripts/gen_scipy_fft_goldens.py`). The tests pick the set for the platform they
+are built for, so `cargo test` needs no Python, no setup and no regeneration on
+either platform — including in `release.yml`, whose two runners run the same
+command. `--verify` is the gate: it recomputes the set and fails if the local
+libm/wheels have drifted from the committed values, and it runs on both CI jobs
+(the windows leg against the Windows set, the Linux leg against the Linux one).
+The 1024-point canary is `include!`d as a Rust literal, so it is committed per
+platform too, and the platform choice there is made by `cfg`.
 
 Building on other architectures (aarch64, macOS) is untested: it compiles and
 runs best-effort, but the parity claim does not extend there — the reference

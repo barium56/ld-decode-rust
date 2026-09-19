@@ -2430,8 +2430,28 @@ mod tests {
 
     // --- Audio + EFM filters vs the reference dump (scripts/py_audio_ref.py) ---
 
+    /// Resolve a golden path, preferring this platform's committed set.
+    ///
+    /// scipy's own twiddles come from the platform libm, so the values it
+    /// produces on Linux differ from the committed Windows goldens by 1-2 ulp
+    /// (see `scripts/gen_scipy_fft_goldens.py`); the Linux set lives in
+    /// `tests/data/linux/`. Anything that is *not* platform-dependent -- the
+    /// committed inputs, the f32 filter references -- has no Linux copy and
+    /// falls through to the shared file.
+    fn golden_path(path: &str) -> std::path::PathBuf {
+        let p = std::path::Path::new(path);
+        #[cfg(target_os = "linux")]
+        if let (Some(dir), Some(name)) = (p.parent(), p.file_name()) {
+            let alt = dir.join("linux").join(name);
+            if alt.exists() {
+                return alt;
+            }
+        }
+        p.to_path_buf()
+    }
+
     fn read_f32(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).expect("reference data file");
+        let bytes = std::fs::read(golden_path(path)).expect("reference data file");
         bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -2618,6 +2638,7 @@ mod tests {
     }
 
     fn read_f64(path: &str) -> Vec<f64> {
+        let path = golden_path(path);
         let bytes = std::fs::read(path).expect("reference data file");
         bytes
             .chunks_exact(8)

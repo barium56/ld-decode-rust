@@ -343,6 +343,23 @@ mod tests {
 
     // Reference outputs were produced by `scipy.fft` (scipy 1.18.0 in the
     // bundled 7.3.0 release python). The FFI must reproduce them bit-for-bit.
+    //
+    // "Them" is per platform: ducc0 computes its unity roots from the platform
+    // C library's sin/cos (vendor/ducc0/math/unity_roots.h), so the reference
+    // values differ by 1-2 ulp between Windows (UCRT) and Linux (glibc). Each
+    // platform's set is committed -- Windows in `tests/data`, Linux in
+    // `tests/data/linux` -- which is why the loaders below resolve a path
+    // twice. Regenerate with `scripts/gen_scipy_fft_goldens.py`; that script
+    // also owns the explanation.
+    const SCI_PY_IN_1024: &[[f64; 2]] = include!("../tests/data/scipy_in_1024.rs");
+    // The 1024-point canary is consumed at *compile* time, so the platform
+    // choice has to be made by `cfg`, not at run time.
+    #[cfg(not(target_os = "linux"))]
+    const SCI_PY_OUT_1024: &[[f64; 2]] = include!("../tests/data/scipy_out_1024.rs");
+    #[cfg(target_os = "linux")]
+    const SCI_PY_OUT_1024: &[[f64; 2]] =
+        include!("../tests/data/linux/scipy_out_1024.rs");
+
     fn to_complex(data: &[[f64; 2]]) -> Vec<Complex64> {
         data.iter().map(|d| Complex64::new(d[0], d[1])).collect()
     }
@@ -351,10 +368,8 @@ mod tests {
     /// bit-for-bit. Reference produced by the bundled 7.3.0 release python.
     #[test]
     fn fft_matches_scipy_1024() {
-        let input_const: &[[f64; 2]] = include!("../tests/data/scipy_in_1024.rs");
-        let want_const: &[[f64; 2]] = include!("../tests/data/scipy_out_1024.rs");
-        let x = to_complex(input_const);
-        let want = to_complex(want_const);
+        let x = to_complex(SCI_PY_IN_1024);
+        let want = to_complex(SCI_PY_OUT_1024);
         let y = fft(&x);
         assert_eq!(y.len(), want.len());
         for i in 0..want.len() {
@@ -475,10 +490,18 @@ mod tests {
     // against the reference library. Goldens: `scripts/gen_fft32768_ref.py`
     // under the bundled 7.3.0 python (scipy 1.18.0, numpy 2.4.6), raw
     // little-endian f64, complex files interleaved re/im.
+    // Platform-dependent goldens win over the shared ones when a platform copy
+    // exists (only the libm-derived outputs have one; see the note above).
     fn data_path(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data")
-            .join(name)
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        #[cfg(target_os = "linux")]
+        {
+            let alt = root.join("linux").join(name);
+            if alt.exists() {
+                return alt;
+            }
+        }
+        root.join(name)
     }
 
     fn read_f64s(name: &str) -> Vec<f64> {
@@ -561,8 +584,8 @@ mod tests {
     // would have to eliminate. `--nocapture` to see the table.
     fn census_engine(e: FftEngine) {
         // 1024 c2c canary.
-        let input_const: &[[f64; 2]] = include!("../tests/data/scipy_in_1024.rs");
-        let want_const: &[[f64; 2]] = include!("../tests/data/scipy_out_1024.rs");
+        let input_const = SCI_PY_IN_1024;
+        let want_const = SCI_PY_OUT_1024;
         let x: Vec<Complex64> = input_const
             .iter()
             .map(|d| Complex64::new(d[0], d[1]))

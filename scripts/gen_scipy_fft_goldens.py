@@ -18,24 +18,32 @@
 # are recomputed here, with the same scipy calls that produced the committed
 # Windows versions.
 #
+# Layout: because the two platforms' outputs are different values, each
+# platform's *output* set is committed. The Windows set is the shared root
+# (where it has always been, so its files and hashes are unchanged) and the
+# Linux set lives in a `linux/` subdirectory next to it; the platform is chosen
+# from `sys.platform` unless --platform overrides it. The 1024-point *input*
+# literal is emitted to the shared root on every platform, so the two sets
+# cannot drift apart in the one file that must be identical.
+#
 # Modes:
-#   --verify   compare the computed values against the files in --out, exit
-#              non-zero on any mismatch. Run this on Windows against the
-#              committed goldens: it proves the recipes below still reproduce
-#              them byte-for-byte, which is what makes a Linux regeneration
-#              trustworthy.
+#   --verify   compare the computed values against this platform's committed
+#              set, exit non-zero on any mismatch. Run this on each platform:
+#              it proves the recipes below still reproduce them byte-for-byte,
+#              which is what makes a committed platform set trustworthy.
 #   --census   same comparison, but reports *how far* the local (Linux) scipy is
-#              from the committed (Windows) goldens -- cells, ulp, first
-#              divergent indices with both bit patterns -- and always exits 0.
-#              This measures the Python reference's own cross-platform drift,
-#              which is what decides whether the port can match a single
-#              platform-independent golden set at all. It does NOT involve the
-#              Rust decoder.
-#   (default)  write the goldens into --out.
+#              from the reference -- cells, ulp, first divergent indices with
+#              both bit patterns -- and always exits 0. This measures the Python
+#              reference's own cross-platform drift, which is why the port
+#              cannot match a single platform-independent golden set. It does
+#              NOT involve the Rust decoder. Use --ref to point it at the other
+#              platform's set (CI passes the Windows root explicitly).
+#   (default)  write this platform's goldens into --out.
 #
 # Usage:
-#   python3 scripts/gen_scipy_fft_goldens.py --census --out crates/ld-decode/tests/data
-#   python3 scripts/gen_scipy_fft_goldens.py --out "$RUNNER_TEMP/goldens"
+#   python3 scripts/gen_scipy_fft_goldens.py --verify --out crates/ld-decode/tests/data
+#   python3 scripts/gen_scipy_fft_goldens.py --census --ref crates/ld-decode/tests/data
+#   python3 scripts/gen_scipy_fft_goldens.py --out crates/ld-decode/tests/data
 import argparse
 import os
 import re
@@ -109,6 +117,14 @@ def compute():
     return out
 
 
+# The 1024-point canary is compared like every other golden, but never written
+# in binary form: the tests consume the `include!`d `scipy_out_1024.rs` literal,
+# so a `.f64` beside it would be a file nothing reads (and the gate would check
+# that instead of the literal). `read_reference` falls back to the `.rs`, which is
+# how the Windows set has always been stored.
+CANARY = "scipy_out_1024.f64"
+
+
 def golden_files():
     """{filename: little-endian f64 array} exactly as the tests read them."""
     files = {}
@@ -126,16 +142,16 @@ def golden_files():
 
 
 def rs_goldens():
-    """{filename: complex values} for the goldens the tests `include!` literally.
+    """(input, output) complex values for the goldens the tests `include!`.
 
     The 1024-point canary predates the binary `.f64` form and is consumed at
     *compile* time (`include!("../tests/data/scipy_out_1024.rs")`), so a
-    platform-local regeneration has to rewrite the literals as well, not only
-    the `.f64` files. The input is platform-independent committed data; it is
-    rewritten from the parsed values so the round-trip is exercised too.
+    platform's golden set has to carry its literals as well, not only the `.f64`
+    files. The input is platform-independent committed data and is rewritten
+    from the parsed values so the round-trip is exercised too.
     """
     zc = input_1024()
-    return {"scipy_in_1024.rs": zc, "scipy_out_1024.rs": scipy.fft.fft(zc)}
+    return zc, scipy.fft.fft(zc)
 
 
 def rs_text(values):
@@ -149,10 +165,20 @@ def rs_text(values):
     return "\n".join(lines) + "\n"
 
 
-def write_rs(out_dir):
-    """Write the literal goldens and prove they parse back bit-for-bit."""
-    for name, vals in sorted(rs_goldens().items()):
-        path = os.path.join(out_dir, name)
+def write_rs(out_dir, shared_dir):
+    """Write the literal goldens and prove they parse back bit-for-bit.
+
+    The 1024-point *input* goes to the shared root (it is committed data, the
+    same on both platforms); only the FFT *output* literal is platform-specific
+    and goes to the platform directory.
+    """
+    zin, zout = rs_goldens()
+    for name, vals, dest in (
+        ("scipy_in_1024.rs", zin, shared_dir),
+        ("scipy_out_1024.rs", zout, out_dir),
+    ):
+        os.makedirs(dest, exist_ok=True)
+        path = os.path.join(dest, name)
         with open(path, "w", newline="\r\n", encoding="utf-8") as f:
             f.write(rs_text(vals))
         back = parse_rs_complex(path)
@@ -160,7 +186,8 @@ def write_rs(out_dir):
             back.view("<u8"), vals.view("<u8")
         ):
             raise SystemExit(f"{path}: re-emitted literals do not round-trip")
-        print(f"  {name}: wrote {vals.size} complex literals")
+        where = os.path.relpath(dest, os.path.dirname(DATA))
+        print(f"  {name}: wrote {vals.size} complex literals ({where})")
 
 
 def read_reference(out_dir, name):
@@ -232,28 +259,77 @@ def census(out_dir):
     return 0
 
 
+def platform_name(requested):
+    """Resolve `--platform`: `auto` means "the machine running this script"."""
+    if requested != "auto":
+        return requested
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return sys.platform
+
+
+def platform_subdir(platform):
+    """Subdirectory holding this platform's outputs, under the golden root.
+
+    Windows lives in the shared root: that is where the original set was
+    committed, and keeping it there leaves those files (and their hashes)
+    untouched.
+    """
+    return "linux" if platform == "linux" else ""
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Regenerate or measure the platform-dependent scipy goldens."
     )
-    ap.add_argument("--out", default=DATA, help="directory to write/compare against")
+    ap.add_argument("--out", default=DATA, help="golden root to write into")
+    ap.add_argument(
+        "--ref",
+        default=None,
+        help="explicit reference directory to compare against (default: this "
+        "platform's directory under --out)",
+    )
+    ap.add_argument(
+        "--platform",
+        default="auto",
+        choices=("auto", "windows", "linux"),
+        help="which platform's set to write/compare (default: auto-detect)",
+    )
     ap.add_argument("--verify", action="store_true", help="compare, fail on mismatch")
     ap.add_argument("--census", action="store_true", help="report drift, never fail")
     args = ap.parse_args()
 
+    platform = platform_name(args.platform)
+    subdir = platform_subdir(platform)
+    out_dir = os.path.join(args.out, subdir) if subdir else args.out
+    ref_dir = args.ref if args.ref else out_dir
+
     if args.census:
-        return census(args.out)
+        return census(ref_dir)
 
     files = golden_files()
-    print(f"scipy {scipy.__version__} numpy {np.__version__} (data dir {DATA})")
+    print(f"scipy {scipy.__version__} numpy {np.__version__}")
+    print(f"platform {platform}: goldens {os.path.normpath(out_dir)}")
+    if args.verify:
+        print(f"platform {platform}: reference {os.path.normpath(ref_dir)}")
+    else:
+        print(
+            "  (writing: platform-independent inputs stay in the shared root, "
+            "this platform's outputs go to the directory above)"
+        )
     bad = []
     for name in sorted(files):
         want = files[name]
-        path = os.path.join(args.out, name)
+        path = os.path.join(out_dir, name)
+        if name == CANARY and not args.verify:
+            print(f"  {name}: not written (the tests consume scipy_out_1024.rs)")
+            continue
         if args.verify:
-            got = read_reference(args.out, name)
+            got = read_reference(ref_dir, name)
             if got is None:
-                print(f"  {name}: MISSING (in {args.out})")
+                print(f"  {name}: MISSING (in {ref_dir})")
                 bad.append(name)
                 continue
             if got.shape == want.shape and np.array_equal(
@@ -264,21 +340,32 @@ def main():
                 print(f"  {name}: DIFFER (shape {got.shape} vs {want.shape})")
                 bad.append(name)
         else:
-            os.makedirs(args.out, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
             want.tofile(path)
             print(f"  {name}: wrote {want.size} f64")
 
     if not bad and not args.verify and not args.census:
-        write_rs(args.out)
+        write_rs(out_dir, args.out)
 
     if bad:
         print(
             f"FAILED: {len(bad)} golden(s) not reproduced: {', '.join(bad)}",
             file=sys.stderr,
         )
+        if platform == "linux":
+            print(
+                "If this host's libm is not the one the committed set was "
+                "generated with (the CI runner is ubuntu-22.04, glibc 2.35, "
+                "CPython 3.12 with the pinned wheels), regenerate the set "
+                "with the same script and no --verify.",
+                file=sys.stderr,
+            )
         return 1
     if args.verify:
-        print("OK: every computed golden reproduces the committed file byte-for-byte")
+        print(
+            f"OK: every computed golden reproduces the committed {platform} file "
+            "byte-for-byte"
+        )
     return 0
 
 

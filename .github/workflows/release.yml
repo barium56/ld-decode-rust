@@ -120,6 +120,14 @@ jobs:
         shell: bash
         # `pll_matches_stock_field_stream` needs the LD_PLL_DIR golden field
         # stream dumped from a stock Python run, which is not in the repo.
+        #
+        # This step needs no Python: the scipy fidelity goldens are committed
+        # per platform (Windows in `tests/data`, Linux in `tests/data/linux`),
+        # so the same command is meaningful on both runners. Regenerating them
+        # here instead (as an earlier revision did in CI) is what made this job
+        # fail on Linux -- the goldens' values depend on the platform libm, so
+        # "compare against the committed ones" only works if the right set is
+        # checked in. `ci.yml` owns the `--verify` gate on those sets.
         run: cargo test --workspace --release --target "${{ matrix.target }}" -- --skip pll_matches_stock_field_stream
 
       - name: Smoke test the decoder
