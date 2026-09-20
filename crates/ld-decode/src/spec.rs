@@ -1153,6 +1153,19 @@ pub(crate) fn np_cpow(a: Complex64, b: Complex64) -> Complex64 {
             return acc;
         }
     }
+    // Off Windows, UCRT's own `cexp(clogl(z) * w)` composition is reproduced in
+    // `optimized::ucrt_exp_log` and must win: the reference rounds the way UCRT
+    // rounds even when it runs on Linux, and glibc's `cpow` is a different
+    // algorithm (it takes `pow(|z|, w)`), not a differently-rounded one -- the
+    // two differ on ~39% of the MTF filter's elements at every level. Windows
+    // keeps the raw-dylib call, so that platform cannot move. The port declines
+    // arguments outside the ranges it covers (non-positive logarithms,
+    // subnormal moduli, |x| >= 2e7), which then fall through to the platform
+    // library exactly as before.
+    #[cfg(not(target_os = "windows"))]
+    if let Some((re, im)) = crate::optimized::ucrt_exp_log::cpow(a.re, a.im, b.re, b.im) {
+        return Complex64::new(re, im);
+    }
     let r = unsafe {
         sys_cpow::cpow(
             DComplex { re: a.re, im: a.im },

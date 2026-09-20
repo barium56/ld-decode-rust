@@ -318,17 +318,23 @@ served by bit-exact ports of the one platform's math library:
   glibc disagree on ~0.2% of arguments, so Linux must not call glibc there. The
   port costs nothing — 16.28 ns/call against glibc's 16.89 ns — and covers every
   operand class the decoder can produce, falling back to the platform library for
-  NaN/inf and subnormal operands, which it cannot. C99 `cpow` (numpy's complex
-  power, used for `MTF ** level` and for the de-emphasis exponent in the video
-  filter) is the one remaining platform-bound call, and it is **measured to be
-  the residual**: `LD_DUMP_MTFPOW` dumps the filter and the `cpow` result, and a
-  cross-platform diff shows the MTF filter bit-identical while `cpow` differs on
-  39% of its 32768 elements, by up to 3 ulp, for every level used. That leaves
-  **one differing byte per 20 000 fields** (a 1-LSB luma value) in a full-disc
-  Linux run, with `.efm` and `.pcm` byte-identical. Removing it needs UCRT's
-  `clogl`/`cexp` (and the `log`/`exp`/`hypot` beneath them) ported the same way;
-  UCRT computes `cexp(clog(z) * w)` where glibc uses a `pow` on the modulus,
-  which is why they disagree by more than rounding.
+  NaN/inf and subnormal operands, which it cannot. **C99 `cpow` is ported the same
+  way** (`optimized/ucrt_exp_log.rs`, with the tables UCRT uses in
+  `optimized/ucrt_exp_log_tables.rs`): numpy's complex power (`MTF ** level`, and
+  the de-emphasis exponent in the video filter) reaches `cpow`, and UCRT computes
+  `cexp(clogl(z) * w)` where glibc uses a `pow` on the modulus — a different
+  algorithm, not a differently-rounded one, which `LD_DUMP_MTFPOW` showed
+  diverging on 39% of a 32768-element filter by up to 3 ulp at every level. The
+  port carries UCRT's own `exp` (table-based, *not* fdlibm: a `2^(j/64)` table
+  used whole and as a 24-bit head, and exactly-rounded `1/n!` tails), `log`,
+  `log1p`, `_dexp`, `clogl` and `cexp`, and is validated on Windows against the
+  real UCRT by bit-pattern pins in both profiles. The one branch left to the
+  platform is a real non-negative base with a real exponent, which UCRT hands to
+  `pow` (a double-double `log2`/`exp2` pair, a separate job, and not reproducible
+  by `exp(y*log(x))` — measured 45% of arguments differing); in the decoder that
+  is the DC bin of the MTF filter, the only exactly-real element of 32768, once
+  per level. Linux and UCRT agree there on every level sampled so far, and it is
+  the first suspect if a stray byte ever reappears.
   `numpy_sincos` (numpy's complex `exp`) is another explicit choice rather than an
   optimizer accident: on glibc `sincos` is *not* the same number as `cos`/`sin`,
   and `np.exp(-1j*w)` follows it across all 32768 bins of the `freqz` grid.
@@ -361,12 +367,16 @@ this table read 9 / 6 / 14 differing `.tbc` bytes (isolated luma values off by 1
 LSB) and a ±1 LSB `.pcm` dither on about 7% of samples — `.efm` was already
 identical everywhere, being hard-decision and drift-free.
 
-Those rows are windowed runs. Over a long run the one unported call shows up: a
-40 000-field Linux decode of the s16 capture differs from the Windows reference
-in **one byte of 19 GB** of `.tbc` (field 11 656, line 126, a 1-LSB luma value),
-with `.efm` and `.pcm` still identical. `LD_DUMP_MTFPOW` identifies it as `cpow`
-(see the bullet above); everything else on the video path, including the MTF
-filter it is applied to, is bit-identical across the two platforms.
+Those rows are windowed runs, and the drift that used to show up over a *long*
+run is gone. Before the `cpow` port a 40 000-field Linux decode of the s16
+capture differed from the Windows reference in **one byte of 19 GB** of `.tbc`
+(field 11 656, line 126, a 1-LSB luma value, with `.efm` and `.pcm` identical);
+`LD_DUMP_MTFPOW` identified it as `cpow`. Re-running from field 0 for 12 000
+fields — i.e. past that field — now gives **0 differing `.tbc` bytes of
+5 743 920 000**, 0 `.pcm`, 0 `.efm`, with `.tbc.json` differing only in `osInfo`
+(and the field count, the run being shorter than the reference). The same window
+is 0 differing bytes on Windows, and the sustained rate is **85 FPS on Windows
+against 77 FPS in WSL at `-j 9`**, so the port is not a cost.
 
 The hermetic FFT/filter goldens live in `crates/ld-decode/tests/data` as **one
 committed set for both platforms**, holding the values scipy 1.18.0 produces on
