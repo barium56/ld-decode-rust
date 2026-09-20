@@ -346,6 +346,15 @@ pub(crate) fn cpow(ar: f64, ai: f64, br: f64, bi: f64) -> Option<(f64, f64)> {
     // the exponent must be real, and the base non-negative; the disassembly
     // tests exactly that, in that order.
     if ai == 0.0 && ar >= 0.0 && bi == 0.0 {
+        // UCRT sends this to `pow`. `ucrt_pow` is a port of that same function
+        // for the class the decoder reaches (the MTF filter's DC bin raised to
+        // an MTF level); anything outside it falls through to the platform
+        // `powf`, which is the same call as before this module existed. This
+        // branch is never taken on Windows: there `np_cpow` still calls the
+        // real UCRT directly.
+        if let Some(v) = crate::optimized::ucrt_pow::pow(ar, br) {
+            return Some((v, 0.0));
+        }
         return Some((ar.powf(br), 0.0));
     }
     let (m, t) = clogl(ar, ai)?;

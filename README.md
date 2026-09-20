@@ -328,13 +328,18 @@ served by bit-exact ports of the one platform's math library:
   port carries UCRT's own `exp` (table-based, *not* fdlibm: a `2^(j/64)` table
   used whole and as a 24-bit head, and exactly-rounded `1/n!` tails), `log`,
   `log1p`, `_dexp`, `clogl` and `cexp`, and is validated on Windows against the
-  real UCRT by bit-pattern pins in both profiles. The one branch left to the
-  platform is a real non-negative base with a real exponent, which UCRT hands to
-  `pow` (a double-double `log2`/`exp2` pair, a separate job, and not reproducible
-  by `exp(y*log(x))` — measured 45% of arguments differing); in the decoder that
-  is the DC bin of the MTF filter, the only exactly-real element of 32768, once
-  per level. Linux and UCRT agree there on every level sampled so far, and it is
-  the first suspect if a stray byte ever reappears.
+  real UCRT by bit-pattern pins in both profiles. **The one branch that reaches
+  `pow` is ported too** (`optimized/ucrt_pow.rs`): UCRT sends a real non-negative
+  base with a real exponent there, and glibc's `pow` is a different
+  implementation — on the decoder's own argument pairs (the MTF filter's DC bin
+  with the MTF level; 1 010 pairs extracted from a real window) **1 pair differs
+  by 1 ulp**, which is why it was worth the port rather than an assumption. The
+  port reproduces UCRT's double-double `exp(y*ln(x))` (a 257-entry reciprocal
+  table pair for the log, the `1/n!` chains for both ends, and the 2^(j/64)
+  head/tail pair), is validated against the real UCRT over 2 400 000 cases and
+  all 1 010 real pairs with 0 mismatches, and declines anything outside that
+  class so the platform library still answers it. No call on the decode path is
+  left to the platform math library on Linux.
   `numpy_sincos` (numpy's complex `exp`) is another explicit choice rather than an
   optimizer accident: on glibc `sincos` is *not* the same number as `cos`/`sin`,
   and `np.exp(-1j*w)` follows it across all 32768 bins of the `freqz` grid.
@@ -375,8 +380,9 @@ capture differed from the Windows reference in **one byte of 19 GB** of `.tbc`
 fields — i.e. past that field — now gives **0 differing `.tbc` bytes of
 5 743 920 000**, 0 `.pcm`, 0 `.efm`, with `.tbc.json` differing only in `osInfo`
 (and the field count, the run being shorter than the reference). The same window
-is 0 differing bytes on Windows, and the sustained rate is **85 FPS on Windows
-against 77 FPS in WSL at `-j 9`**, so the port is not a cost.
+is 0 differing bytes on Windows, and the same window takes **140.9 s on Windows
+against 156.1 s in WSL2 at `-j 9`** (the decoder logs frames/s, so those print as
+42.7 and 38.5 FPS), i.e. the port is not a measurable cost.
 
 The hermetic FFT/filter goldens live in `crates/ld-decode/tests/data` as **one
 committed set for both platforms**, holding the values scipy 1.18.0 produces on

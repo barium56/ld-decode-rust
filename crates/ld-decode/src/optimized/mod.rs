@@ -6,6 +6,8 @@ pub(crate) mod ucrt_atan2;
 pub(crate) mod ucrt_exp_log;
 pub(crate) mod ucrt_exp_log_tables;
 pub(crate) mod ucrt_math;
+pub(crate) mod ucrt_pow;
+pub(crate) mod ucrt_pow_tables;
 mod unwrap_angles;
 
 pub(crate) use scale_field::*;
