@@ -60,13 +60,98 @@ pub(crate) const DP_VIDEO_HPF_ORDER: usize = 4;
 // Small DSP helpers
 // ---------------------------------------------------------------------------
 
+/// numpy's scalar `np.cos(x)` / `np.sin(x)` / `np.exp(x)` / `np.log(x)` and
+/// `np.power(x, y)` (Python's float `**`).
+///
+/// These are **separate scalar libm calls**, deliberately not `numpy_sincos`:
+/// `np.exp(1j*x)` goes through the platform's combined `sincos` entry point,
+/// while a bare `np.cos(x)` or `np.sin(x)` -- as in `np.sinc`, scipy's `firwin`
+/// window and `core.py`'s FEFM coefficient build -- calls its own. On Windows
+/// that distinction is invisible (both are UCRT); on Linux the reference still
+/// rounds the way UCRT rounds, so these must come from the bit-exact UCRT ports
+/// rather than glibc, and `np.power`/`np.exp` likewise.
+///
+/// Measured (2026-09-20, `construction_fingerprint_probe`): before this the
+/// `firwin`-derived filters differed from the Windows build in ~84% of their
+/// elements at the last bit, and `Fefm` at 2 ulp in 43 of 65536. The
+/// `butter`-derived filters were already identical, which is why only the
+/// `np.sin`/`np.cos`/`np.power`/`np.exp` sites needed routing.
+#[cfg(target_os = "windows")]
+#[inline]
+fn numpy_cos(x: f64) -> f64 {
+    x.cos()
+}
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn numpy_cos(x: f64) -> f64 {
+    crate::optimized::ucrt_math::cos_or_libm(x)
+}
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn numpy_sin(x: f64) -> f64 {
+    x.sin()
+}
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn numpy_sin(x: f64) -> f64 {
+    crate::optimized::ucrt_math::sin_or_libm(x)
+}
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn numpy_exp(x: f64) -> f64 {
+    x.exp()
+}
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn numpy_exp(x: f64) -> f64 {
+    crate::optimized::ucrt_exp_log::exp(x)
+}
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn numpy_log(x: f64) -> f64 {
+    x.ln()
+}
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn numpy_log(x: f64) -> f64 {
+    crate::optimized::ucrt_exp_log::log(x).unwrap_or_else(|| x.ln())
+}
+
+/// The C library `pow`, which is what `np.power` and Python's float `**` call.
+///
+/// A negative base with a non-integral exponent is a C99 domain error (NaN);
+/// with an integral exponent both UCRT and glibc evaluate on `|x|` and apply
+/// UCRT's own sign rule (negative only for an odd exponent), so the port can be
+/// driven with `|x|` and the sign applied here.
+fn numpy_pow(x: f64, y: f64) -> f64 {
+    #[cfg(not(target_os = "windows"))]
+    if x < 0.0 && y.fract() == 0.0 {
+        let v = match crate::optimized::ucrt_pow::pow(-x, y) {
+            Some(v) => v,
+            None => return x.powf(y),
+        };
+        let odd = (y.abs() % 2.0) == 1.0;
+        return if odd { -v } else { v };
+    }
+    #[cfg(not(target_os = "windows"))]
+    if x >= 0.0 {
+        if let Some(v) = crate::optimized::ucrt_pow::pow(x, y) {
+            return v;
+        }
+    }
+    x.powf(y)
+}
+
 /// scipy-compatible `sinc` (np.sinc): sin(pi x)/(pi x), 1 at x == 0.
 fn np_sinc(x: f64) -> f64 {
     if x == 0.0 {
         1.0
     } else {
         let x_pi = PI * x;
-        x_pi.sin() / x_pi
+        numpy_sin(x_pi) / x_pi
     }
 }
 
@@ -115,7 +200,7 @@ fn firwin(numtaps: usize, cutoff: &[f64], pass_zero: bool) -> Vec<f64> {
             i as f64 * step + (-PI)
         };
         // k = 0 term: 0.54 * cos(0.0) == 0.54 exactly; then += a1 * cos(fac).
-        let win = 0.54 + a1 * fac.cos();
+        let win = 0.54 + a1 * numpy_cos(fac);
         *value *= win;
     }
 
@@ -132,7 +217,7 @@ fn firwin(numtaps: usize, cutoff: &[f64], pass_zero: bool) -> Vec<f64> {
     let prod: Vec<f64> = (0..numtaps)
         .map(|n| {
             let m = n as f64 - alpha;
-            h[n] * (PI * m * scale_frequency).cos()
+            h[n] * numpy_cos(PI * m * scale_frequency)
         })
         .collect();
     let s = crate::decode::pairwise_sum_f64(&prod);
@@ -196,7 +281,7 @@ fn genwave(rate: &[f64], freq: f64, initial_phase: f64) -> Vec<f64> {
     let mut out = vec![0.0f64; rate.len()];
     let mut angle = initial_phase;
     for (i, &r) in rate.iter().enumerate() {
-        out[i] = angle.sin();
+        out[i] = numpy_sin(angle);
         angle += PI * (r / freq);
         if angle > PI {
             angle -= TAU;
@@ -354,7 +439,9 @@ fn gen_bpf_supergauss(
     let half = block_len / 2 + 1;
     let freq = freq_high - freq_low;
     let centerfreq = (freq_high + freq_low) / 2.0;
-    let log2_half = (2.0f64.ln() / 2.0).powf(1.0 / (2.0 * order as f64));
+    // Python: `(math.log(2.0) / 2.0) ** (1 / (2 * order))` -- a separate
+    // `math.log` and a float `**`, both of which are UCRT calls on Windows.
+    let log2_half = numpy_pow(numpy_log(2.0) / 2.0, 1.0 / (2.0 * order as f64));
     // numpy's `linspace(0, nyquist, n)` builds `i * (delta/div) + start`.
     let step = nyquist_hz / (half - 1) as f64;
     let mut sg: Vec<f64> = (0..half)
@@ -364,7 +451,7 @@ fn gen_bpf_supergauss(
             // `np.power(arg, 2*order)` evaluates the C library `pow` with a
             // float exponent; `powi` would use repeated squaring and differ by
             // ulps across the whole band.
-            (-2.0 * arg.powf(2.0 * order as f64)).exp()
+            numpy_exp(-2.0 * numpy_pow(arg, 2.0 * order as f64))
         })
         .collect();
     sg.pop(); // [:-1]
@@ -1498,11 +1585,24 @@ impl DecoderSpec {
         let linelen = (freq_hz / (1e6 / line_period)).round() as usize;
         let samplesperline = freq / linelen as f64;
 
-        // Resolve decoder params (including overrides and the lowband preset).
+        // Resolve decoder params (including the lowband preset, then any
+        // overrides). The order matters and mirrors `core.py`, which deep-copies
+        // `FilterParams_NTSC_lowband` over `FilterParams_NTSC` and only then
+        // applies `decoder_params_override`: the preset is the *starting point*,
+        // so an explicit override of the same key still wins.
         let mut video_bpf_low = DP_VIDEO_BPF_LOW;
         let mut video_bpf_high = DP_VIDEO_BPF_HIGH;
         let mut video_lpf_freq = DP_VIDEO_LPF_FREQ;
         let mut mtf_basemult = DP_MTF_BASEMULT;
+        if request.lowband {
+            // `FilterParams_NTSC_lowband` is a copy of `FilterParams_NTSC` with
+            // exactly these three entries replaced ("settings for use with
+            // noisier disks"); every other decoder param, including the filter
+            // orders, is unchanged.
+            video_bpf_low = 3_800_000.0;
+            video_bpf_high = 12_500_000.0;
+            video_lpf_freq = 4_200_000.0;
+        }
         for (key, &value) in &request.decoder_params_override {
             match key.as_str() {
                 "MTF_basemult" => mtf_basemult = value,
@@ -1730,7 +1830,7 @@ fn compute_fefm(freq_hz: f64, blocklen: usize) -> Vec<Complex64> {
     let bin_phase = scipy_cubic_spline(&freqs, &phase, &bin_freqs);
     let mut coeffs = vec![Complex64::new(0.0, 0.0); blocklen];
     for (k, (&a, &p)) in bin_amp.iter().zip(&bin_phase).enumerate() {
-        coeffs[k] = Complex64::new(a * p.cos(), -a * p.sin());
+        coeffs[k] = Complex64::new(a * numpy_cos(p), -a * numpy_sin(p));
     }
     for v in &mut coeffs {
         *v *= 8.0;
@@ -2335,6 +2435,336 @@ fn ifft_real(data: &[Complex64], blocklen: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every value the spec *constructs*, as a `(name, FNV-1a hash)` list: the
+    /// whole filter bank (which is the ducc-FFT output of the constructed
+    /// FIR/IIR responses), the measured delays and the downscale sinc LUT.
+    fn construction_fingerprints(request: &crate::request::DecodeRequest) -> Vec<(&'static str, u64)> {
+        fn fnv(h: &mut u64, bytes: &[u8]) {
+            for &b in bytes {
+                *h ^= b as u64;
+                *h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        fn hash_f(h: &mut u64, v: &[f64]) {
+            for x in v {
+                fnv(h, &x.to_bits().to_le_bytes());
+            }
+        }
+        fn hash_c(h: &mut u64, v: &[Complex64]) {
+            for z in v {
+                fnv(h, &z.re.to_bits().to_le_bytes());
+                fnv(h, &z.im.to_bits().to_le_bytes());
+            }
+        }
+
+        fn of_c(v: &[Complex64]) -> u64 {
+            let mut h = 0xcbf29ce484222325u64;
+            hash_c(&mut h, v);
+            h
+        }
+        fn of_f(v: &[f64]) -> u64 {
+            let mut h = 0xcbf29ce484222325u64;
+            hash_f(&mut h, v);
+            h
+        }
+
+        let spec = DecoderSpec::new(request).unwrap();
+        let mut out: Vec<(&'static str, u64)> = vec![
+            ("fefm", of_c(&spec.filters.fefm)),
+            ("frfhpf", of_c(&spec.filters.frfhpf)),
+            ("mtf", of_c(&spec.filters.mtf)),
+            ("rfvideo", of_c(&spec.filters.rfvideo)),
+            ("fvideo05", of_c(&spec.filters.fvideo05)),
+        ];
+        for (i, f) in spec.filters.fvideo.iter().enumerate() {
+            out.push((["fvideo0", "fvideo1", "fvideo2"][i], of_c(f)));
+        }
+        for (i, a) in spec.filters.audio.iter().enumerate() {
+            out.push((["audio0_filt1", "audio1_filt1"][i], of_c(&a.filt1)));
+            out.push((["audio0_stage2", "audio1_stage2"][i], of_c(&a.audio2_filter)));
+            out.push((["audio0_freqs", "audio1_freqs"][i], of_f(&[a.a1_freq, a.low_freq])));
+        }
+        out.push((
+            "delays",
+            of_f(&[
+                spec.delays.video_sync,
+                spec.delays.video_white,
+                spec.delays.video_rot as f64,
+            ]),
+        ));
+        let lut = crate::optimized::sinc::build_kaiser_lut();
+        let mut h = 0xcbf29ce484222325u64;
+        for w in &lut {
+            fnv(&mut h, &w.to_bits().to_le_bytes());
+        }
+        out.push(("sinc_lut", h));
+        out
+    }
+
+    /// **The construction layer must be bit-identical on every platform.**
+    ///
+    /// The filter bank is built from `np.sin`/`np.cos`/`np.exp`/`np.power` and
+    /// scipy windowing rather than from data, so a platform libm that rounds
+    /// differently silently changes every filter — and a last-bit change in a
+    /// filter propagates into ~84% of its FFT bins. That is exactly what the
+    /// first cross-platform run of this probe found: `firwin`'s window `cos`
+    /// and `np.sinc`'s `sin` were glibc's on Linux, and the derived filters
+    /// differed from the Windows build in 84% of their elements (worst 2.7e7 ulp
+    /// at near-zero bins). Routing those sites through the UCRT ports made all
+    /// 17 fingerprints below agree exactly, on both platforms.
+    ///
+    /// So this test is the gate: it pins the whole construction layer to one
+    /// value set. It is deliberately platform-free — the same numbers are
+    /// expected on Windows (where the platform *is* UCRT) and on Linux (where
+    /// the ports supply UCRT's values), which is what makes the reference's
+    /// roundings reproducible rather than merely close.
+    #[test]
+    fn construction_is_platform_independent() {
+        use crate::request::DecodeRequest;
+        // Measured identical on Windows x86-64 and Linux x86-64, 2026-09-20.
+        // The variants matter: `lowband`, `ntsc_color_notch` and the
+        // `decoder_params_override` entries select *different* filter shapes,
+        // so they exercise different argument lists through the same
+        // construction code.
+        let mut lowband = DecodeRequest::default();
+        lowband.lowband = true;
+        let mut notch = DecodeRequest::default();
+        notch.ntsc_color_notch = true;
+        let mut deemp = DecodeRequest::default();
+        deemp.deemp_coeff = (1.0, 2.0);
+        deemp.deemp_str = 0.5;
+        let mut mtf = DecodeRequest::default();
+        mtf.mtf_level = 1.5;
+        let mut ovr = DecodeRequest::default();
+        ovr.decoder_params_override.insert("video_bpf_low".into(), 2.0e6);
+        ovr.decoder_params_override.insert("video_bpf_high".into(), 7.0e6);
+        ovr.decoder_params_override.insert("video_lpf_freq".into(), 4.0e6);
+        ovr.decoder_params_override.insert("MTF_basemult".into(), 1.5);
+        let variants = construction_variants(lowband, notch, deemp, mtf, ovr);
+        for (vname, req) in &variants {
+            let got = construction_fingerprints(req);
+            let pinned = PINNED_BY_VARIANT
+                .iter()
+                .find(|(n, _)| n == vname)
+                .map(|(_, v)| *v)
+                .expect("variant missing from the pinned table");
+            assert_eq!(got.len(), pinned.len(), "{vname}: fingerprint list changed");
+            for ((gn, gh), (pn, ph)) in got.iter().zip(pinned.iter()) {
+                assert_eq!(gn, pn, "{vname}: fingerprint order changed");
+                assert_eq!(
+                    gh, ph,
+                    "{vname}/{gn}: constructed value differs from the pinned \
+                     platform-independent value (got {gh:#018x}, want {ph:#018x}) -- a platform \
+                     libm call is back in the construction path; route it through the UCRT port \
+                     in `optimized::ucrt_*`"
+                );
+            }
+        }
+    }
+
+    /// The request variants whose constructed filters are pinned. Different
+    /// options select different filter shapes, so each is a separate argument
+    /// list through the same construction code.
+    fn construction_variants(
+        lowband: crate::request::DecodeRequest,
+        notch: crate::request::DecodeRequest,
+        deemp: crate::request::DecodeRequest,
+        mtf: crate::request::DecodeRequest,
+        ovr: crate::request::DecodeRequest,
+    ) -> Vec<(&'static str, crate::request::DecodeRequest)> {
+        vec![
+            ("default", crate::request::DecodeRequest::default()),
+            ("lowband", lowband),
+            ("notch", notch),
+            ("deemp", deemp),
+            ("mtf1.5", mtf),
+            ("override", ovr),
+        ]
+    }
+
+    /// The pinned fingerprint sets, per request variant. See
+    /// `construction_is_platform_independent`.
+    const PINNED_BY_VARIANT: &[(&str, &[(&str, u64)])] = &[
+        ("default", PINNED_DEFAULT),
+        ("lowband", PINNED_LOWBAND),
+        ("notch", PINNED_NOTCH),
+        ("deemp", PINNED_DEEMP),
+        ("mtf1.5", PINNED_MTF),
+        ("override", PINNED_OVERRIDE),
+    ];
+
+    const PINNED_DEFAULT: &[(&str, u64)] = &[
+            ("fefm", 0x605191da3f0f82b7),
+            ("frfhpf", 0x31fdf68497983a37),
+            ("mtf", 0x311f43941a5edeac),
+            ("rfvideo", 0xc388578009bd5664),
+            ("fvideo05", 0x05e27caa321c28ee),
+            ("fvideo0", 0x6adb021b068800bd),
+            ("fvideo1", 0x05e27caa321c28ee),
+            ("fvideo2", 0x1662d95d6b27b6e5),
+            ("audio0_filt1", 0x3725337de9170a70),
+            ("audio0_stage2", 0x6fbd947994a20b05),
+            ("audio0_freqs", 0x8bf9032c7159eea6),
+            ("audio1_filt1", 0xb9c85cb9287c2026),
+            ("audio1_stage2", 0x6fbd947994a20b05),
+            ("audio1_freqs", 0x58b59c67d4819029),
+            ("delays", 0x6730d61543d388df),
+            ("sinc_lut", 0xcc5ea0188b5afed3),
+        ];
+
+    /// `lowband: true` substitutes `FilterParams_NTSC_lowband` (three changed
+    /// entries), so the band-pass and video LPFs differ from the default set.
+    /// Before the preset was actually applied this table was identical to
+    /// `PINNED_DEFAULT` -- i.e. the flag was a silent no-op, which this table
+    /// now catches.
+    const PINNED_LOWBAND: &[(&str, u64)] = &[
+        ("fefm", 0x605191da3f0f82b7),
+        ("frfhpf", 0x31fdf68497983a37),
+        ("mtf", 0x311f43941a5edeac),
+        ("rfvideo", 0xde59a50aad6f581f),
+        ("fvideo05", 0xb1dfebd7b8a1b215),
+        ("fvideo0", 0xc87a585556a2c1e1),
+        ("fvideo1", 0xb1dfebd7b8a1b215),
+        ("fvideo2", 0x7980f53fb7be11fb),
+        ("audio0_filt1", 0x3725337de9170a70),
+        ("audio0_stage2", 0x6fbd947994a20b05),
+        ("audio0_freqs", 0x8bf9032c7159eea6),
+        ("audio1_filt1", 0xb9c85cb9287c2026),
+        ("audio1_stage2", 0x6fbd947994a20b05),
+        ("audio1_freqs", 0x58b59c67d4819029),
+        ("delays", 0xb09282b21ad2aec9),
+        ("sinc_lut", 0xcc5ea0188b5afed3),
+    ];
+
+    const PINNED_NOTCH: &[(&str, u64)] = &[
+        ("fefm", 0x605191da3f0f82b7),
+        ("frfhpf", 0x31fdf68497983a37),
+        ("mtf", 0x311f43941a5edeac),
+        ("rfvideo", 0xc388578009bd5664),
+        ("fvideo05", 0x5db41ddfac73cc5e),
+        ("fvideo0", 0x2dc5d1ae16b95563),
+        ("fvideo1", 0x5db41ddfac73cc5e),
+        ("fvideo2", 0xb997ee22d7e7e8f8),
+        ("audio0_filt1", 0x3725337de9170a70),
+        ("audio0_stage2", 0x6fbd947994a20b05),
+        ("audio0_freqs", 0x8bf9032c7159eea6),
+        ("audio1_filt1", 0xb9c85cb9287c2026),
+        ("audio1_stage2", 0x6fbd947994a20b05),
+        ("audio1_freqs", 0x58b59c67d4819029),
+        ("delays", 0x04fe66b63a66b8fe),
+        ("sinc_lut", 0xcc5ea0188b5afed3),
+    ];
+
+    const PINNED_DEEMP: &[(&str, u64)] = &[
+        ("fefm", 0x605191da3f0f82b7),
+        ("frfhpf", 0x31fdf68497983a37),
+        ("mtf", 0x311f43941a5edeac),
+        ("rfvideo", 0xc388578009bd5664),
+        ("fvideo05", 0x2316a3fdd5bab151),
+        ("fvideo0", 0xae6f1921411feed7),
+        ("fvideo1", 0x2316a3fdd5bab151),
+        ("fvideo2", 0xca7fc5e372541be4),
+        ("audio0_filt1", 0x3725337de9170a70),
+        ("audio0_stage2", 0x6fbd947994a20b05),
+        ("audio0_freqs", 0x8bf9032c7159eea6),
+        ("audio1_filt1", 0xb9c85cb9287c2026),
+        ("audio1_stage2", 0x6fbd947994a20b05),
+        ("audio1_freqs", 0x58b59c67d4819029),
+        ("delays", 0xcdcc0662426c5142),
+        ("sinc_lut", 0xcc5ea0188b5afed3),
+    ];
+
+    /// `mtf_level` shifts the runtime MTF power spectrum, not the constructed
+    /// filters -- hence the table identical to the default one.
+    const PINNED_MTF: &[(&str, u64)] = PINNED_DEFAULT;
+
+    const PINNED_OVERRIDE: &[(&str, u64)] = &[
+        ("fefm", 0x605191da3f0f82b7),
+        ("frfhpf", 0x31fdf68497983a37),
+        ("mtf", 0x311f43941a5edeac),
+        ("rfvideo", 0xb37b78d84a813e34),
+        ("fvideo05", 0x572d10d260042608),
+        ("fvideo0", 0x7bcf330e9a2e0ff6),
+        ("fvideo1", 0x572d10d260042608),
+        ("fvideo2", 0x98c45f7c0dbee23f),
+        ("audio0_filt1", 0x3725337de9170a70),
+        ("audio0_stage2", 0x6fbd947994a20b05),
+        ("audio0_freqs", 0x8bf9032c7159eea6),
+        ("audio1_filt1", 0xb9c85cb9287c2026),
+        ("audio1_stage2", 0x6fbd947994a20b05),
+        ("audio1_freqs", 0x58b59c67d4819029),
+        ("delays", 0x20cb13856ba1a8a9),
+        ("sinc_lut", 0xcc5ea0188b5afed3),
+    ];
+
+    /// Prints the same fingerprints, and dumps the raw arrays when
+    /// `LD_FILTERDUMP=<dir>` is set (one f64 pair per element, little-endian) so
+    /// an off-line script can report the first differing index and the worst ulp
+    /// gap per filter. For cross-platform diffing by hand.
+    #[test]
+    #[ignore]
+    fn construction_fingerprint_probe() {
+        use crate::request::DecodeRequest;
+        let mut lowband = DecodeRequest::default();
+        lowband.lowband = true;
+        let mut notch = DecodeRequest::default();
+        notch.ntsc_color_notch = true;
+        let mut deemp = DecodeRequest::default();
+        deemp.deemp_coeff = (1.0, 2.0);
+        deemp.deemp_str = 0.5;
+        let mut mtf = DecodeRequest::default();
+        mtf.mtf_level = 1.5;
+        let mut ovr = DecodeRequest::default();
+        ovr.decoder_params_override.insert("video_bpf_low".into(), 2.0e6);
+        ovr.decoder_params_override.insert("video_bpf_high".into(), 7.0e6);
+        ovr.decoder_params_override.insert("video_lpf_freq".into(), 4.0e6);
+        ovr.decoder_params_override.insert("MTF_basemult".into(), 1.5);
+        for (vname, req) in construction_variants(lowband, notch, deemp, mtf, ovr) {
+            for (name, h) in construction_fingerprints(&req) {
+                println!("{vname:9} {name:16} {h:016x}");
+            }
+        }
+        println!(
+            "f05_offset={} fvideo_burst_offset={}",
+            DecoderSpec::new(&crate::request::DecodeRequest::default())
+                .unwrap()
+                .filters
+                .f05_offset,
+            DecoderSpec::new(&crate::request::DecodeRequest::default())
+                .unwrap()
+                .filters
+                .fvideo_burst_offset
+        );
+        if let Some(dir) = std::env::var_os("LD_FILTERDUMP") {
+            let spec = DecoderSpec::new(&crate::request::DecodeRequest::default()).unwrap();
+            let d = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let write_c = |name: &str, v: &[Complex64]| {
+                let mut b = Vec::with_capacity(v.len() * 16);
+                for z in v {
+                    b.extend_from_slice(&z.re.to_le_bytes());
+                    b.extend_from_slice(&z.im.to_le_bytes());
+                }
+                std::fs::write(d.join(name), b).unwrap();
+            };
+            write_c("fefm.bin", &spec.filters.fefm);
+            write_c("fvideo05.bin", &spec.filters.fvideo05);
+            for (i, f) in spec.filters.fvideo.iter().enumerate() {
+                write_c(&format!("fvideo{i}.bin"), f);
+            }
+            write_c("audio0_filt1.bin", &spec.filters.audio[0].filt1);
+            write_c("audio1_filt1.bin", &spec.filters.audio[1].filt1);
+            write_c("mtf.bin", &spec.filters.mtf);
+            let lut = crate::optimized::sinc::build_kaiser_lut();
+            let mut b = Vec::with_capacity(lut.len() * 4);
+            for w in &lut {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+            std::fs::write(d.join("sinc_lut.bin"), b).unwrap();
+            println!("dumped filters to {}", d.display());
+        }
+    }
 
     /// `np_cmul3` must be bit-identical to the two-pass fill+assign pair it
     /// replaces (the demod video product): same lane ops, same rounding,

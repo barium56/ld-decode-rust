@@ -1,6 +1,6 @@
 mod fast_math;
 mod scale_field;
-mod sinc;
+pub(crate) mod sinc;
 mod sosfiltfilt;
 pub(crate) mod ucrt_atan2;
 pub(crate) mod ucrt_exp_log;

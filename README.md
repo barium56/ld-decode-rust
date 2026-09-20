@@ -343,6 +343,20 @@ served by bit-exact ports of the one platform's math library:
   `numpy_sincos` (numpy's complex `exp`) is another explicit choice rather than an
   optimizer accident: on glibc `sincos` is *not* the same number as `cos`/`sin`,
   and `np.exp(-1j*w)` follows it across all 32768 bins of the `freqz` grid.
+- **The filter bank itself is a cross-platform gate.** Everything the spec
+  *constructs* — every filter in the bank (which is the ducc-FFT of the
+  constructed FIR/IIR responses), the measured delays and the downscale sinc LUT
+  — is hashed by `spec::tests::construction_is_platform_independent` across six
+  request variants, and those hashes are pinned. The same values are expected on
+  both platforms, because the reference's `np.sin`/`np.cos`/`np.exp`/
+  `np.power` calls in `scipy.signal.firwin`, `np.sinc` and
+  `gen_bpf_supergauss` are UCRT calls on Windows and are answered by the UCRT
+  ports elsewhere. This is not a theoretical concern: before those call sites
+  were routed, the Linux build's `firwin`-derived filters differed from
+  Windows' in **~84% of their elements** (worst 2.7e7 ulp at near-zero bins),
+  which is invisible in a short run only because a last-bit filter change rarely
+  survives the downstream rounding. The LUT is the instructive case: it computes
+  `sin` at runtime but stores `f32`, so it hashed identical even before the fix.
 - **The Rust code is `target-cpu=x86-64-v3` on x86-64 only.**
   `.cargo/config.toml` scopes that to `cfg(target_arch = "x86_64")`, since the
   CPU name is invalid elsewhere. A `x86-64-v2` build of the same source is
@@ -383,6 +397,14 @@ fields — i.e. past that field — now gives **0 differing `.tbc` bytes of
 is 0 differing bytes on Windows, and the same window takes **140.9 s on Windows
 against 156.1 s in WSL2 at `-j 9`** (the decoder logs frames/s, so those print as
 42.7 and 38.5 FPS), i.e. the port is not a measurable cost.
+
+The strongest statement available is a **full-disc** one, and Linux now meets it.
+The complete 168 800-field s16 decode (36.5 FPS, 2310 s in WSL2) reproduces the
+Windows Python 7.3.0 reference **byte-for-byte on all three bit-compared
+outputs** — `.tbc` (80 797 808 000 bytes), `.pcm` and `.efm`, each sha256-equal
+to `_stock_s16_full_7.3.0`. That supersedes the windowed table above: the
+long-run state the windowed runs cannot reach (AGC/MTF history) is reproduced
+too, and the one-byte field-11656 drift is gone.
 
 The hermetic FFT/filter goldens live in `crates/ld-decode/tests/data` as **one
 committed set for both platforms**, holding the values scipy 1.18.0 produces on
