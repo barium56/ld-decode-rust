@@ -28,6 +28,18 @@ name: CI
 # recipes that produced it; the Linux job's `--census` measures how far the
 # local scipy is from it, which is the drift the ports neutralise.
 # scripts/gen_scipy_fft_goldens.py explains the arrangement.
+#
+# The same split applies to the filter bank, which is *constructed* rather than
+# loaded from data: `spec::tests::construction_is_platform_independent` pins a
+# hash of every constructed filter, the measured delays and the sinc LUT across
+# six request variants (default, --lowband, the colour notch, custom
+# de-emphasis, MTF level and the decoder-param overrides), and expects identical
+# values on both platforms. It is the only test whose whole purpose is that the
+# two agree, and it is what caught the construction path still calling the
+# platform libm for `np.sin`/`np.cos`/`np.exp`/`np.power` on Linux (the filters
+# differed in ~84% of their elements until those sites were routed through the
+# UCRT ports). Because the variants are pinned, it also gates options the decode
+# tests never exercise -- it is what caught `--lowband` being a silent no-op.
 
 on:
   push:
@@ -71,15 +83,38 @@ jobs:
         shell: bash
         # Proves the golden-generation recipes still reproduce the committed
         # Windows reference files bit-for-byte, so an accidental edit to a golden
-        # fails here instead of silently widening a parity gate. Skips with a
-        # warning if the pinned wheels are missing.
+        # fails here instead of silently widening a parity gate.
+        #
+        # Failing to set up the pinned wheels now fails the job rather than
+        # warning: this is the only place the committed set is recomputed from
+        # its recipes, and a gate that silently does not run is worse than a red
+        # build. Windows is the platform that must be able to reproduce the set,
+        # because the set is Windows-generated. (The Linux job's `--census`
+        # keeps the soft path -- it is a measurement, not a gate.)
         run: |
           set -euo pipefail
           if ! PY="$(bash .github/scripts/scipy_venv.sh)"; then
-            echo "::warning::pinned numpy/scipy unavailable; skipping the golden verify"
-            exit 0
+            echo "::error::could not install the pinned numpy 2.4.6 / scipy 1.18.0 wheels; the golden verify is the Windows parity gate and must not be skipped"
+            exit 1
           fi
           "$PY" scripts/gen_scipy_fft_goldens.py --verify
+
+      - name: Install FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install ffmpeg --yes --no-progress
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            throw 'FFmpeg was not added to PATH'
+          }
+          ffmpeg -version | Select-Object -First 1
+
+      - name: Smoke test the decoder
+        # Deliberately before the test suite, exactly as in the Linux job: a
+        # failing test step would otherwise hide whether the binary decodes at
+        # all, which is the more useful signal to see first.
+        shell: bash
+        run: bash .github/scripts/smoke.sh target/release/ld-decode.exe
 
       - name: Test (debug profile)
         shell: bash
@@ -93,20 +128,6 @@ jobs:
       - name: Test (release profile)
         shell: bash
         run: cargo test --workspace --release -- --skip pll_matches_stock_field_stream
-
-      - name: Install FFmpeg
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          choco install ffmpeg --yes --no-progress
-          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-            throw 'FFmpeg was not added to PATH'
-          }
-          ffmpeg -version | Select-Object -First 1
-
-      - name: Smoke test the decoder
-        shell: bash
-        run: bash .github/scripts/smoke.sh target/release/ld-decode.exe
 
       - name: Upload decoder binary
         # Pull requests do not need a downloadable binary; release.yml is the

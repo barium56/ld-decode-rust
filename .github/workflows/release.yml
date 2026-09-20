@@ -245,6 +245,10 @@ jobs:
           echo "previous_tag=${PREVIOUS_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
+        # v8 here against upload-artifact@v7 in the two jobs above is deliberate,
+        # not an oversight: the artifact format's cross-compatibility break was
+        # at the v4 boundary (v3 uploads are unreadable by v4+ download), and
+        # both of these are well past it, each pinned to its own latest major.
         uses: actions/download-artifact@v8
         with:
           path: artifacts
