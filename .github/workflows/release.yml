@@ -160,11 +160,12 @@ jobs:
           $Version = '${{ steps.version.outputs.version }}'
           $BinPath = "target\${{ matrix.target }}\release\${{ matrix.bin }}"
           if (-not (Test-Path $BinPath)) { throw "missing $BinPath" }
-          $ExeName = "ld-decode-windows_${Version}_${{ matrix.arch }}.exe"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item -Path $BinPath -Destination "dist\$ExeName" -Force
           $ZipName = "ld-decode-windows_${Version}_${{ matrix.arch }}.zip"
-          Compress-Archive -Path @("dist\$ExeName") -DestinationPath $ZipName -Force
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # The archive is versioned (name above); the executable inside is plain
+          # `ld-decode.exe` so users always get a stable path regardless of release.
+          Copy-Item -Path $BinPath -Destination "dist\ld-decode.exe" -Force
+          Compress-Archive -Path @("dist\ld-decode.exe") -DestinationPath $ZipName -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ZipName))
           try {
@@ -172,8 +173,8 @@ jobs:
               throw "Expected 1 entry in $ZipName, found $($zip.Entries.Count)"
             }
             foreach ($entry in $zip.Entries) {
-              if ($entry.FullName.Contains('/') -or $entry.FullName.Contains('\')) {
-                throw "ZIP entry is nested; expected flat layout: $($entry.FullName)"
+              if ($entry.FullName -ne "ld-decode.exe") {
+                throw "ZIP entry should be flat `ld-decode.exe`, found: $($entry.FullName)"
               }
             }
           } finally {
