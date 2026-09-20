@@ -339,7 +339,10 @@ served by bit-exact ports of the one platform's math library:
   head/tail pair), is validated against the real UCRT over 2 400 000 cases and
   all 1 010 real pairs with 0 mismatches, and declines anything outside that
   class so the platform library still answers it. No call on the decode path is
-  left to the platform math library on Linux.
+  left to the platform math library on **either** platform: since the 2026-09-20
+  CI finding below, the `np.*` family (`sin`, `cos`, `exp`, `log`, `power`),
+  `numpy_sincos`, `atan2` and `cpow` resolve to these ports on Windows too, and
+  the platform C runtime is only the fallback for operands a port declines.
   `numpy_sincos` (numpy's complex `exp`) is another explicit choice rather than an
   optimizer accident: on glibc `sincos` is *not* the same number as `cos`/`sin`,
   and `np.exp(-1j*w)` follows it across all 32768 bins of the `freqz` grid.
@@ -350,13 +353,26 @@ served by bit-exact ports of the one platform's math library:
   request variants, and those hashes are pinned. The same values are expected on
   both platforms, because the reference's `np.sin`/`np.cos`/`np.exp`/
   `np.power` calls in `scipy.signal.firwin`, `np.sinc` and
-  `gen_bpf_supergauss` are UCRT calls on Windows and are answered by the UCRT
-  ports elsewhere. This is not a theoretical concern: before those call sites
+  `gen_bpf_supergauss` are UCRT calls in the reference and are answered by the
+  UCRT ports. This is not a theoretical concern: before those call sites
   were routed, the Linux build's `firwin`-derived filters differed from
   Windows' in **~84% of their elements** (worst 2.7e7 ulp at near-zero bins),
   which is invisible in a short run only because a last-bit filter change rarely
   survives the downstream rounding. The LUT is the instructive case: it computes
   `sin` at runtime but stores `f32`, so it hashed identical even before the fix.
+- **The host's `ucrtbase.dll` is not an input any more.** The gate above caught
+  the opposite case on the Windows CI runner: `construction_is_platform_independent`
+  failed there on `deemp/fvideo0` — the one filter of that variant built through
+  `cpow` — with the same source, rustc and target as a local run that passed. The
+  runner's `ucrtbase.dll` just computes that call differently, which meant a
+  Windows release artifact built on CI could differ in its last bits from the
+  corpus it is supposed to reproduce. So the UCRT ports are authoritative on
+  Windows too, and the binary now follows the *captured* UCRT (the revision the
+  committed goldens were produced with) rather than whatever the build machine
+  ships. A few construction-path sites are still platform calls (`tan` in
+  prewarping, `powf`/`log10`/`atan` in `buttord`'s order selection, `hypot` in
+  `csqrt`); they are measured identical and pinned by the same test, so they get
+  ported if and only if that pin goes red — which is how this one surfaced.
 - **The Rust code is `target-cpu=x86-64-v3` on x86-64 only.**
   `.cargo/config.toml` scopes that to `cfg(target_arch = "x86_64")`, since the
   CPU name is invalid elsewhere. A `x86-64-v2` build of the same source is
@@ -429,8 +445,9 @@ not what is mathematically equivalent. Some consequences, all deliberate:
 
 - FFTs go through the vendored ducc0, never `rustfft`, in the hot paths.
 - Complex multiply uses numpy's FMA kernel and Smith's division-by-reciprocal;
-  complex `pow` is a direct FFI call to the platform C library (UCRT on Windows),
-  never an `exp(b*log(a))` chain.
+  complex `pow` goes through the bit-exact UCRT port (`ucrt_exp_log` +
+  `ucrt_pow`), never an `exp(b*log(a))` chain, with the platform C library only
+  as the fallback for operands the port declines.
 - The Hilbert-unwrap path uses numba's plain four-product multiply, *not* numpy's
   FMA version — both are correct and they round differently.
 - Summation of `bw_ratios` uses a bit-port of numpy's pairwise summation, because

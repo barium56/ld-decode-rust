@@ -26,8 +26,11 @@
 //! either.
 
 
-// On Windows the decoder calls UCRT directly and this module is referenced only
-// by its own tests, so most of it looks dead there.
+// Used on every platform since 2026-09-20: `spec::libm_atan2` calls the port
+// first and falls back to the platform library only for operands it declines.
+// (Before that, Windows called `ucrtbase!atan2` directly and this module was
+// referenced only by its own tests there, which is what the `allow` below is
+// still for.)
 #![allow(dead_code)]
 
 // ucrtbase.dll rodata.

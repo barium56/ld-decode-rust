@@ -8,8 +8,9 @@
 //! real window, `work/mtf_dc_pairs.py` + `work/pow_diff.py`), **one pair
 //! differs between UCRT and glibc by 1 ulp**, and a 1-ulp difference in a
 //! filter coefficient is exactly the kind of thing that eventually flips a
-//! marginal dropout or whiteloc decision. Off Windows `np_cpow` now calls this
-//! first and falls back to `powf` only for arguments outside the class below.
+//! marginal dropout or whiteloc decision. `np_cpow` now calls this first on
+//! every platform and falls back to `powf` only for arguments outside the class
+//! below.
 //!
 //! Provenance: `ucrtbase.dll` (`pow` at RVA 0x2c3e0, FMA body at 0x2d021,
 //! selected by the same CPU-feature dispatch as `sin`/`cos`/`atan2`).
@@ -37,8 +38,9 @@
 //! interchangeable but are not (a `w - (f + s)` where the parenthesisation is
 //! what carries the rounding error, for instance).
 
-// On Windows the decoder calls UCRT directly and this module is referenced only
-// by its own tests, so most of it looks dead there.
+// Used on every platform since 2026-09-20 (via `ucrt_exp_log::cpow`); before
+// that Windows called the real UCRT and this module was referenced only by its
+// own tests there.
 #![allow(dead_code)]
 
 use super::ucrt_exp_log_tables::{EXP_T2, LOG_HI, LOG_LO};

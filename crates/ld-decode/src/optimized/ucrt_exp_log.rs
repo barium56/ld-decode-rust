@@ -30,8 +30,10 @@
 //! returning a wrong value. The decoder's cpow arguments are MTF filter
 //! elements and levels, i.e. magnitudes in `[0.4, 6]`.
 
-// On Windows the decoder calls UCRT directly and this module is referenced only
-// by its own tests, so most of it looks dead there.
+// Used on every platform since 2026-09-20: `spec::np_cpow` and
+// `spec::numpy_exp` / `numpy_log` call the ports first and fall back to the
+// platform library only for operands they decline. (Before that, Windows called
+// the real UCRT and this module was referenced only by its own tests there.)
 #![allow(dead_code)]
 
 use super::ucrt_exp_log_tables::{EXP_T1, EXP_T2, LOG_HI, LOG_INV, LOG_LO};
@@ -349,9 +351,7 @@ pub(crate) fn cpow(ar: f64, ai: f64, br: f64, bi: f64) -> Option<(f64, f64)> {
         // UCRT sends this to `pow`. `ucrt_pow` is a port of that same function
         // for the class the decoder reaches (the MTF filter's DC bin raised to
         // an MTF level); anything outside it falls through to the platform
-        // `powf`, which is the same call as before this module existed. This
-        // branch is never taken on Windows: there `np_cpow` still calls the
-        // real UCRT directly.
+        // `powf`, which is the same call as before this module existed.
         if let Some(v) = crate::optimized::ucrt_pow::pow(ar, br) {
             return Some((v, 0.0));
         }

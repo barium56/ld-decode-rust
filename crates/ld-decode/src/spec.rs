@@ -66,55 +66,42 @@ pub(crate) const DP_VIDEO_HPF_ORDER: usize = 4;
 /// These are **separate scalar libm calls**, deliberately not `numpy_sincos`:
 /// `np.exp(1j*x)` goes through the platform's combined `sincos` entry point,
 /// while a bare `np.cos(x)` or `np.sin(x)` -- as in `np.sinc`, scipy's `firwin`
-/// window and `core.py`'s FEFM coefficient build -- calls its own. On Windows
-/// that distinction is invisible (both are UCRT); on Linux the reference still
-/// rounds the way UCRT rounds, so these must come from the bit-exact UCRT ports
-/// rather than glibc, and `np.power`/`np.exp` likewise.
+/// window and `core.py`'s FEFM coefficient build -- calls its own.
 ///
 /// Measured (2026-09-20, `construction_fingerprint_probe`): before this the
 /// `firwin`-derived filters differed from the Windows build in ~84% of their
 /// elements at the last bit, and `Fefm` at 2 ulp in 43 of 65536. The
 /// `butter`-derived filters were already identical, which is why only the
 /// `np.sin`/`np.cos`/`np.power`/`np.exp` sites needed routing.
-#[cfg(target_os = "windows")]
-#[inline]
-fn numpy_cos(x: f64) -> f64 {
-    x.cos()
-}
-#[cfg(not(target_os = "windows"))]
+///
+/// **The ports are authoritative on Windows too (2026-09-20, later).** They
+/// used to be the non-Windows arm only, on the assumption that on Windows the
+/// platform library *is* UCRT. The Windows CI run on `5e7eda2` falsified it:
+/// `construction_is_platform_independent` failed there on `deemp/fvideo0`
+/// (got `0x630e930f037f6148`, pinned `0xae6f1921411feed7`), and `fvideo0` is
+/// the one filter of that variant built through `np_cpow` -- every other
+/// filter of the variant, and every other variant, matched. Same source, same
+/// rustc, same target: the runner's `ucrtbase.dll` computes that call
+/// differently from the one the reference corpus was captured with. So "the
+/// platform library is the reference" is not a portable statement, and the
+/// ports -- which reproduce the *captured* UCRT, and which are what Linux has
+/// been decoding with all along -- are now used on every platform, with the
+/// platform library kept only for operands a port declines.
 #[inline]
 fn numpy_cos(x: f64) -> f64 {
     crate::optimized::ucrt_math::cos_or_libm(x)
 }
 
-#[cfg(target_os = "windows")]
-#[inline]
-fn numpy_sin(x: f64) -> f64 {
-    x.sin()
-}
-#[cfg(not(target_os = "windows"))]
 #[inline]
 fn numpy_sin(x: f64) -> f64 {
     crate::optimized::ucrt_math::sin_or_libm(x)
 }
 
-#[cfg(target_os = "windows")]
-#[inline]
-fn numpy_exp(x: f64) -> f64 {
-    x.exp()
-}
-#[cfg(not(target_os = "windows"))]
 #[inline]
 fn numpy_exp(x: f64) -> f64 {
     crate::optimized::ucrt_exp_log::exp(x)
 }
 
-#[cfg(target_os = "windows")]
-#[inline]
-fn numpy_log(x: f64) -> f64 {
-    x.ln()
-}
-#[cfg(not(target_os = "windows"))]
 #[inline]
 fn numpy_log(x: f64) -> f64 {
     crate::optimized::ucrt_exp_log::log(x).unwrap_or_else(|| x.ln())
@@ -127,7 +114,6 @@ fn numpy_log(x: f64) -> f64 {
 /// UCRT's own sign rule (negative only for an odd exponent), so the port can be
 /// driven with `|x|` and the sign applied here.
 fn numpy_pow(x: f64, y: f64) -> f64 {
-    #[cfg(not(target_os = "windows"))]
     if x < 0.0 && y.fract() == 0.0 {
         let v = match crate::optimized::ucrt_pow::pow(-x, y) {
             Some(v) => v,
@@ -136,7 +122,6 @@ fn numpy_pow(x: f64, y: f64) -> f64 {
         let odd = (y.abs() % 2.0) == 1.0;
         return if odd { -v } else { v };
     }
-    #[cfg(not(target_os = "windows"))]
     if x >= 0.0 {
         if let Some(v) = crate::optimized::ucrt_pow::pow(x, y) {
             return v;
@@ -1069,18 +1054,13 @@ fn np_csqrt(z: Complex64) -> Complex64 {
 /// off at bin 3319, purely because of the merge. Calling this makes the choice
 /// part of the source instead of an optimizer accident.
 ///
-/// The parity target is the **Windows** reference, which resolves these to
-/// UCRT, so Linux takes its values from the bit-exact UCRT ports in
-/// `optimized::ucrt_math` instead of from glibc: UCRT and glibc agree on only
-/// ~97% of arguments, and one of the four call sites maps over the whole freqz
-/// grid. Windows keeps the platform calls, because there they *are* UCRT.
-#[cfg(target_os = "windows")]
-#[inline]
-fn numpy_sincos(x: f64) -> (f64, f64) {
-    (x.sin(), x.cos())
-}
-
-#[cfg(not(target_os = "windows"))]
+/// The parity target is the **captured Windows** reference, which resolves
+/// these to UCRT, so the values come from the bit-exact UCRT ports in
+/// `optimized::ucrt_math` on every platform: UCRT and glibc agree on only ~97%
+/// of arguments, one of the four call sites maps over the whole freqz grid, and
+/// a *different* UCRT build (the CI runner's) also disagrees -- see the note on
+/// `numpy_cos`. The shape stays a two-scalar pair rather than a real `sincos`,
+/// because that is the shape numpy has on Windows.
 #[inline]
 fn numpy_sincos(x: f64) -> (f64, f64) {
     (
@@ -1089,8 +1069,9 @@ fn numpy_sincos(x: f64) -> (f64, f64) {
     )
 }
 
-/// The reference's `atan2`: UCRT (ucrtbase.dll) on Windows, and on other
-/// platforms the bit-exact UCRT port in `optimized::ucrt_atan2`.
+/// The reference's `atan2`: the bit-exact UCRT port in `optimized::ucrt_atan2`
+/// on every platform, with the platform C library as the fallback for the
+/// operand classes the port declines.
 ///
 /// Rust's std `f64::atan2` is not bit-identical to the C runtime on Windows
 /// (it deviates by 1-2 ulp on a few percent of arguments), while numpy's
@@ -1098,45 +1079,29 @@ fn numpy_sincos(x: f64) -> (f64, f64) {
 /// (unwrap_hilbert) and VITS phase must call this to stay bit-exact.
 ///
 /// This is the **hottest parity call in the decoder** -- one per demod sample,
-/// ~700 000 per field -- so on Linux it cannot simply bind glibc: UCRT and
-/// glibc disagree by 1 ulp on ~0.2% of arguments, which is enough to move a
-/// marginal pixel over a long run. The port is used where it covers the
-/// operand class and glibc only as a documented fallback (NaN/inf operands and
-/// subnormal operands, neither of which the decoder can produce).
-#[cfg(target_os = "windows")]
+/// ~700 000 per field -- so it cannot bind the platform library outright: UCRT
+/// and glibc disagree by 1 ulp on ~0.2% of arguments, which is enough to move a
+/// marginal pixel over a long run. The port covers the operand class and the
+/// platform call is a documented fallback (NaN/inf operands and subnormal
+/// operands, neither of which the decoder can produce).
+///
+/// Windows used to call `ucrtbase!atan2` directly; the ports are now
+/// authoritative there too, for the reason recorded on `numpy_cos` -- the host's
+/// `ucrtbase.dll` is not one fixed implementation across machines.
 pub(crate) mod libm_atan2 {
+    /// The platform fallback: UCRT on Windows, the system libm elsewhere.
+    #[cfg(target_os = "windows")]
     #[link(name = "ucrtbase", kind = "raw-dylib")]
     extern "C" {
-        pub fn atan2(y: f64, x: f64) -> f64;
+        #[link_name = "atan2"]
+        fn atan2_platform(y: f64, x: f64) -> f64;
     }
 
-    /// Public entry: exact UCRT `atan2` for one pair.
-    #[inline]
-    pub fn call(y: f64, x: f64) -> f64 {
-        unsafe { atan2(y, x) }
-    }
-
-    /// Whole-slice variant: keeping the loop in one function lets LLVM keep
-    /// `d`/`scale` in registers and avoids re-loading closure state. Same
-    /// per-element calls and results as `call` in a loop.
-    pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
-        assert_eq!(out.len(), pim.len());
-        assert_eq!(out.len(), pre.len());
-        for i in 0..out.len() {
-            out[i] = unsafe { atan2(pim[i], pre[i]) };
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) mod libm_atan2 {
-    // Fallback for the operand classes the port deliberately does not cover;
-    // rustc links `-lm` on the unix targets that matter, so the symbol is
-    // always present.
+    #[cfg(not(target_os = "windows"))]
     #[link(name = "m")]
     extern "C" {
         #[link_name = "atan2"]
-        fn atan2_glibc(y: f64, x: f64) -> f64;
+        fn atan2_platform(y: f64, x: f64) -> f64;
     }
 
     /// Exact UCRT `atan2` for one pair.
@@ -1144,10 +1109,13 @@ pub(crate) mod libm_atan2 {
     pub fn call(y: f64, x: f64) -> f64 {
         match crate::optimized::ucrt_atan2::atan2(y, x) {
             Some(v) => v,
-            None => unsafe { atan2_glibc(y, x) },
+            None => unsafe { atan2_platform(y, x) },
         }
     }
 
+    /// Whole-slice variant: keeping the loop in one function lets LLVM keep
+    /// `d`/`scale` in registers and avoids re-loading closure state. Same
+    /// per-element calls and results as `call` in a loop.
     pub fn call_slice(out: &mut [f64], pim: &[f64], pre: &[f64]) {
         assert_eq!(out.len(), pim.len());
         assert_eq!(out.len(), pre.len());
@@ -1166,7 +1134,8 @@ pub(crate) struct DComplex {
 }
 
 /// The platform C99 complex pow, exported as `cpow`: UCRT (ucrtbase.dll) on
-/// Windows, the system libm elsewhere.
+/// Windows, the system libm elsewhere. Now only a fallback for arguments
+/// `optimized::ucrt_exp_log::cpow` declines.
 ///
 /// Both ABIs pass and return a two-double aggregate in a pair of FP registers
 /// (xmm0/xmm1 on SysV x86-64, v0/v1 on AAPCS64), which is exactly what
@@ -1240,16 +1209,17 @@ pub(crate) fn np_cpow(a: Complex64, b: Complex64) -> Complex64 {
             return acc;
         }
     }
-    // Off Windows, UCRT's own `cexp(clogl(z) * w)` composition is reproduced in
-    // `optimized::ucrt_exp_log` and must win: the reference rounds the way UCRT
-    // rounds even when it runs on Linux, and glibc's `cpow` is a different
-    // algorithm (it takes `pow(|z|, w)`), not a differently-rounded one -- the
-    // two differ on ~39% of the MTF filter's elements at every level. Windows
-    // keeps the raw-dylib call, so that platform cannot move. The port declines
-    // arguments outside the ranges it covers (non-positive logarithms,
-    // subnormal moduli, |x| >= 2e7), which then fall through to the platform
-    // library exactly as before.
-    #[cfg(not(target_os = "windows"))]
+    // UCRT's own `cexp(clogl(z) * w)` composition is reproduced in
+    // `optimized::ucrt_exp_log` and must win on **every** platform: the
+    // reference rounds the way *the captured* UCRT rounds, glibc's `cpow` is a
+    // different algorithm (it takes `pow(|z|, w)`), not a differently-rounded
+    // one -- the two differ on ~39% of the MTF filter's elements at every
+    // level -- and the Windows CI run on `5e7eda2` showed that a *different
+    // build of UCRT* also disagrees (see the note on `numpy_cos`). Windows used
+    // to keep the raw-dylib call and, with it, whichever `ucrtbase.dll` the
+    // machine shipped. The port declines arguments outside the ranges it
+    // covers (non-positive logarithms, subnormal moduli, |x| >= 2e7), which
+    // then fall through to the platform library exactly as before.
     if let Some((re, im)) = crate::optimized::ucrt_exp_log::cpow(a.re, a.im, b.re, b.im) {
         return Complex64::new(re, im);
     }
