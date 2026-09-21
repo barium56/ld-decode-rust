@@ -99,13 +99,25 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
             sync_ranges.push((start, end));
         }
     }
-    // 1-bit-per-sample mask: building it touches only the (narrow) sync
-    // ranges instead of writing two 46MB value vectors, and the per-sample
-    // lookup below is a plain array index.
-    let mut sync_mask = vec![false; demod.len()];
+    // Normalise to disjoint, sorted intervals. The union is exactly what the
+    // old full-length `sync_mask` marked true, but no per-field mask array is
+    // allocated, faulted in or read back (1.3M bools of allocator traffic and
+    // a per-sample load): the element-wise pass below walks these intervals
+    // forward inside each chunk, which is one compare per sample in the common
+    // case. Sorting also makes the chunk walk's starting point well defined.
+    sync_ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sync_ranges.len());
     for &(s, e) in &sync_ranges {
-        sync_mask[s..e].fill(true);
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => {
+                if e > last.1 {
+                    last.1 = e;
+                }
+            }
+            _ => merged.push((s, e)),
+        }
     }
+    let sync_ranges = merged;
 
     let s_vm = s0.elapsed().as_nanos() as u64;
     // Absurd fluctuations in pre-deemp demod can only be caused by dropouts.
@@ -117,19 +129,29 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
     let stride = iserr.len().max(1).div_ceil(rayon::current_num_threads() * 16).max(1024);
     iserr.par_chunks_mut(stride).enumerate().for_each(|(ci, chunk)| {
         let gi0 = ci * stride;
+        // Resume at the last interval starting at or before this chunk's first
+        // sample; the walk below then only ever moves forward.
+        let mut ri = sync_ranges.partition_point(|&(s, _)| s <= gi0);
+        if ri > 0 {
+            ri -= 1;
+        }
         for (i, flag) in chunk.iter_mut().enumerate() {
             let gi = gi0 + i;
+            while ri < sync_ranges.len() && sync_ranges[ri].1 <= gi {
+                ri += 1;
+            }
+            let in_sync = ri < sync_ranges.len() && gi >= sync_ranges[ri].0;
             if gi < demod_raw.len() && demod_raw[gi] > freq_hz_half {
                 *flag = true;
             }
             if gi < demod.len() {
-                let vmin = if sync_mask[gi] { sync_min } else { valid_min_default };
+                let vmin = if in_sync { sync_min } else { valid_min_default };
                 if demod[gi] < vmin || demod[gi] > valid_max {
                     *flag = true;
                 }
             }
             if gi < demod_05.len() {
-                let vmin = if sync_mask[gi] { sync_min_05 } else { valid_min05_default };
+                let vmin = if in_sync { sync_min_05 } else { valid_min05_default };
                 if demod_05[gi] < vmin || demod_05[gi] > valid_max05 {
                     *flag = true;
                 }
@@ -264,11 +286,24 @@ pub(crate) fn detect_dropouts(field: &Field) -> (Vec<usize>, Vec<usize>, Vec<usi
     let s5 = std::time::Instant::now();
     let iserr = dropout_detect_demod(field);
     let s_demod = s5.elapsed().as_nanos() as u64;
+    // Parallel, order-preserving index collection: per-chunk lists built from
+    // the read-only flags and concatenated in chunk order, so the sequence is
+    // the same one the serial filter produced.
+    const ERR_CHUNK: usize = 1 << 16;
     let errmap: Vec<usize> = iserr
-        .iter()
+        .par_chunks(ERR_CHUNK)
         .enumerate()
-        .filter(|(_, &e)| e)
-        .map(|(i, _)| i)
+        .map(|(ci, chunk)| {
+            let base = ci * ERR_CHUNK;
+            chunk
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &e)| if e { Some(base + i) } else { None })
+                .collect::<Vec<usize>>()
+        })
+        .collect::<Vec<Vec<usize>>>()
+        .into_iter()
+        .flatten()
         .collect();
 
     let mut rv_lines = Vec::new();
