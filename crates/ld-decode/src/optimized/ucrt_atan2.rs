@@ -62,8 +62,14 @@ pub fn atan2(y: f64, x: f64) -> Option<f64> {
     let abs_x = bx & 0x7fff_ffff_ffff_ffff;
     let abs_y = by & 0x7fff_ffff_ffff_ffff;
 
-    // NaN or inf: UCRT hands these to helpers (0x180033f9c).
-    if abs_x > 0x7ff0_0000_0000_0000 || abs_y > 0x7ff0_0000_0000_0000 {
+    // NaN or inf: UCRT hands these to helpers (0x180033f9c). `>=` rather than
+    // `>` because the infinity pattern *is* `0x7ff0000000000000`: with `>` an
+    // infinite operand slipped through, and `inf/inf` is NaN, which takes the
+    // table branch on the false `z <= 1/16` and then indexes the table with
+    // `NaN as i32` -> 0 -> a negative index (panic). The decoder never produces
+    // an infinite operand, so declining them changes no output; it only turns a
+    // panic into the platform fallback the port already uses for NaN.
+    if abs_x >= 0x7ff0_0000_0000_0000 || abs_y >= 0x7ff0_0000_0000_0000 {
         return None;
     }
     if abs_y == 0 {
@@ -232,6 +238,213 @@ pub fn atan2(y: f64, x: f64) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// 4-lane AVX2 path.
+// ---------------------------------------------------------------------------
+
+/// Four `atan2`s at once, with the scalar port's exact rounding.
+///
+/// Returns `false` (leaving `out` untouched) when any lane falls outside the
+/// classes this path covers — NaN/inf/subnormal/zero operands, or an exponent
+/// gap wide enough to take one of the early-out branches — and the caller then
+/// runs the four lanes through [`atan2`].
+///
+/// **Why this is bit-exact by construction.** Every operation in the scalar
+/// port is a plain, correctly-rounded IEEE double op (`*`, `+`, `-`, `/`,
+/// `from_bits`, comparisons, a truncating conversion) applied to one lane.
+/// AVX2's `vmulpd`/`vaddpd`/`vsubpd`/`vdivpd`/`vcvttpd2dq` compute exactly the
+/// same values lane-wise, and `vcmp*` masks plus `vblendvpd` reproduce the
+/// branches. Nothing here can be contracted into an FMA (intrinsics are opaque
+/// to LLVM's contraction), so no intermediate is rounded differently. The two
+/// value-producing branches (table and polynomial) are both evaluated and the
+/// per-lane mask selects between them, which is why a mixed vector costs no
+/// more than a uniform one.
+///
+/// The table loads stay scalar (four index-driven loads per table) rather than
+/// `vgather*`, which is microcoded on Zen and slower than the scalar form.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub fn atan2_4(y: &[f64; 4], x: &[f64; 4], out: &mut [f64; 4]) -> bool {
+    use std::arch::x86_64::*;
+    // Set once per call; the whole body below is one op sequence per lane.
+    unsafe {
+        let vy = _mm256_loadu_pd(y.as_ptr());
+        let vx = _mm256_loadu_pd(x.as_ptr());
+        let bi = _mm256_castpd_si256;
+        let bf = _mm256_castsi256_pd;
+        let bx = bi(vx);
+        let by = bi(vy);
+        let nan_inf = _mm256_set1_epi64x(0x7ff0_0000_0000_0000u64 as i64);
+        let absmask = _mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64);
+        let abs_x = _mm256_and_si256(bx, absmask);
+        let abs_y = _mm256_and_si256(by, absmask);
+
+        // Gate: every lane must be finite, non-zero, normal (exponent != 0) and
+        // within the exponent gap the early-out branches would swallow.
+        let finite = _mm256_and_si256(
+            _mm256_cmpgt_epi64(nan_inf, abs_x),
+            _mm256_cmpgt_epi64(nan_inf, abs_y),
+        );
+        let nz = _mm256_and_si256(
+            _mm256_cmpgt_epi64(abs_x, _mm256_setzero_si256()),
+            _mm256_cmpgt_epi64(abs_y, _mm256_setzero_si256()),
+        );
+        let expshift = _mm_set1_epi64x(52);
+        let explow = _mm256_set1_epi64x(0x7ff);
+        let exp_x = _mm256_and_si256(_mm256_srl_epi64(bx, expshift), explow);
+        let exp_y = _mm256_and_si256(_mm256_srl_epi64(by, expshift), explow);
+        let norm = _mm256_and_si256(
+            _mm256_cmpgt_epi64(exp_x, _mm256_setzero_si256()),
+            _mm256_cmpgt_epi64(exp_y, _mm256_setzero_si256()),
+        );
+        // `esi > 56` and `esi < -28` are the port's early-outs (the latter with
+        // sub-branches of its own); the class this path covers is exactly
+        // `-28 <= esi <= 56`.
+        let esi = _mm256_sub_epi64(exp_y, exp_x);
+        let gap_ok = _mm256_and_si256(
+            _mm256_cmpgt_epi64(_mm256_set1_epi64x(57), esi),
+            _mm256_cmpgt_epi64(_mm256_add_epi64(esi, _mm256_set1_epi64x(29)), _mm256_setzero_si256()),
+        );
+        let ok = _mm256_and_si256(
+            _mm256_and_si256(finite, nz),
+            _mm256_and_si256(norm, gap_ok),
+        );
+        if _mm256_movemask_pd(bf(ok)) != 0b1111 {
+            return false;
+        }
+
+        // 0x18003212b: both magnitudes below 0.5 -> both doubled, exponents
+        // recomputed from the scaled values. `x * 2.0` is exact, so computing
+        // it for every lane and selecting is the scalar arithmetic.
+        let half = _mm256_set1_epi64x(0x3fd);
+        let small_x = _mm256_cmpgt_epi64(half, exp_x);
+        let small_y = _mm256_cmpgt_epi64(half, exp_y);
+        let dblmask = bf(_mm256_and_si256(small_x, small_y));
+        let vx2 = _mm256_blendv_pd(vx, _mm256_mul_pd(vx, _mm256_set1_pd(2.0)), dblmask);
+        let vy2 = _mm256_blendv_pd(vy, _mm256_mul_pd(vy, _mm256_set1_pd(2.0)), dblmask);
+
+        // 0x1800323d0: magnitudes, larger operand in `lg` (both positive).
+        let lg_abs = _mm256_and_pd(vx2, bf(absmask));
+        let sm_abs = _mm256_and_pd(vy2, bf(absmask));
+        let swapped = _mm256_cmp_pd::<_CMP_GT_OQ>(sm_abs, lg_abs);
+        let lg = _mm256_blendv_pd(lg_abs, sm_abs, swapped);
+        let sm = _mm256_blendv_pd(sm_abs, lg_abs, swapped);
+        let z = _mm256_div_pd(sm, lg);
+
+        let sx = _mm256_cmp_pd::<_CMP_LT_OQ>(vx, _mm256_setzero_pd());
+        let sy = _mm256_cmp_pd::<_CMP_LT_OQ>(vy, _mm256_setzero_pd());
+
+        // ---- table branch (z > 1/16) ----
+        let table = _mm256_cmp_pd::<_CMP_GT_OQ>(z, _mm256_set1_pd(SIXTEENTH));
+        let nmask = _mm256_movemask_pd(table);
+        // `n = trunc(z*256 + 0.5)`; for a table lane `z` is in (1/16, 1], so
+        // `n` lands in 16..=256 and the table index is in range. Lanes outside
+        // the table branch keep a clamped slot whose value the final blend
+        // drops.
+        let nv = _mm256_cvttpd_epi32(_mm256_add_pd(
+            _mm256_mul_pd(z, _mm256_set1_pd(SCALE_256)),
+            _mm256_set1_pd(HALF),
+        ));
+        let mut t_lo = [0.0f64; 4];
+        let mut t_hi = [0.0f64; 4];
+        if nmask != 0 {
+            let mut narr = [0i32; 4];
+            _mm_storeu_si128(narr.as_mut_ptr() as *mut __m128i, nv);
+            for k in 0..4 {
+                let idx = (narr[k] - 16).clamp(0, 240) as usize;
+                t_lo[k] = ATAN_TBL_HI[idx];
+                t_hi[k] = ATAN_TBL_LO[idx];
+            }
+        }
+        let vt_lo = _mm256_loadu_pd(t_lo.as_ptr());
+        let vt_hi = _mm256_loadu_pd(t_hi.as_ptr());
+        let m = _mm256_mul_pd(_mm256_cvtepi32_pd(nv), _mm256_set1_pd(INV_256));
+
+        // 0x180032458: scale `lg` into [1,2) by 2^d, split into 2^e * 2^f so
+        // neither factor overflows on its own. `e` is `d / 2` under Rust's
+        // truncating integer division, done here in doubles (exact for these
+        // magnitudes) and converted back with `cvttpd2dq`, which also
+        // truncates toward zero.
+        let exlg = _mm256_and_si256(_mm256_srli_epi64(bi(lg), 52), explow);
+        let d64 = _mm256_sub_epi64(_mm256_set1_epi64x(0x3ff), exlg);
+        let d32 = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(
+            d64,
+            _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0),
+        ));
+        let e32 = _mm256_cvttpd_epi32(_mm256_mul_pd(_mm256_cvtepi32_pd(d32), _mm256_set1_pd(0.5)));
+        let e64 = _mm256_cvtepi32_epi64(e32);
+        let f64 = _mm256_sub_epi64(d64, e64);
+        let sh52 = _mm256_set1_epi64x(52);
+        let two_e = bf(_mm256_sllv_epi64(_mm256_add_epi64(e64, _mm256_set1_epi64x(0x3ff)), sh52));
+        let two_f = bf(_mm256_sllv_epi64(_mm256_add_epi64(f64, _mm256_set1_epi64x(0x3ff)), sh52));
+        let big = _mm256_mul_pd(_mm256_mul_pd(two_e, lg), two_f);
+        let small = _mm256_mul_pd(_mm256_mul_pd(two_e, sm), two_f);
+
+        // r = (small - X*m) / (X + m*small), with the split of X and the
+        // residual of `small - X*m` both carried.
+        let x_hi = _mm256_and_pd(big, bf(_mm256_set1_epi64x(0xffff_ffff_f800_0000u64 as i64)));
+        let p = _mm256_mul_pd(_mm256_sub_pd(big, x_hi), m);
+        let acc0 = _mm256_sub_pd(_mm256_sub_pd(small, _mm256_mul_pd(x_hi, m)), p);
+        let msmall = _mm256_add_pd(_mm256_mul_pd(m, small), big);
+        let r = _mm256_div_pd(acc0, msmall);
+        let r2 = _mm256_mul_pd(r, r);
+        let c = _mm256_mul_pd(
+            _mm256_mul_pd(_mm256_sub_pd(_mm256_set1_pd(C333A), _mm256_mul_pd(r2, _mm256_set1_pd(C199A))), r2),
+            r,
+        );
+        let poly = _mm256_sub_pd(_mm256_add_pd(r, vt_hi), c);
+        let lo_t = vt_lo;
+        let hi_t = poly;
+
+        // ---- polynomial branch (z <= 1/16) ----
+        let z2 = _mm256_mul_pd(z, z);
+        let trunc32 = _mm256_set1_epi64x(0xffff_ffff_0000_0000u64 as i64);
+        let lg_hi = _mm256_and_pd(lg, bf(trunc32));
+        let z_hi = _mm256_and_pd(z, bf(trunc32));
+        let t1 = _mm256_mul_pd(_mm256_sub_pd(lg, lg_hi), z_hi);
+        // NB: `sm`, not the table branch's scaled `small` — the residual is of
+        // the unscaled smaller magnitude.
+        let mut pacc = _mm256_sub_pd(sm, _mm256_mul_pd(z_hi, lg_hi));
+        pacc = _mm256_sub_pd(pacc, t1);
+        pacc = _mm256_sub_pd(pacc, _mm256_mul_pd(_mm256_sub_pd(z, z_hi), lg));
+        pacc = _mm256_div_pd(pacc, lg);
+        let cz = _mm256_sub_pd(_mm256_set1_pd(C111), _mm256_mul_pd(z2, _mm256_set1_pd(C090)));
+        let cz2 = _mm256_mul_pd(cz, z2);
+        let tz = _mm256_sub_pd(_mm256_set1_pd(C142), cz2);
+        let tz2 = _mm256_mul_pd(tz, z2);
+        let c2 = _mm256_sub_pd(_mm256_set1_pd(C199B), tz2);
+        let c2z = _mm256_mul_pd(c2, z2);
+        let t2 = _mm256_mul_pd(
+            _mm256_sub_pd(_mm256_set1_pd(C333B), c2z),
+            _mm256_mul_pd(z2, z),
+        );
+        pacc = _mm256_add_pd(_mm256_sub_pd(pacc, t2), z);
+        // A_TINY > z: lo = 0, hi = z (the odd series is skipped).
+        let tiny = _mm256_cmp_pd::<_CMP_LT_OQ>(z, _mm256_set1_pd(A_TINY));
+        let hi_p = _mm256_blendv_pd(pacc, z, tiny);
+        let lo_p = _mm256_setzero_pd();
+
+        // Pick the branch per lane, then the quadrant fix-ups.
+        let mut lo = _mm256_blendv_pd(lo_p, lo_t, table);
+        let mut hi = _mm256_blendv_pd(hi_p, hi_t, table);
+        lo = _mm256_blendv_pd(lo, _mm256_sub_pd(_mm256_set1_pd(PI2_HI), lo), swapped);
+        hi = _mm256_blendv_pd(hi, _mm256_sub_pd(_mm256_set1_pd(PI2_LO), hi), swapped);
+        lo = _mm256_blendv_pd(lo, _mm256_sub_pd(_mm256_set1_pd(PI_HI), lo), sx);
+        hi = _mm256_blendv_pd(hi, _mm256_sub_pd(_mm256_set1_pd(PI_LO), hi), sx);
+        let v = _mm256_add_pd(lo, hi);
+        let v = _mm256_xor_pd(v, _mm256_and_pd(sy, _mm256_set1_pd(-0.0)));
+        _mm256_storeu_pd(out.as_mut_ptr(), v);
+        true
+    }
+}
+
+/// Scalar-target fallback: always declines, so callers take the scalar path.
+#[cfg(not(target_feature = "avx2"))]
+#[inline]
+pub fn atan2_4(_y: &[f64; 4], _x: &[f64; 4], _out: &mut [f64; 4]) -> bool {
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Generated tables (ucrtbase.dll rodata).
 // ---------------------------------------------------------------------------
 
@@ -367,7 +580,7 @@ pub(crate) const ATAN_TBL_LO: [f64; 241] = [
 
 #[cfg(test)]
 mod tests {
-    use super::atan2;
+    use super::{atan2, atan2_4};
 
     /// Every expected value was read out of the real UCRT on Windows
     /// (`work/numprobe/src/bin/atan2pins.rs`), not computed here, so this pins
@@ -416,6 +629,115 @@ mod tests {
             atan2(10011000.0, 9999900.0).unwrap().to_bits(),
             0x3fe926869d4a54b3
         );
+    }
+
+    /// The 4-lane path must be *bit-identical* to four scalar calls — that is
+    /// the whole contract, and it is what lets `unwrap_hilbert_into` use it
+    /// without a second golden set. Two directions are checked: every value the
+    /// vector path returns must equal the scalar port's value bit for bit, and
+    /// every operand in the class the path claims to cover must be *accepted*
+    /// (so a gate that got subtly stricter — silently reverting the whole
+    /// optimisation to scalar — fails here instead of only in a benchmark).
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn atan2_4_matches_the_scalar_port_bit_for_bit() {
+        // Pseudo-random finite doubles with a chosen exponent, i.e. the whole
+        // (mantissa, exponent) space the decoder can produce, plus the exact
+        // boundaries of every branch.
+        fn with_exp(seed: &mut u64, exp: i32) -> f64 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mant = *seed >> 12; // 52 bits
+            f64::from_bits(((exp as u64) << 52) | mant)
+        }
+
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut checked = 0usize;
+        let mut accepted = 0usize;
+        let mut ys = [0.0f64; 4];
+        let mut xs = [0.0f64; 4];
+        let mut out = [0.0f64; 4];
+        // Exponent grid: 0x3f0..0x410 covers magnitudes ~2^-15..2^17, and the
+        // full -28..=56 gap range is covered by pairing exponents up to 56
+        // apart (the class boundary).
+        let exps: Vec<i32> = (0..=56).map(|d| 0x3f0 + d.min(40)).collect();
+        for &ea in &exps {
+            for &off in &[
+                0i32, 1, 3, 7, 15, 27, 28, 29, 40, 56, 57, 60, -1, -3, -15, -27, -28, -29, -40, -56,
+                -57,
+            ] {
+                for _ in 0..64 {
+                    for k in 0..4 {
+                        xs[k] = with_exp(&mut seed, ea);
+                        ys[k] = with_exp(&mut seed, ea + off);
+                    }
+                    let want: Vec<Option<f64>> =
+                        (0..4).map(|k| atan2(ys[k], xs[k])).collect();
+                    let ok = atan2_4(&ys, &xs, &mut out);
+                    let main_path = (-28..=56).contains(&off);
+                    if ok {
+                        for k in 0..4 {
+                            let w = want[k].expect("vector path accepted a declined lane");
+                            assert_eq!(out[k].to_bits(), w.to_bits(),
+                                "lane {k}: y={:e} x={:e}", ys[k], xs[k]);
+                        }
+                        accepted += 1;
+                    }
+                    if main_path && !ok {
+                        panic!("gate refused the covered class: y={ys:?} x={xs:?}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 20_000, "corpus too small: {checked}");
+        assert!(accepted * 2 > checked, "vector path engaged on {accepted}/{checked}");
+
+        // The decoder's own shape: a ~0.5 rad phase step, magnitudes ~1e6, and
+        // the full sign/quadrant combination of the two components.
+        for &(a, b) in &[
+            (871110.0, -1440200.0),
+            (-4209800.0, 3331100.0),
+            (10011000.0, 9999900.0),
+            (1.5e6, 1.5e6),
+            (2.0e6, 7.0e5),
+            (7.0e5, 2.0e6),
+            (3.0e6, 1.0e3),
+            (1.0e3, 3.0e6),
+        ] {
+            for k in 0..4 {
+                xs[k] = a;
+                ys[k] = b;
+            }
+            let ok = atan2_4(&ys, &xs, &mut out);
+            let w = atan2(b, a).expect("decoder-shaped operand declined");
+            assert!(ok, "decoder-shaped operand refused by the gate");
+            for k in 0..4 {
+                assert_eq!(out[k].to_bits(), w.to_bits());
+            }
+        }
+    }
+
+    /// A lane the scalar port declines (or short-circuits) must make the vector
+    /// path decline the whole group rather than compute a value for it.
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn atan2_4_declines_groups_with_an_uncovered_lane() {
+        let mut out = [0.0f64; 4];
+        let good = [1.0e6, 2.0e6, 3.0e6, 4.0e6];
+        let bad_x = [
+            [0.0, 2.0e6, 3.0e6, 4.0e6],
+            [1.0e6, f64::NAN, 3.0e6, 4.0e6],
+            [1.0e6, 2.0e6, f64::INFINITY, 4.0e6],
+            [1.0e6, 2.0e6, 3.0e6, 1e-320],
+            // 2^60 apart: the `esi > 56` early-out.
+            [1.0e6, 2.0e6, 3.0e6, 1.0e24],
+            // 2^-40 apart: the `esi < -28` early-out.
+            [1.0e6, 2.0e6, 3.0e6, 1.0e-12],
+        ];
+        for xs in bad_x {
+            assert!(!atan2_4(&good, &xs, &mut out), "accepted {xs:?}");
+            assert!(!atan2_4(&xs, &good, &mut out), "accepted {xs:?} as y");
+        }
     }
 
     /// The operand classes the port deliberately does not cover must report

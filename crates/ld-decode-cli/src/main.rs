@@ -379,8 +379,9 @@ fn refill_take(
 /// Drop the head of the window so it starts at `keep`, re-seeking the reader if
 /// the window was fully drained. The drop is logical: the head is recorded as
 /// a skip offset and the buffer is only compacted (memmoved) when the dead
-/// prefix exceeds a quarter of the buffer, so a steady-state field loop never
-/// memmoves the ~8M-sample window per field.
+/// prefix has grown at least as large as the live tail, so a steady-state
+/// field loop moves a small fraction of the ~8M-sample window per field
+/// instead of the whole thing.
 fn keep_window(
     reader: &mut prefetch::PrefetchReader,
     window: &mut Vec<f32>,
@@ -411,10 +412,20 @@ fn keep_window(
         // keeps the needed data in the window.
     }
     *base = keep.max(*base);
-    // Amortized compaction: only memmove when the dead prefix is large
-    // relative to the live tail (cost amortizes to a few percent of a
-    // per-field drain). Nothing above `base` is ever read again.
-    if *skip > 0 && *skip * 4 >= window.len() - *skip {
+    // Amortized compaction: only memmove when the dead prefix has grown at
+    // least as large as the live tail. Nothing above `base` is ever read
+    // again, so whenever to compact is free to choose.
+    //
+    // The memmove volume per field is `A / f` where `A` is the per-field
+    // advance (~666k samples) and `f` the fraction of the window the dead
+    // prefix must reach before a drain: each drain moves the whole live tail,
+    // and drains happen every `f * live / A` fields. The old `f = 0.2`
+    // therefore memmoved ~3.3M samples (13 MB) per field, which is real wall
+    // time (`refill_take` + this are the ~1 ms/field the loop spends outside
+    // `Decoder::decode`). `f = 0.5` cuts that to ~1.3M samples (5 MB) at the
+    // cost of holding the dead prefix up to one extra window length (~34 MB
+    // of f32 here) — memory we have, unlike samples/s.
+    if *skip > 0 && *skip >= window.len() - *skip {
         window.drain(..*skip);
         *skip = 0;
     }
