@@ -129,34 +129,55 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
     let stride = iserr.len().max(1).div_ceil(rayon::current_num_threads() * 16).max(1024);
     iserr.par_chunks_mut(stride).enumerate().for_each(|(ci, chunk)| {
         let gi0 = ci * stride;
-        // Resume at the last interval starting at or before this chunk's first
-        // sample; the walk below then only ever moves forward.
-        let mut ri = sync_ranges.partition_point(|&(s, _)| s <= gi0);
-        if ri > 0 {
-            ri -= 1;
-        }
-        for (i, flag) in chunk.iter_mut().enumerate() {
-            let gi = gi0 + i;
-            while ri < sync_ranges.len() && sync_ranges[ri].1 <= gi {
-                ri += 1;
+        let gi_end = gi0 + chunk.len();
+        // One straight-line scan per array instead of one fused loop that
+        // tested all three with three bounds guards per sample. `chunk` holds
+        // only this chunk's samples, so the scans stay independent.
+        //
+        // The threshold a level map uses depends on the sample's position, so
+        // the sync ranges are walked once per chunk and each segment is a plain
+        // scan with a fixed threshold. The predicate is unchanged: `vmin` is
+        // `sync_min` exactly on the samples the old mask marked.
+        let scan_levels = |arr: &[f32], valid_min: f32, s_min: f32, v_max: f32, chunk: &mut [bool]| {
+            let hi = arr.len().min(gi_end);
+            if gi0 >= hi {
+                return;
             }
-            let in_sync = ri < sync_ranges.len() && gi >= sync_ranges[ri].0;
-            if gi < demod_raw.len() && demod_raw[gi] > freq_hz_half {
-                *flag = true;
+            let mut seg = gi0;
+            // Resume at the last interval starting at or before `seg`; the
+            // walk below then only ever moves forward.
+            let mut ri = sync_ranges.partition_point(|&(s, _)| s <= seg);
+            if ri > 0 {
+                ri -= 1;
             }
-            if gi < demod.len() {
-                let vmin = if in_sync { sync_min } else { valid_min_default };
-                if demod[gi] < vmin || demod[gi] > valid_max {
-                    *flag = true;
+            while seg < hi {
+                while ri < sync_ranges.len() && sync_ranges[ri].1 <= seg {
+                    ri += 1;
                 }
-            }
-            if gi < demod_05.len() {
-                let vmin = if in_sync { sync_min_05 } else { valid_min05_default };
-                if demod_05[gi] < vmin || demod_05[gi] > valid_max05 {
-                    *flag = true;
+                let (end, vmin) = match sync_ranges.get(ri) {
+                    Some(&(s, e)) if seg >= s => (e.min(hi), s_min),
+                    Some(&(s, _)) => (s.min(hi), valid_min),
+                    None => (hi, valid_min),
+                };
+                for gi in seg..end {
+                    let v = arr[gi];
+                    if v < vmin || v > v_max {
+                        chunk[gi - gi0] = true;
+                    }
                 }
+                seg = end;
+            }
+        };
+        // 1) RF highpass excursion: position-independent, no range walk.
+        let hi = demod_raw.len().min(gi_end);
+        for gi in gi0..hi {
+            if demod_raw[gi] > freq_hz_half {
+                chunk[gi - gi0] = true;
             }
         }
+        // 2) the demodulated video level map, 3) the 0.5 MHz one.
+        scan_levels(demod, valid_min_default, sync_min, valid_max, chunk);
+        scan_levels(demod_05, valid_min05_default, sync_min_05, valid_max05, chunk);
     });
 
     let s_p2 = s0.elapsed().as_nanos() as u64;
