@@ -84,19 +84,28 @@ struct Args {
     threads: usize,
 }
 
-/// Default demod thread count: half the logical cores plus one (9 on a 16-thread
-/// box). The demod pool and the serial tail's data-parallel sections overlap, so
-/// the split between them matters more than the total — and the ideal split
-/// moves with how much work the tail has. It was three quarters of the cores
-/// when the tail still carried the EFM PLL inline; with that offloaded the tail
-/// needs less headroom and giving the (memory-bound) demod more cores pays
-/// again: measured `-l 5000` on a 16-thread box, 2 rounds each —
-/// `-j 9` 38.29/38.20, `-j 10` 37.87/37.65, `-j 8` 37.18/36.95,
-/// `-j 12` 36.19/35.40 (the old default). Re-sweep after any change that
-/// moves the demod/tail balance.
+/// Default demod thread count: half the logical cores (8 on a 16-thread box,
+/// i.e. one per physical core). The demod pool and the serial tail's
+/// data-parallel sections overlap, so the split between them matters more than
+/// the total — and the ideal split moves with how much work the tail has. It
+/// was three quarters of the cores when the tail still carried the EFM PLL
+/// inline; after that was offloaded, `half plus one` won: measured `-l 5000` on
+/// a 16-thread box, 2 rounds each — `-j 9` 38.29/38.20, `-j 10` 37.87/37.65,
+/// `-j 8` 37.18/36.95, `-j 12` 36.19/35.40 (the old default).
+///
+/// Re-swept after the 4-lane `atan2` cut took most of the pool's non-FFT work
+/// out: with the pool no longer the binding side, the ninth thread is pure SMT
+/// contention. `-l 2000`, 3 rounds — `-j 8` 46.81/46.95, `-j 9` 46.48/46.87,
+/// `-j 10` 45.67/45.29; then `-l 5000`, 2 rounds — `-j 8` 47.10/47.15,
+/// `-j 9` 46.81/47.07; and 4 further `-l 2000` rounds — `-j 8`
+/// 46.77/46.79/47.04/46.83 against `-j 9` 46.93/46.64/46.54/46.67. Small but
+/// consistent, and `-j 8` has the tighter spread. Output is byte-identical
+/// across the two (`-l 5000`, both rounds, .tbc/.pcm/.efm).
+///
+/// Re-sweep after any change that moves the demod/tail balance.
 fn default_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| (n.get() / 2 + 1).max(2))
+        .map(|n| (n.get() / 2).max(2))
         .unwrap_or(4)
 }
 
