@@ -106,6 +106,36 @@ void FN(ifft_batch_rows)(int k, int n, const double *in, double *out) {
   }
 }
 
+// In-place form of the above: the same batched c2c over `k` contiguous rows,
+// with `in == out`.
+//
+// ducc's c2c takes its "inplace" path whenever the transform axis is
+// contiguous and `n_bunch == 1` -- exactly this call's shape -- and that path
+// reads the input straight out of `out` (`if (in.data()!=out.data())
+// copy_input(...)`), transforms it there through its own line buffer and
+// writes back. Handing it the same pointer therefore only drops that copy: the
+// plan, the pass structure and every arithmetic op are the ones the
+// out-of-place call already used, so the results are bit-identical (gated by
+// `ifft_batch_rows_inplace_matches_out_of_place`).
+void FN(ifft_batch_rows_ip)(int k, int n, double *buf) {
+  try {
+    force_simul_batch() = true;
+    shape_t shp{ (size_t)k, (size_t)n };
+    stride_t strd{ (ptrdiff_t)n, 1 };
+    cfmav<complex<double>> cin((complex<double>*)buf, shp, strd);
+    vfmav<complex<double>> cout((complex<double>*)buf, shp, strd);
+    c2c(cin, cout, shape_t{1}, BACKWARD, 1.0/double(n), 1);
+    force_simul_batch() = false;
+  } catch (const std::exception &e) {
+    force_simul_batch() = false;
+    duccq_fail(e.what(), "ifft_batch_rows_ip");
+  }
+  catch (...) {
+    force_simul_batch() = false;
+    duccq_fail("unknown", "ifft_batch_rows_ip");
+  }
+}
+
 } // extern "C"
 
 extern "C" {

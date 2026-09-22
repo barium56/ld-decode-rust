@@ -46,6 +46,9 @@ unsafe extern "C" {
     fn duccq_sse2_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2fma_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_ifft_batch_rows_ip(k: c_int, n: c_int, buf: *mut f64);
+    fn duccq_avx2fma_ifft_batch_rows_ip(k: c_int, n: c_int, buf: *mut f64);
+    fn duccq_avx2_ifft_batch_rows_ip(k: c_int, n: c_int, buf: *mut f64);
 }
 
 /// The FFT engine backing the ducc FFI entry points.
@@ -278,6 +281,44 @@ pub fn ifft_batch_rows(k: usize, n: usize, x: &[Complex64], out: &mut [Complex64
             x.as_ptr() as *const f64,
             out.as_mut_ptr() as *mut f64,
         );
+    }
+}
+
+/// The in-place batch entry point of the active engine.
+fn batch_ip_fn() -> unsafe extern "C" fn(c_int, c_int, *mut f64) {
+    #[cfg(test)]
+    {
+        if let Ok(g) = TEST_OVERRIDE.read() {
+            if let Some(e) = *g {
+                return match e {
+                    FftEngine::Sse2 => duccq_sse2_ifft_batch_rows_ip,
+                    FftEngine::Avx2Fma => duccq_avx2fma_ifft_batch_rows_ip,
+                    FftEngine::Avx2 => duccq_avx2_ifft_batch_rows_ip,
+                };
+            }
+        }
+    }
+    match active_engine() {
+        FftEngine::Sse2 => duccq_sse2_ifft_batch_rows_ip,
+        FftEngine::Avx2Fma => duccq_avx2fma_ifft_batch_rows_ip,
+        FftEngine::Avx2 => duccq_avx2_ifft_batch_rows_ip,
+    }
+}
+
+/// [`ifft_batch_rows`] in place: `k` contiguous rows transformed in the buffer
+/// they already live in.
+///
+/// Bit-identical to the out-of-place form (gated by
+/// `ifft_batch_rows_inplace_matches_out_of_place`) because ducc's contiguous
+/// "inplace" path already stages every row through its own line buffer and
+/// only skips the input copy when the two pointers match. It exists to remove
+/// that copy and the second `k*n` buffer from the demod kernel's working set,
+/// which is what the 8 concurrent prefetch workers are budgeted against.
+pub fn ifft_batch_rows_inplace(k: usize, n: usize, buf: &mut [Complex64]) {
+    debug_assert_eq!(buf.len(), k * n);
+    let f_batch = batch_ip_fn();
+    unsafe {
+        f_batch(k as c_int, n as c_int, buf.as_mut_ptr() as *mut f64);
     }
 }
 
@@ -757,6 +798,59 @@ mod tests {
                 );
             }
         }
+        }
+        *TEST_OVERRIDE.write().unwrap() = None;
+    }
+
+    /// The in-place batch entry has to be the *same* arithmetic as the
+    /// out-of-place one, not merely a valid FFT: the demod kernel rebuilds four
+    /// 32768-point spectra per block in one buffer and transforms them there,
+    /// so any pass-structure difference would move `hilbert`, `rfhpf`, EFM and
+    /// every video channel at once.
+    #[test]
+    fn ifft_batch_rows_inplace_matches_out_of_place() {
+        let n = 32768usize;
+        let golden_in = read_cf("fft32768_in.f64");
+        let have_avx2 = cpu_has_avx2() && cpu_has_fma();
+        let engines: &[FftEngine] = if have_avx2 {
+            &[FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma]
+        } else {
+            println!("note: CPU lacks avx2/fma; sse2 only");
+            &[FftEngine::Sse2]
+        };
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for engine in engines {
+            *TEST_OVERRIDE.write().unwrap() = Some(*engine);
+            for k in [1usize, 2, 3, 4, 6, 8] {
+                let mut x = vec![Complex64::new(0.0, 0.0); k * n];
+                // Row 0 is a real capture's own block spectrum, so the comparison
+                // also covers the magnitudes the decoder actually transforms.
+                x[..n].copy_from_slice(&golden_in);
+                for t in 1..k {
+                    for i in 0..n {
+                        let scale = 2f64.powi(((t * 3 + i % 7) as i32 % 30) - 15);
+                        x[t * n + i] = Complex64::new(next() * scale, next() * scale);
+                    }
+                }
+                let mut want = vec![Complex64::new(0.0, 0.0); k * n];
+                ifft_batch_rows(k, n, &x, &mut want);
+                let mut got = x.clone();
+                ifft_batch_rows_inplace(k, n, &mut got);
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        (g.re.to_bits(), g.im.to_bits()),
+                        (w.re.to_bits(), w.im.to_bits()),
+                        "in-place batch ({}) k={k} diverged at flat index {i}",
+                        engine.name()
+                    );
+                }
+            }
         }
         *TEST_OVERRIDE.write().unwrap() = None;
     }

@@ -125,8 +125,11 @@ struct Scratch {
     /// Batched spectra: four `blocklen` rows of filter products, inverse
     /// transformed in two batched calls per block (see the kernel body).
     batch_spec: Vec<Complex64>,
-    /// Batched inverse-FFT output, row-aligned with `batch_spec`.
-    batch_out: Vec<Complex64>,
+    /// There is deliberately no second row-aligned output buffer: the batched
+    /// inverse FFTs run *in place* over `batch_spec` (see
+    /// `ffi_ducc::ifft_batch_rows_inplace`), which is bit-identical and keeps
+    /// 2 MB per worker out of the eight concurrent prefetch working sets.
+    ///
     /// `unwrap_hilbert` output, clamped in place for the second r2c.
     demod_buf: Vec<f64>,
 }
@@ -657,7 +660,6 @@ pub(crate) fn demod_block_cpu(
         samples,
         indata,
         batch_spec,
-        batch_out,
         demod_buf,
     } = &mut *sc;
 
@@ -679,7 +681,6 @@ pub(crate) fn demod_block_cpu(
     // after the late group: `demod_fft` overwrites `indata` in between.
     if batch_spec.len() < 4 * blocklen {
         batch_spec.resize(4 * blocklen, Complex64::new(0.0, 0.0));
-        batch_out.resize(4 * blocklen, Complex64::new(0.0, 0.0));
     }
 
     // The hilbert product is fused with the MTF power (when nonzero): per
@@ -706,14 +707,9 @@ pub(crate) fn demod_block_cpu(
         &mut batch_spec[2 * blocklen..3 * blocklen],
     );
     st.mark(2);
-    ffi_ducc::ifft_batch_rows(
-        2,
-        blocklen,
-        &batch_spec[..2 * blocklen],
-        &mut batch_out[..2 * blocklen],
-    );
+    ffi_ducc::ifft_batch_rows_inplace(2, blocklen, &mut batch_spec[..2 * blocklen]);
     if let Some(s) = dump {
-        let rfhpf_f64: Vec<f64> = batch_out[blocklen..2 * blocklen]
+        let rfhpf_f64: Vec<f64> = batch_spec[blocklen..2 * blocklen]
             .iter()
             .map(|v| v.re)
             .collect();
@@ -723,7 +719,7 @@ pub(crate) fn demod_block_cpu(
             &pipe_f64(&rfhpf_f64),
         );
     }
-    let rfhpf = cut_rfhpf(&batch_out[blocklen..2 * blocklen], spec, rotdelay);
+    let rfhpf = cut_rfhpf(&batch_spec[blocklen..2 * blocklen], spec, rotdelay);
     st.mark(3);
 
     // Analog audio stage 1: per-channel sliced bandpass demod.
@@ -791,11 +787,11 @@ pub(crate) fn demod_block_cpu(
         pipe_write(
             pipe_dir.as_deref().unwrap(),
             &format!("s{}_hilbert.bin", s),
-            &pipe_cf(&batch_out[..blocklen]),
+            &pipe_cf(&batch_spec[..blocklen]),
         );
     }
     st.mark(8);
-    unwrap_hilbert_into(&batch_out[..blocklen], spec.freq_hz, demod_buf);
+    unwrap_hilbert_into(&batch_spec[..blocklen], spec.freq_hz, demod_buf);
     if let Some(s) = dump {
         pipe_write(
             pipe_dir.as_deref().unwrap(),
@@ -846,18 +842,13 @@ pub(crate) fn demod_block_cpu(
             &mut batch_spec[row * blocklen..(row + 1) * blocklen],
         );
     }
-    ffi_ducc::ifft_batch_rows(
-        4,
-        blocklen,
-        &batch_spec[..4 * blocklen],
-        &mut batch_out[..4 * blocklen],
-    );
+    ffi_ducc::ifft_batch_rows_inplace(4, blocklen, &mut batch_spec[..4 * blocklen]);
     st.mark(11);
 
     // EFM (row 2): the clip is element-wise, so building only the kept range
     // yields exactly the elements the full-length build then sliced out.
     let efm: Vec<i16> = {
-        let row = &batch_out[2 * blocklen..3 * blocklen];
+        let row = &batch_spec[2 * blocklen..3 * blocklen];
         let (start, end) = if cut {
             let start = spec.blockcut.min(row.len());
             let end = row.len().saturating_sub(spec.blockcut_end);
@@ -871,7 +862,7 @@ pub(crate) fn demod_block_cpu(
             .collect()
     };
     if let Some(s) = dump {
-        let efm_f64: Vec<f64> = batch_out[2 * blocklen..3 * blocklen]
+        let efm_f64: Vec<f64> = batch_spec[2 * blocklen..3 * blocklen]
             .iter()
             .map(|v| v.re)
             .collect();
@@ -900,7 +891,7 @@ pub(crate) fn demod_block_cpu(
             2 => 3,
             _ => unreachable!(),
         };
-        let ch_out = &batch_out[row * blocklen..(row + 1) * blocklen];
+        let ch_out = &batch_spec[row * blocklen..(row + 1) * blocklen];
         if let Some(s) = dump {
             if i < 2 {
                 pipe_write(
