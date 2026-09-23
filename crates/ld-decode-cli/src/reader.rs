@@ -570,6 +570,51 @@ impl RawFlacSource {
     }
 }
 
+/// Put the `ffmpeg` decode child below this process's priority.
+///
+/// The child only has to sustain the reader's ~137 MB/s of s16 and its decode
+/// rate is ~234 MB/s (measured on the CLV capture: `-threads auto` 234,
+/// `-threads 2` 231, `-threads 1` 123 MB/s against the 137 needed), so it has
+/// headroom to lose the scheduling race and still keep the pipe full. That
+/// matters because the demod pool is the binding constraint and everything it
+/// loses to another runnable thread inflates `dcpu` directly: the `.flac` path
+/// costs ~8 core-ms/field of demod inflation against s16, worth 9.6% FPS, and
+/// the mechanism is visible in `LD_TIMING` (`dcpu` 80.6 -> 88.6, `asm`
+/// 1.47 -> 1.58 — contention, not reader starvation).
+///
+/// Priority cannot change the decode's output: FLAC is lossless and ffmpeg's
+/// sample values do not depend on when its threads run.
+///
+/// Unix uses `setpriority(PRIO_PROCESS, pid, 19)`; Windows
+/// `SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)`.
+#[cfg(windows)]
+fn demote_child_priority(child: &std::process::Child) {
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    use std::os::windows::io::AsRawHandle;
+    extern "system" {
+        fn SetPriorityClass(hprocess: *mut core::ffi::c_void, class: u32) -> i32;
+    }
+    // Best effort: a failure just leaves the child at normal priority.
+    unsafe {
+        SetPriorityClass(
+            child.as_raw_handle() as *mut core::ffi::c_void,
+            BELOW_NORMAL_PRIORITY_CLASS,
+        );
+    }
+}
+
+#[cfg(unix)]
+fn demote_child_priority(child: &std::process::Child) {
+    const PRIO_PROCESS: i32 = 0;
+    const PRIO_LOWEST: i32 = 19;
+    extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    }
+    unsafe {
+        setpriority(PRIO_PROCESS, child.id(), PRIO_LOWEST);
+    }
+}
+
 /// `.flac` input decoded by an `ffmpeg` child process (C-speed FLAC decode,
 /// output as raw s16le mono on stdout — the same sample values the Python
 /// reference gets from its PyAV s16 resampler). Falls back to claxon (see
@@ -632,6 +677,7 @@ impl FfmpegFlacSource {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         let mut child = cmd.spawn().context("spawning ffmpeg for .flac decode")?;
+        demote_child_priority(&child);
         let stdout = child.stdout.take().context("ffmpeg stdout")?;
         Ok(Self {
             path: path.to_string(),
