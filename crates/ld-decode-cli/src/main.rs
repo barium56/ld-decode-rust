@@ -77,9 +77,9 @@ struct Args {
     /// Disable analog audio decoding
     #[arg(long, alias = "disable-analogue-audio")]
     disable_analog_audio: bool,
-    /// Number of demodulation worker threads (default: 3/4 of the cores). The
-    /// serial tail's parallel sections get a quarter of this; `LD_PF_POOL`
-    /// overrides the split.
+    /// Number of demodulation worker threads (default: 1.25x the physical
+    /// cores = 5/8 of the logical count). The serial tail's parallel sections
+    /// get a quarter of this; `LD_PF_POOL` overrides the split.
     #[arg(long, short = 'j', default_value_t = default_threads())]
     threads: usize,
 }
@@ -102,10 +102,23 @@ struct Args {
 /// consistent, and `-j 8` has the tighter spread. Output is byte-identical
 /// across the two (`-l 5000`, both rounds, .tbc/.pcm/.efm).
 ///
-/// Re-sweep after any change that moves the demod/tail balance.
+/// Re-swept once more (2026-09-23) after the in-place batched inverse FFTs and
+/// the engine-independence fix cut the pool's per-worker memory traffic, which
+/// is what had made a second thread per core lose before. Two env-only sweeps
+/// (each config's own round evidence, `-l 1000`): a first screen gave base
+/// `-j 8` 45.67/46.20 against `-j 10` 47.67/47.77 and `-j 6` 41.30/41.39; the
+/// upward screen gave 49.93/47.58, 48.61/47.66, 47.68/47.06, 45.74/44.67 and
+/// 42.45/42.15 for `-j` 10/11/12/13/14 against a per-round base of 49.24/45.57.
+/// So the optimum moved to **1.25x the physical cores** (`-j 10` here = 8
+/// physical + 2 SMT siblings), and beyond it the trend is monotonically worse,
+/// as the SMT contention model predicts. Re-sweep after any change that moves
+/// the pool's balance or its memory traffic.
 fn default_threads() -> usize {
+    // `available_parallelism` is the LOGICAL count, so the physical-core
+    // estimate is its half; the measured optimum fills a quarter of the SMT
+    // siblings on top, i.e. logical * 5 / 8 (10 on a 16-thread box, 5 on 8).
     std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(2))
+        .map(|n| ((n.get() * 5) / 8).max(2))
         .unwrap_or(4)
 }
 
