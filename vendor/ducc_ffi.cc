@@ -1,20 +1,18 @@
 // C shim exposing ducc0's 1-D real/complex FFTs (matching scipy 1.18's
 // _duccfft rounding) to the Rust decoder via FFI.
 //
-// Compiled with clang targeting MSVC ABI, SSE2 homegrown SIMD, single-threaded.
+// Compiled with clang targeting MSVC ABI, single-threaded.
 //
 // The shim is compiled ONCE PER ENGINE (see crates/ld-decode/build.rs):
 //   sse2    — the scipy-wheel replica (default, bit-exact reference build)
-//   avx2fma — -mavx2 -mfma (fastest, historically rounds differently)
+//   avx2fma — -mavx2 -mfma (fastest, but rounds differently by construction)
 //   avx2    — -mavx2 -mfma -ffp-contract=off (FMA-contraction hypothesis)
 // DUCCQ_PREFIX gives each copy's extern "C" entry points distinct symbols so
-// all three can link into one binary and be selected at runtime. ducc
-// internals (fft1d_impl.h / fftnd_impl.h) are anonymous-namespace templates
-// instantiated inside this TU, so the per-engine copies cannot clash.
+// all three can link into one binary and be selected at runtime.
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <complex>
-#include "ducc0/fft/fftnd_impl.h"
 
 #ifndef DUCCQ_PREFIX
 #define DUCCQ_PREFIX duccq_
@@ -24,12 +22,75 @@
 #define DUCCQ_CONCAT(a, b) DUCCQ_CONCAT2(a, b)
 #define FN(name) DUCCQ_CONCAT(DUCCQ_PREFIX, name)
 
+// Give this engine its OWN copy of ducc's entry layer. Without this the three
+// engine objects share one engine's compiled code, silently.
+//
+// ducc's entry points are explicitly instantiated (fft_inst_inc.h) in the
+// externally-linked namespace `ducc0::detail_fft`, so all three copies emitted
+// identically-named strong symbols (`ducc0::detail_fft::c2c<double>` is `T` in
+// every object, verified with llvm-nm) and the LINKER KEPT ONE. Measured
+// 2026-09-22, the two consequences were both invisible and both wrong:
+//
+//  * `fft_simdlen<double>` is 4 in an AVX2 object and 2 in the SSE2 object, but
+//    the executing code was the SSE2 copy, so no 256-bit kernel could ever run
+//    no matter which engine was selected.
+//  * The kernel bodies live in anonymous namespaces (per-TU, correctly
+//    separate), but the shared entry copy also read the SSE2 object's
+//    `thread_local` `force_simul_batch()` flag — which the AVX2 shim never sets
+//    (it sets its own). So the AVX2 copies ran `n_simul=1`: one SCALAR transform
+//    at a time, never the batched path. That is what the long-recorded "AVX2 is
+//    ~22% slower in situ" measured — not a codegen or frequency penalty.
+//
+// Renaming the namespace per engine fixes both: the macro is what
+// `namespace detail_fft`, every `ducc0::detail_fft::` qualified name and the
+// `using` declarations all spell, so they stay consistent. Only `detail_fft`
+// needs it — `detail_mav` and the FFT pass classes are header-inline or
+// anonymous-namespace templates, already per-TU.
+#define detail_fft DUCCQ_CONCAT(duccq_fft_, DUCCQ_PREFIX)
+
+#include "ducc0/fft/fftnd_impl.h"
+
 using namespace ducc0;
 using namespace ducc0::detail_mav;
 using namespace ducc0::detail_fft;
 
 static void duccq_fail(const char *what, const char *fn) {
   std::fprintf(stderr, "ducc_ffi[%s] exception: %s\n", fn, what);
+  std::fflush(stderr);
+}
+
+// Env-gated (DUCC_TRACE_SIMUL=1) probe: report what this translation unit was
+// actually compiled as, so an engine name can be checked against the SIMD
+// support the compiler gave it — the check that found the shared-symbol bug
+// above. Pairs with the dispatch trace in vendor/ducc0/fft/fftnd_impl.h.
+#ifdef __AVX__
+#define DUCCQ_P_AVX 1
+#else
+#define DUCCQ_P_AVX 0
+#endif
+#ifdef __AVX2__
+#define DUCCQ_P_AVX2 1
+#else
+#define DUCCQ_P_AVX2 0
+#endif
+#ifdef __FMA__
+#define DUCCQ_P_FMA 1
+#else
+#define DUCCQ_P_FMA 0
+#endif
+#define DUCCQ_ST2(x) #x
+#define DUCCQ_ST(x) DUCCQ_ST2(x)
+static void duccq_engine_probe(const char *fn) {
+  static const bool trace = getenv("DUCC_TRACE_SIMUL") != nullptr;
+  if (!trace) return;
+  static bool done = false;
+  if (done) return;
+  done = true;
+  std::fprintf(stderr,
+    "TUPROBE [%s] %s AVX=%d AVX2=%d FMA=%d native_simd<double>=%zu fft_simdlen<double>=%zu\n",
+    DUCCQ_ST(DUCCQ_PREFIX), fn, DUCCQ_P_AVX, DUCCQ_P_AVX2, DUCCQ_P_FMA,
+    (size_t)ducc0::native_simd<double>::size(),
+    (size_t)ducc0::detail_fft::fft_simdlen<double>);
   std::fflush(stderr);
 }
 
@@ -89,7 +150,12 @@ void FN(irfft)(int n, const double *in, double *out) {
 // results bit-identical to the scalar path.
 void FN(ifft_batch_rows)(int k, int n, const double *in, double *out) {
   try {
+    duccq_engine_probe("ifft_batch_rows");
     force_simul_batch() = true;
+    static const bool trace = getenv("DUCC_TRACE_SIMUL") != nullptr;
+    if (trace)
+      std::fprintf(stderr, "CALL [%s] batch k=%d n=%d forced=%d\n",
+        DUCCQ_ST(DUCCQ_PREFIX), k, n, (int)force_simul_batch());
     shape_t shp{ (size_t)k, (size_t)n };
     stride_t strd{ (ptrdiff_t)n, 1 };
     cfmav<complex<double>> cin((complex<double>*)in, shp, strd);

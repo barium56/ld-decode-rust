@@ -56,9 +56,11 @@ unsafe extern "C" {
 pub enum FftEngine {
     /// scipy-wheel replica (-msse2 only): the bit-exact default.
     Sse2,
-    /// -mavx2 -mfma: fastest ducc build, historically divergent rounding.
+    /// -mavx2 -mfma: genuinely 4-lane, NOT bit-exact (see
+    /// [`FftEngine::is_parity_reference`]).
     Avx2Fma,
-    /// -mavx2 -mfma -ffp-contract=off: FMA-contraction-hypothesis build.
+    /// -mavx2 -mfma -ffp-contract=off: as `Avx2Fma` but without FMA
+    /// contraction, which does not change the divergence.
     Avx2,
 }
 
@@ -69,6 +71,27 @@ impl FftEngine {
             FftEngine::Avx2Fma => "avx2fma",
             FftEngine::Avx2 => "avx2",
         }
+    }
+
+    /// Whether this engine is expected to reproduce the scipy 1.18 golden
+    /// values bit-for-bit.
+    ///
+    /// Only `sse2` is, and the reason is structural rather than a matter of
+    /// tuning: scipy's shipped `_duccfft` wheel is a baseline-SSE2 ducc build,
+    /// whose vectorized pass decomposes a transform into `vlen = 2` lanes, and
+    /// ducc's `cfftp_vecpass` **changes the decomposition with the lane width**
+    /// (`spass = make_pass(1, ip/vlen, vlen, roots)` in `fft1d_impl.h`). A 4-lane
+    /// build therefore evaluates the same transform as a different, differently
+    /// rounded sequence of operations — no compiler flag can bring it back, and
+    /// `-ffp-contract=off` does not (measured: `avx2` and `avx2fma` agree with
+    /// each other to the ulp and both differ from the golden).
+    ///
+    /// So the AVX2 engines are an experiment, not a tuning knob: they are
+    /// ~1.5x faster per batched transform and ~2.7x faster on the single 1-D
+    /// `r2c` the demod kernel issues, and they are excluded from the parity
+    /// assertion in `ifft_batch_matches_scalar_transforms` for that reason.
+    pub fn is_parity_reference(self) -> bool {
+        matches!(self, FftEngine::Sse2)
     }
 
     fn resolve(requested: Option<&str>) -> Result<FftEngine, String> {
@@ -126,7 +149,19 @@ pub(crate) fn cpu_has_fma() -> bool {
 static ENGINE: OnceLock<FftEngine> = OnceLock::new();
 
 #[cfg(test)]
-static TEST_OVERRIDE: std::sync::RwLock<Option<FftEngine>> = std::sync::RwLock::new(None);
+std::thread_local! {
+    /// Per-THREAD engine override for tests.
+    ///
+    /// This was a process-global `RwLock` until 2026-09-22, and the engine
+    /// census tests cycle it while other tests run concurrently in the same
+    /// process. Every engine happened to be bit-identical then (see the
+    /// `ducc_engine_*` namespace note in `vendor/ducc_ffi.cc` � the three
+    /// engines were running one engine's compiled code, so the poisoning was
+    /// undetectable), which is the only reason the suite was green. A thread
+    /// local keeps an override from leaking into a concurrently running parity
+    /// test.
+    static TEST_OVERRIDE: std::cell::Cell<Option<FftEngine>> = const { std::cell::Cell::new(None) };
+}
 
 /// Resolve and install the FFT engine from the `LD_FFT_ENGINE` env var (once
 /// per process). Called by the CLI before decoding starts; errors are fatal
@@ -156,8 +191,8 @@ fn eng() -> (
 ) {
     #[cfg(test)]
     {
-        if let Ok(g) = TEST_OVERRIDE.read() {
-            if let Some(e) = *g {
+        if let Some(e) = TEST_OVERRIDE.with(|c| c.get()) {
+            {
                 return match e {
                     FftEngine::Sse2 => (
                         duccq_sse2_fft,
@@ -288,8 +323,8 @@ pub fn ifft_batch_rows(k: usize, n: usize, x: &[Complex64], out: &mut [Complex64
 fn batch_ip_fn() -> unsafe extern "C" fn(c_int, c_int, *mut f64) {
     #[cfg(test)]
     {
-        if let Ok(g) = TEST_OVERRIDE.read() {
-            if let Some(e) = *g {
+        if let Some(e) = TEST_OVERRIDE.with(|c| c.get()) {
+            {
                 return match e {
                     FftEngine::Sse2 => duccq_sse2_ifft_batch_rows_ip,
                     FftEngine::Avx2Fma => duccq_avx2fma_ifft_batch_rows_ip,
@@ -629,7 +664,7 @@ mod tests {
             .iter()
             .map(|d| Complex64::new(d[0], d[1]))
             .collect();
-        *TEST_OVERRIDE.write().unwrap() = Some(e);
+        TEST_OVERRIDE.with(|c| c.set(Some(e)));
         let y = fft(&x);
         let mut cells = 0u64;
         let mut worst_rel = 0.0f64;
@@ -706,7 +741,7 @@ mod tests {
             want.len() * 2,
             worst_rel
         );
-        *TEST_OVERRIDE.write().unwrap() = None;
+        TEST_OVERRIDE.with(|c| c.set(None));
     }
 
     #[test]
@@ -727,6 +762,14 @@ mod tests {
     /// opt-in, which hands the plan the SIMD type index that the 1-D entry
     /// point never passes; it is bit-exact because each SIMD lane runs the same
     /// operation sequence for its own transform.
+    ///
+    /// That bit-exactness holds **only for the parity reference engine**. A
+    /// 4-lane engine evaluates a different decomposition of the same transform
+    /// (`FftEngine::is_parity_reference`), so for those engines the two
+    /// comparisons in this test are censused and printed instead of asserted;
+    /// what remains asserted for them is that the batch is well-formed (right
+    /// length, all values finite), which is all "the batching is harmless" can
+    /// mean for an engine that does not reproduce the reference rounding.
     #[test]
     fn ifft_batch_matches_scalar_transforms() {
         let n = 32768usize;
@@ -750,7 +793,7 @@ mod tests {
             ((st >> 11) as f64 / (1u64 << 53) as f64) - 0.5
         };
         for engine in engines {
-        *TEST_OVERRIDE.write().unwrap() = Some(*engine);
+        TEST_OVERRIDE.with(|c| c.set(Some(*engine)));
         for k in [1usize, 2, 3, 4, 6, 8] {
             let mut x = vec![Complex64::new(0.0, 0.0); k * n];
             // Row 0 is the scipy 1.18 golden input, so the batch is also
@@ -769,37 +812,72 @@ mod tests {
             }
             let mut got = vec![Complex64::new(0.0, 0.0); k * n];
             ifft_batch_rows(k, n, &x, &mut got);
+            let parity = engine.is_parity_reference();
+            let mut rowdiff = 0usize;
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-                assert_eq!(
-                    g.re.to_bits(),
-                    w.re.to_bits(),
-                    "batched ifft ({}) k={k} diverged at flat index {i} (re)",
-                    engine.name()
-                );
-                assert_eq!(
-                    g.im.to_bits(),
-                    w.im.to_bits(),
-                    "batched ifft ({}) k={k} diverged at flat index {i} (im)",
-                    engine.name()
+                assert!(g.re.is_finite() && g.im.is_finite(), "non-finite output");
+                if g.re.to_bits() != w.re.to_bits() || g.im.to_bits() != w.im.to_bits() {
+                    rowdiff += 1;
+                    if parity {
+                        assert_eq!(
+                            g.re.to_bits(),
+                            w.re.to_bits(),
+                            "batched ifft ({}) k={k} diverged at flat index {i} (re)",
+                            engine.name()
+                        );
+                        assert_eq!(
+                            g.im.to_bits(),
+                            w.im.to_bits(),
+                            "batched ifft ({}) k={k} diverged at flat index {i} (im)",
+                            engine.name()
+                        );
+                    }
+                }
+            }
+            if !parity {
+                println!(
+                    "census: batched ifft ({}) k={k}: {rowdiff}/{} values differ from the scalar \
+                     per-transform path (expected for a 4-lane engine)",
+                    engine.name(),
+                    got.len()
                 );
             }
+            // Row 0 is the scipy input, so for the reference engine this
+            // pins the batch against the reference library's own numbers.
+            // The AVX2 engines are 4-lane and therefore evaluate a different
+            // (differently rounded) decomposition by construction — see
+            // `FftEngine::is_parity_reference` — so they are censused instead
+            // of asserted, and the count is printed rather than thrown.
+            let mut diff = 0usize;
             for i in 0..n {
-                assert_eq!(
-                    got[i].re.to_bits(),
-                    golden_inv[i].re.to_bits(),
-                    "batched ifft ({}) k={k} row 0 differs from the scipy golden at bin {i} (re)",
-                    engine.name()
-                );
-                assert_eq!(
-                    got[i].im.to_bits(),
-                    golden_inv[i].im.to_bits(),
-                    "batched ifft ({}) k={k} row 0 differs from the scipy golden at bin {i} (im)",
+                if engine.is_parity_reference() {
+                    assert_eq!(
+                        got[i].re.to_bits(),
+                        golden_inv[i].re.to_bits(),
+                        "batched ifft ({}) k={k} row 0 differs from the scipy golden at bin {i} (re)",
+                        engine.name()
+                    );
+                    assert_eq!(
+                        got[i].im.to_bits(),
+                        golden_inv[i].im.to_bits(),
+                        "batched ifft ({}) k={k} row 0 differs from the scipy golden at bin {i} (im)",
+                        engine.name()
+                    );
+                } else if got[i].re.to_bits() != golden_inv[i].re.to_bits()
+                    || got[i].im.to_bits() != golden_inv[i].im.to_bits()
+                {
+                    diff += 1;
+                }
+            }
+            if !engine.is_parity_reference() {
+                println!(
+                    "census: batched ifft ({}) k={k} row 0: {diff}/{n} bins differ from the scipy golden",
                     engine.name()
                 );
             }
         }
         }
-        *TEST_OVERRIDE.write().unwrap() = None;
+        TEST_OVERRIDE.with(|c| c.set(None));
     }
 
     /// The in-place batch entry has to be the *same* arithmetic as the
@@ -826,7 +904,7 @@ mod tests {
             ((st >> 11) as f64 / (1u64 << 53) as f64) - 0.5
         };
         for engine in engines {
-            *TEST_OVERRIDE.write().unwrap() = Some(*engine);
+            TEST_OVERRIDE.with(|c| c.set(Some(*engine)));
             for k in [1usize, 2, 3, 4, 6, 8] {
                 let mut x = vec![Complex64::new(0.0, 0.0); k * n];
                 // Row 0 is a real capture's own block spectrum, so the comparison
@@ -852,7 +930,7 @@ mod tests {
                 }
             }
         }
-        *TEST_OVERRIDE.write().unwrap() = None;
+        TEST_OVERRIDE.with(|c| c.set(None));
     }
 
     /// SIMD lane counts compiled into each engine: `(fft1d_simdlen<double>,
@@ -908,14 +986,14 @@ mod tests {
                 .collect();
             // Build plans for every engine first.
             for e in engines {
-                *TEST_OVERRIDE.write().unwrap() = Some(e);
+                TEST_OVERRIDE.with(|c| c.set(Some(e)));
                 let s = fft(&xc);
                 std::hint::black_box(&ifft(&s));
             }
             let mut res: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
             for _ in 0..9 {
                 for (i, e) in engines.iter().enumerate() {
-                    *TEST_OVERRIDE.write().unwrap() = Some(*e);
+                    TEST_OVERRIDE.with(|c| c.set(Some(*e)));
                     let iters = (1 << 20) / n;
                     let t0 = std::time::Instant::now();
                     for _ in 0..iters {
@@ -926,7 +1004,7 @@ mod tests {
                     res[i].push(t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
                 }
             }
-            *TEST_OVERRIDE.write().unwrap() = None;
+            TEST_OVERRIDE.with(|c| c.set(None));
             let mut line = format!("n={n:>6}:");
             for (i, e) in engines.iter().enumerate() {
                 res[i].sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -966,7 +1044,7 @@ mod tests {
         // timed sample.
         let mut buf = Vec::new();
         for e in engines {
-            *TEST_OVERRIDE.write().unwrap() = Some(e);
+            TEST_OVERRIDE.with(|c| c.set(Some(e)));
             let s = fft(&xc);
             std::hint::black_box(&ifft(&s));
             fft_real_full_into(&xr, &mut buf);
@@ -979,7 +1057,7 @@ mod tests {
         let iters = 20;
         for _ in 0..rounds {
             for (i, e) in engines.iter().enumerate() {
-                *TEST_OVERRIDE.write().unwrap() = Some(*e);
+                TEST_OVERRIDE.with(|c| c.set(Some(*e)));
                 let t0 = std::time::Instant::now();
                 for _ in 0..iters {
                     let s = fft(&xc);
@@ -997,7 +1075,7 @@ mod tests {
                 r2c[i].push(t1.elapsed().as_secs_f64() * 1e6 / iters as f64);
             }
         }
-        *TEST_OVERRIDE.write().unwrap() = None;
+        TEST_OVERRIDE.with(|c| c.set(None));
         for (i, e) in engines.iter().enumerate() {
             let med = |v: &mut Vec<f64>| {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1010,6 +1088,118 @@ mod tests {
                 c2c[i][0],
                 med(&mut r2c[i]),
                 r2c[i][0]
+            );
+        }
+    }
+
+    /// Per-call cost of each *call shape* the demod kernel issues, per engine.
+    ///
+    /// `engine_speed_census` above answers "which engine", but its c2c figure
+    /// is a single 1-D `fft`+`ifft` pair, i.e. the scalar `exec_simple` path
+    /// that ducc takes for one long transform. The production kernel never
+    /// calls it that way: it runs one scalar r2c forward per block and its
+    /// inverse transforms in vectorized batches (`ifft_batch_rows`). Those are
+    /// different kernels with different per-engine costs, and a regression in
+    /// either (or a toolchain change that silently drops a SIMD flag) would
+    /// not show up in the census above. This probe is the instrument for that
+    /// question; run it with `--ignored --nocapture` after any toolchain or
+    /// vendored-ducc update.
+    ///
+    /// Kept `#[ignore]`d because it takes ~40 s and reports timings rather
+    /// than asserting anything.
+    #[test]
+    #[ignore = "perf probe: prints a table, takes ~40 s"]
+    fn kernel_shape_speed_census() {
+        if !cpu_has_avx2() || !cpu_has_fma() {
+            println!("skip: CPU lacks avx2/fma");
+            return;
+        }
+        let n = 32768usize;
+        let xr: Vec<f64> = (0..n)
+            .map(|i| ((i as f64) * 0.3819660112501051).fract() - 0.5)
+            .collect();
+        let xk2: Vec<Complex64> = (0..2 * n)
+            .map(|i| {
+                Complex64::new(
+                    ((i as f64) * 0.38).fract() - 0.5,
+                    ((i as f64) * 0.11).fract(),
+                )
+            })
+            .collect();
+        let xk4: Vec<Complex64> = xk2.iter().copied().chain(xk2.iter().copied()).collect();
+        let xk8: Vec<Complex64> = xk4.iter().copied().chain(xk4.iter().copied()).collect();
+        let mut buf = Vec::new();
+        let mut outk4 = vec![Complex64::new(0.0, 0.0); 4 * n];
+        let mut outk2 = vec![Complex64::new(0.0, 0.0); 2 * n];
+        let mut outk8 = vec![Complex64::new(0.0, 0.0); 8 * n];
+
+        let engines = [FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma];
+        // Build every engine's plan first: plan construction at n=32768 is
+        // milliseconds, so a cold plan would swamp the timed samples.
+        for e in engines {
+            TEST_OVERRIDE.with(|c| c.set(Some(e)));
+            fft_real_full_into(&xr, &mut buf);
+            ifft_batch_rows(2, n, &xk2, &mut outk2);
+            ifft_batch_rows(4, n, &xk4, &mut outk4);
+            ifft_batch_rows(8, n, &xk8, &mut outk8);
+        }
+
+        let rounds = 13;
+        let iters = 12;
+        let mut fwd: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut c2: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut c4: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut c8: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for _ in 0..rounds {
+            for (i, e) in engines.iter().enumerate() {
+                TEST_OVERRIDE.with(|c| c.set(Some(*e)));
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    fft_real_full_into(&xr, &mut buf);
+                    std::hint::black_box(&buf);
+                }
+                fwd[i].push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    ifft_batch_rows(2, n, &xk2, &mut outk2);
+                    std::hint::black_box(&outk2);
+                }
+                c2[i].push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    ifft_batch_rows(4, n, &xk4, &mut outk4);
+                    std::hint::black_box(&outk4);
+                }
+                c4[i].push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    ifft_batch_rows(8, n, &xk8, &mut outk8);
+                    std::hint::black_box(&outk8);
+                }
+                c8[i].push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            }
+        }
+        TEST_OVERRIDE.with(|c| c.set(None));
+        println!("n=32768, median of {rounds} interleaved rounds, plan warm");
+        println!(
+            "{:8}  {:>8}  {:>9}  {:>7}  {:>9}  {:>7}  {:>9}  {:>7}",
+            "engine","r2c x1","bat k=2","/xform","bat k=4","/xform","bat k=8","/xform"
+        );
+        for (i, e) in engines.iter().enumerate() {
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let m = med(&mut fwd[i]);
+            let m2 = med(&mut c2[i]);
+            let m4 = med(&mut c4[i]);
+            let m8 = med(&mut c8[i]);
+            println!(
+                "{:8}  {:>8.0}  {:>9.0}  {:>7.1}  {:>9.0}  {:>7.1}  {:>9.0}  {:>7.1}",
+                e.name(), m, m2, m2 / 2.0, m4, m4 / 4.0, m8, m8 / 8.0
             );
         }
     }

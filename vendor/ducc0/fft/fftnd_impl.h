@@ -58,6 +58,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <numeric>
 #include <stdexcept>
 #include <memory>
@@ -733,6 +734,14 @@ DUCC0_NOINLINE void general_nd(const cfmav<T> &in, const vfmav<T> &out,
       bool inplace = (in.stride(axes[iax])==1) && (out.stride(axes[iax])==1) && (n_bunch==1);
       MR_assert(n_bunch<=nmax, "must not happen");
       TmpStorage<T,T0> storage(in.size()/len, len, max(plan->bufsize(),vplan->bufsize()), (n_bunch+vlen-1)/vlen, inplace);
+      // Codebuff dispatch probe (env-gated via DUCC_TRACE_SIMUL). Reports the
+      // state this call's ladder sees, so each engine's lane width and whether
+      // it engaged the batched path can be checked at run time instead of
+      // inferred. Cheap when the variable is unset: one cached flag read.
+      static const bool trace_simul = getenv("DUCC_TRACE_SIMUL") != nullptr;
+      if (trace_simul)
+        fprintf(stderr, "SIMUL len=%zu vlen=%zu n_simul=%zu n_bunch=%zu remaining=%zu nostride=%d\n",
+          len, (size_t)vlen, n_simul, n_bunch, (size_t)it.remaining(), (int)nostride);
 
       // first, do all possible steps of size n_bunch, then n_simul
       if (n_bunch>1)
@@ -741,6 +750,8 @@ DUCC0_NOINLINE void general_nd(const cfmav<T> &in, const vfmav<T> &out,
         if constexpr (vlen>1)
           {
           constexpr size_t lvlen = vlen;
+          if (trace_simul) fprintf(stderr, "  BR1 lvlen=%zu n_simul=%zu eq=%d rem=%zu\n",
+            lvlen, n_simul, (int)(n_simul==lvlen), (size_t)it.remaining());
           if (n_simul>=lvlen)
             {
             if ((n_bunch>n_simul) && (it.remaining()>=n_bunch))
