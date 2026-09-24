@@ -24,6 +24,29 @@ const REFERENCE_VERSION: &str = "release:7.3.0";
 /// `close`), so it is prepended then via an in-place rewrite of this file.
 const FIELDS_OPEN: &[u8] = b"{\"fields\":[";
 
+/// Whether a backfill re-write that lands at `fw2` still reaches the json entry
+/// that was pushed for the same field at `fw1`.
+///
+/// The reference's main loop drains the pending field-info dicts after a
+/// `readfield()` only when `ldd.fields_written < 100 || fields_written % 500 ==
+/// 0` (main.py:506), and `JSONDumper.write()` serializes whatever
+/// `fieldinfo.read()` hands it at that moment. `writeout` takes `fi` out of its
+/// dataset tuple, so a backfill re-write pushes the *same* dict object again:
+/// the earlier entry shows the re-processed values only while it is still
+/// pending, i.e. only if this re-write happens at or before the next drain.
+/// Below 100 the drain is that very field's own write, so a re-write never
+/// reaches back to an earlier entry.
+///
+/// Validated against every reference json on hand (735,000+ fields: Diamond
+/// Time CLV ldf, GGV1016 ldf, Pioneer GGV1069 ldf, s16 full, flac full,
+/// gain1010): this rule matches all 22 repeated-field entries, whereas the
+/// previous `fw1 >= 100` test mismatches the one at GGV1016 seqNo 69999
+/// (`fw1=69999`, `fw2=70001`, next drain 70000).
+fn json_alias_reaches_earlier(fw1: usize, fw2: usize) -> bool {
+    let next_drain = if fw1 < 100 { fw1 } else { fw1.div_ceil(500) * 500 };
+    fw2 <= next_drain
+}
+
 pub struct DecodeWriter {
     /// The picture stream. Boxed so the CLI can point it at stdout (`outfile
     /// == "-"`) instead of a `.tbc` file without a second code path; every
@@ -174,13 +197,27 @@ impl DecodeWriter {
 
         if self.json_file.is_some() {
             // Python's json dumper thread serializes the fi dicts by reference,
-            // but only drains them when the main loop calls write(): after every
-            // field while `fields_written < 100`, then only every 500. A backfill
-            // re-write of the same fi dict therefore lands BEFORE serialization
-            // only when the first write happened at fields_written >= 100 — the
-            // earlier json entry then shows the re-processed efmTValues (the DB,
-            // snapshotted per INSERT, always keeps its own). Below 100 the entry
-            // serializes with its own value. Replicate that split rule.
+            // but only drains them when the main loop calls write():
+            //
+            //     if ldd.fields_written < 100 or (ldd.fields_written % 500) == 0:
+            //         jsondumper.write()          # main.py:506
+            //
+            // i.e. after every field for the first 100, then at each 500-field
+            // boundary. `writeout` gets `fi` out of its dataset tuple, so a
+            // backfill re-write of a field pushes the *same* dict object again;
+            // the earlier json entry therefore shows the re-processed
+            // efmTValues only if this re-write happened at or before the next
+            // drain — once that drain has run, the entry was already serialized
+            // with its own values. (The DB is snapshotted per INSERT and always
+            // keeps its own.) Below 100 the next drain *is* this field's own
+            // write, so a re-write never reaches the earlier entry.
+            //
+            // Checked against every reference json on hand — Diamond Time ldf
+            // 71,710 fields, s16 168,800, gain1010 167,588, GGV1016 108,576,
+            // flac-s300 168,566, Pioneer GGV1069 50,722 — this rule has no
+            // violation; `orig_fw >= 100` has one, at GGV1016 seqNo 69999
+            // (fw1=69999, fw2=70001, next drain 70000), where Python keeps the
+            // entry's own 20265 and the old rule overwrote it with 20293.
             let dup_at = self
                 .json_entries
                 .iter()
@@ -189,7 +226,7 @@ impl DecodeWriter {
             self.json_entries.push(field.info.clone());
             self.json_push_fields.push(self.field_count);
             if let Some((i, orig_fw)) = dup_at {
-                if orig_fw >= 100 {
+                if json_alias_reaches_earlier(orig_fw, self.field_count) {
                     let prev = &mut self.json_entries[i];
                     prev.efm_t_values = field.info.efm_t_values;
                     prev.audio_samples = field.info.audio_samples;
@@ -407,4 +444,34 @@ fn write_i16_slice(file: &mut dyn Write, values: &[i16]) -> Result<()> {
     }
     file.write_all(&bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_alias_reaches_earlier;
+
+    #[test]
+    fn alias_stops_at_the_reference_drain_grid() {
+        // GGV1016 seqNo 69999: pushed at fw1=69999, re-written at fw2=70001.
+        // The 70000 drain serialized the earlier entry first, so Python keeps
+        // that entry's own 20265 (the old `fw1 >= 100` test overwrote it with
+        // the re-processed 20293).
+        assert!(!json_alias_reaches_earlier(69_999, 70_001));
+        assert!(!json_alias_reaches_earlier(69_998, 70_001));
+        // Same 500-block: the re-write lands before the drain, so the shared
+        // dict is still pending and both entries show the re-processed values.
+        assert!(json_alias_reaches_earlier(69_800, 69_802));
+        assert!(json_alias_reaches_earlier(69_900, 69_999));
+        // Exactly on the drain point: the re-write happened during that
+        // iteration, before the drain that follows it.
+        assert!(json_alias_reaches_earlier(69_995, 70_000));
+        // Below 100 the drain is per field, so a re-write never reaches back.
+        assert!(!json_alias_reaches_earlier(99, 101));
+        assert!(!json_alias_reaches_earlier(50, 52));
+        // The first entry already past 100 still aliases within its block (the
+        // ldf lead-in skip-back pairs).
+        assert!(json_alias_reaches_earlier(100, 102));
+        assert!(json_alias_reaches_earlier(100, 500));
+        assert!(!json_alias_reaches_earlier(100, 501));
+    }
 }
