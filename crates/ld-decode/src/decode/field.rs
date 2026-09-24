@@ -2321,15 +2321,15 @@ impl Field {
         let bstart = (bstime * lfreq) as usize;
         let bend = (betime * lfreq) as usize;
 
-        // Python slices `demod_burst[s+bstart : s+bend]` and only bails when
-        // that slice is empty; a partially out-of-range slice is used as-is.
-        let burst_len = self.data.video.demod_burst.len();
-        let demod_len = self.data.video.demod.len();
-        if s + bstart >= burst_len || s + bstart >= demod_len {
+        let Some((start, end)) = burst_window(
+            s,
+            bstart,
+            bend,
+            self.data.video.demod_burst.len(),
+            self.data.video.demod.len(),
+        ) else {
             return (None, 0.0);
-        }
-        let start = s + bstart;
-        let end = (s + bend).min(burst_len).min(demod_len);
+        };
         let burstarea_raw = &self.data.video.demod_burst[start..end];
         let mean = mean_f32(burstarea_raw);
         let burstarea: Vec<f32> = burstarea_raw.iter().map(|&v| v - mean).collect();
@@ -2779,6 +2779,36 @@ impl Field {
 // clb_findbursts (utils.clb_findbursts)
 // ---------------------------------------------------------------------------
 
+/// The burst window Python slices for one line, `demod_burst[s+bstart : s+bend]`,
+/// intersected with the two demod arrays.
+///
+/// `None` is Python's `if len(burstarea) == 0: return None, None` early return in
+/// `compute_line_bursts`, and it is a real case rather than a theoretical one: a
+/// degenerate, sub-sample line length drives `lfreq` low enough that `bstart` and
+/// `bend` truncate to the same sample, so the slice is empty.  Python then passes
+/// `len(burstarea) - 1 == -1` as `endburstarea` and `clb_findbursts`'s loop body
+/// never runs; written literally that is a `usize` underflow indexing an empty
+/// slice, which panicked mid-capture on the GGV1016 CAV side-1 disc (a single
+/// degenerate lineloc is enough; it needs no no-signal region).  Reporting the
+/// empty window here keeps the caller on Python's path (`rising is None` ->
+/// `continue`).
+#[inline]
+fn burst_window(
+    s: usize,
+    bstart: usize,
+    bend: usize,
+    burst_len: usize,
+    demod_len: usize,
+) -> Option<(usize, usize)> {
+    let start = s + bstart;
+    let end = (s + bend).min(burst_len).min(demod_len);
+    if start >= burst_len || start >= demod_len || end <= start {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn clb_findbursts(
     isrising: &mut [bool; 16],
@@ -2988,4 +3018,35 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
     };
 
     (m_synchz, m_ire0hz, m_ire100hz)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::burst_window;
+
+    #[test]
+    fn normal_window_is_a_half_open_slice() {
+        // burst of ~7 usec at ~40 MHz: bstart=230, bend=300 samples.
+        assert_eq!(burst_window(100, 230, 300, 100_000, 100_000), Some((330, 400)));
+        // A partial slice past the array end is clamped to it, not rejected.
+        assert_eq!(burst_window(99_750, 230, 300, 100_000, 100_000), Some((99_980, 100_000)));
+        // The shorter of the two demod arrays bounds the end.
+        assert_eq!(burst_window(900, 0, 200, 1000, 950), Some((900, 950)));
+    }
+
+    #[test]
+    fn empty_window_is_reported_instead_of_underflowing() {
+        // The GGV1016 CAV side-1 case: a degenerate, sub-sample line length
+        // makes `lfreq` small enough that `bstart` and `bend` both truncate to
+        // 0, so Python's `demod_burst[s+0 : s+0]` is empty and
+        // `len(burstarea) - 1` becomes -1.  Anything other than `None` here
+        // panics in `clb_findbursts` (index 0 of a length-0 slice).
+        assert_eq!(burst_window(50_000, 0, 0, 100_000, 100_000), None);
+        // Python slices out of range to empty as well.
+        assert_eq!(burst_window(100_000, 0, 200, 100_000, 100_000), None);
+        assert_eq!(burst_window(100_000, 230, 300, 100_000, 100_000), None);
+        // Same, driven by the shorter of the two arrays.
+        assert_eq!(burst_window(950, 0, 200, 1000, 950), None);
+        assert_eq!(burst_window(950, 230, 300, 1000, 950), None);
+    }
 }
