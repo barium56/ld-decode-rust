@@ -119,7 +119,12 @@ fn unpack_r30(b: &[u8], out: &mut [f32]) {
 fn open_stdin(format: SampleFormat) -> Result<Input> {
     let raw = |bytes: usize, samples: usize, decode: fn(&[u8], &mut [f32])| -> Result<Input> {
         Ok(Input {
-            source: Box::new(PipeSource::new(Box::new(std::io::stdin()), bytes, samples, decode)),
+            source: Box::new(PipeSource::new(
+                Box::new(DrainReader::spawn(Box::new(std::io::stdin()))),
+                bytes,
+                samples,
+                decode,
+            )),
             container_rate_hz: None,
         })
     };
@@ -159,6 +164,71 @@ fn flac_sample_rate(buf: &[u8]) -> Option<u32> {
             let rate = (u32::from(si[10]) << 12) | (u32::from(si[11]) << 4) | u32::from(si[12] >> 4);
             (rate > 0).then_some(rate)
         })
+}
+
+/// Bytes per block the drain thread hands over.
+const DRAIN_BLOCK: usize = 1 << 20;
+/// Blocks the drain queue may hold before it stops reading (512 MiB, ~7 s of a
+/// 75 MB/s live capture).
+const DRAIN_QUEUE_BLOCKS: usize = 512;
+
+/// Empties a live pipe on its own thread into a bounded queue of large blocks.
+/// The decoder is bursty (MTF/AGC redos, lead-in); read on demand, the pipe's
+/// small OS buffer fills during a stall and the writer drops blocks. The queue
+/// absorbs those stalls and turns thousands of small reads into 1 MiB ones. Once
+/// it is full the thread blocks, so the writer sees ordinary back-pressure.
+struct DrainReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    pos: usize,
+}
+
+impl DrainReader {
+    fn spawn(mut input: Box<dyn Read + Send>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DRAIN_QUEUE_BLOCKS);
+        std::thread::spawn(move || loop {
+            let mut block = vec![0u8; DRAIN_BLOCK];
+            let mut filled = 0usize;
+            while filled < block.len() {
+                match input.read(&mut block[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+            block.truncate(filled);
+            let eof = filled < DRAIN_BLOCK;
+            // A closed receiver means the decode is over: stop quietly.
+            if (filled > 0 && tx.send(Ok(block)).is_err()) || eof {
+                return;
+            }
+        });
+        Self { rx, current: Vec::new(), pos: 0 }
+    }
+}
+
+impl Read for DrainReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.current.len() {
+            match self.rx.recv() {
+                Ok(Ok(block)) => {
+                    self.current = block;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                // Sender gone: the pipe reached EOF.
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.current.len() - self.pos);
+        out[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 /// Raw / packed capture read from a pipe: forward-only, so a seek can only
