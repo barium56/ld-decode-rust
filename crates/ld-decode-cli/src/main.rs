@@ -30,14 +30,19 @@ use writer::DecodeWriter;
     about = "Decode raw RF Laserdisc captures (NTSC) into a TBC picture and JSON metadata"
 )]
 struct Args {
-    /// Source file (.lds, .s16, .r16, .rf, .r30)
+    /// Source file (.lds, .s16, .r16, .rf, .r30, .ldf, .flac); "-" reads
+    /// stdin (needs --format; --start/--seek can only skip forward there)
     infile: String,
     /// Base name for the output .tbc and .tbc.json files; "-" streams the
     /// .tbc picture to stdout (sidecar outputs are then disabled)
     outfile: String,
-    /// Input sample rate in MHz
-    #[arg(long, default_value_t = 40.0)]
-    inputfreq: f64,
+    /// Input sample format; default: inferred from the file extension
+    #[arg(long, value_enum)]
+    format: Option<reader::SampleFormat>,
+    /// Input sample rate in MHz (default: the rate in the .flac/.ldf
+    /// metadata, read as kHz = MHz, else 40)
+    #[arg(long)]
+    inputfreq: Option<f64>,
     /// MTF compensation multiplier
     #[arg(long, default_value_t = 1.0)]
     mtf: f64,
@@ -189,8 +194,26 @@ fn main() -> Result<()> {
         .init();
     }
 
+    // Opened before the decoder spec is built: a .flac/.ldf header supplies
+    // the input sample rate.
+    let format = match args.format {
+        Some(f) => f,
+        None => reader::infer_format(&args.infile)?,
+    };
+    let input = reader::open_input(&args.infile, format)?;
+    let inputfreq = match (args.inputfreq, input.container_rate_hz) {
+        (Some(f), _) => f,
+        (None, Some(hz)) => {
+            // The container rate is the RF rate in kHz (`-ar 40k` = 40 MHz).
+            let f = f64::from(hz) / 1000.0;
+            tracing::info!("Input sample rate {f} MHz (from the FLAC metadata, {hz} Hz)");
+            f
+        }
+        (None, None) => 40.0,
+    };
+
     let mut request = DecodeRequest::default();
-    request.inputfreq = args.inputfreq;
+    request.inputfreq = inputfreq;
     request.system = ColorSystem::Ntsc;
     request.mtf_level = args.mtf;
     request.mtf_offset = args.mtf_offset;
@@ -236,11 +259,7 @@ fn main() -> Result<()> {
         spec.output_lines()
     );
 
-    let format = reader::infer_format(&args.infile)?;
-    let file = File::open(&args.infile)
-        .with_context(|| format!("opening {}", args.infile))?;
-    let source = reader::open_source(&args.infile, file, format)?;
-    let mut reader = DecodeReader::new(source);
+    let mut reader = DecodeReader::new(input.source);
 
     let outfile = args.outfile.clone();
     let luma: Box<dyn std::io::Write + Send> = if to_stdout {

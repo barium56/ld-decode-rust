@@ -5,23 +5,28 @@
 //! `load_unpacked_data_float32`).
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Context as _, Result};
 use claxon::FlacReader;
 
-/// Input encoding of a raw capture.
-#[derive(Clone, Copy, Debug)]
+/// Input encoding of a raw capture (the `--format` values).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum SampleFormat {
     /// Little-endian `i16`, one sample per word (`.s16`).
+    #[value(name = "s16")]
     S16Le,
     /// Little-endian `u16`, one sample per word (`.r16` / `.u16`).
+    #[value(name = "r16", alias = "u16")]
     U16Le,
     /// Little-endian `f32` * 32768 (`.rf`).
+    #[value(name = "rf")]
     F32Le,
     /// Packed 10-bit DdD format (`.lds`): 4 samples per 5 bytes.
+    #[value(name = "lds")]
     Lds,
     /// Packed 10-bit `.r30` format: 3 samples per 4 bytes (deprecated).
+    #[value(name = "r30")]
     R30,
     /// FLAC-in-Ogg `.ldf` capture (lossless; see `LdfSource`).
     Ldf,
@@ -49,29 +54,271 @@ pub fn infer_format(path: &str) -> Result<SampleFormat> {
         "r30" => Ok(SampleFormat::R30),
         "ldf" => Ok(SampleFormat::Ldf),
         "flac" => Ok(SampleFormat::Flac),
-        other => bail!("cannot infer sample format from extension .{other}"),
+        other => bail!("cannot infer sample format from extension .{other}; use --format"),
     }
 }
 
-/// Open a raw sample source (regular file). Stdin is not supported for the
-/// initial port. `path` is used by the `.ldf` source to reopen the file when
-/// seeking.
-pub fn open_source(path: &str, file: File, format: SampleFormat) -> Result<Box<dyn SampleSource>> {
+/// Container rate assumed for a FLAC capture whose STREAMINFO cannot be read.
+/// ld-decode and the DdD tools write the capture with `-ar 40k`: the declared
+/// rate in kHz *is* the RF sample rate in MHz.
+const DEFAULT_FLAC_RATE_HZ: u32 = 40_000;
+
+/// An opened input: the sample stream plus the rate declared by the capture's
+/// own metadata, when it has any.
+pub struct Input {
+    pub source: Box<dyn SampleSource>,
+    /// FLAC STREAMINFO sample rate in Hz (`.flac` / `.ldf`). For RF captures
+    /// this is the RF rate in kHz (the "40k fiction"), i.e. MHz * 1000.
+    pub container_rate_hz: Option<u32>,
+}
+
+/// Open `path` (`-` = stdin) as `format`.
+pub fn open_input(path: &str, format: SampleFormat) -> Result<Input> {
+    if path == "-" {
+        return open_stdin(format);
+    }
+    let mut file = File::open(path).with_context(|| format!("opening {path}"))?;
+    let container_rate_hz = if matches!(format, SampleFormat::Ldf | SampleFormat::Flac) {
+        let mut head = vec![0u8; PROBE_WINDOW];
+        let n = read_fully(&mut file, &mut head)?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking {path}"))?;
+        flac_sample_rate(&head[..n])
+    } else {
+        None
+    };
+    let source = open_source(path, file, format, container_rate_hz.unwrap_or(DEFAULT_FLAC_RATE_HZ))?;
+    Ok(Input { source, container_rate_hz })
+}
+
+/// Open a raw sample source (regular file). `path` is used by the FLAC/`.ldf`
+/// sources to reopen the file when seeking; `rate_hz` is the FLAC container
+/// rate (ffmpeg seeks by stream time).
+fn open_source(path: &str, file: File, format: SampleFormat, rate_hz: u32) -> Result<Box<dyn SampleSource>> {
     Ok(match format {
         SampleFormat::S16Le => Box::new(RawSource::new(file, 2, widen_s16)),
         SampleFormat::U16Le => Box::new(RawSource::new(file, 2, widen_u16)),
         SampleFormat::F32Le => Box::new(RawSource::new(file, 4, widen_f32)),
-        SampleFormat::Lds => Box::new(PackedSource::new(file, 4, 5, |b, out| {
-            let s = unpack_lds_group(b);
-            out[..4].copy_from_slice(&s);
-        })),
-        SampleFormat::R30 => Box::new(PackedSource::new(file, 3, 4, |b, out| {
-            let s = unpack_r30_group(b);
-            out[..3].copy_from_slice(&s);
-        })),
-        SampleFormat::Ldf => open_ldf(path, file)?,
-        SampleFormat::Flac => open_raw_flac(path, file, 0)?,
+        SampleFormat::Lds => Box::new(PackedSource::new(file, 4, 5, unpack_lds)),
+        SampleFormat::R30 => Box::new(PackedSource::new(file, 3, 4, unpack_r30)),
+        SampleFormat::Ldf => open_ldf(path, file, rate_hz)?,
+        SampleFormat::Flac => open_raw_flac(path, file, 0, rate_hz)?,
     })
+}
+
+fn unpack_lds(b: &[u8], out: &mut [f32]) {
+    out[..4].copy_from_slice(&unpack_lds_group(b));
+}
+
+fn unpack_r30(b: &[u8], out: &mut [f32]) {
+    out[..3].copy_from_slice(&unpack_r30_group(b));
+}
+
+/// Open stdin. Raw formats are decoded in-process; FLAC/`.ldf` go through an
+/// ffmpeg child (claxon and the Ogg reader both need a seekable file).
+fn open_stdin(format: SampleFormat) -> Result<Input> {
+    let raw = |bytes: usize, samples: usize, decode: fn(&[u8], &mut [f32])| -> Result<Input> {
+        Ok(Input {
+            source: Box::new(PipeSource::new(
+                Box::new(DrainReader::spawn(Box::new(std::io::stdin()))),
+                bytes,
+                samples,
+                decode,
+            )),
+            container_rate_hz: None,
+        })
+    };
+    match format {
+        SampleFormat::S16Le => raw(2, 1, widen_s16),
+        SampleFormat::U16Le => raw(2, 1, widen_u16),
+        SampleFormat::F32Le => raw(4, 1, widen_f32),
+        SampleFormat::Lds => raw(5, 4, unpack_lds),
+        SampleFormat::R30 => raw(4, 3, unpack_r30),
+        SampleFormat::Ldf | SampleFormat::Flac => {
+            let mut head = vec![0u8; PROBE_WINDOW];
+            let n = read_fully(&mut std::io::stdin().lock(), &mut head)?;
+            head.truncate(n);
+            let rate = flac_sample_rate(&head);
+            let source = FfmpegFlacSource::spawn_stdin(head, rate.unwrap_or(DEFAULT_FLAC_RATE_HZ))
+                .context("reading FLAC/.ldf from stdin needs ffmpeg on PATH")?;
+            Ok(Input { source: Box::new(source), container_rate_hz: rate })
+        }
+    }
+}
+
+/// Sample rate (Hz) from the FLAC STREAMINFO block in `buf`, found by its
+/// `fLaC` marker: bare FLAC has it at the start, Ogg-FLAC inside the first
+/// packet.
+fn flac_sample_rate(buf: &[u8]) -> Option<u32> {
+    buf.windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"fLaC")
+        .find_map(|(at, _)| {
+            // Metadata block header (type 0 = STREAMINFO, length 34), then
+            // STREAMINFO bytes 10..13 start with the 20-bit sample rate.
+            let b = buf.get(at + 4..at + 4 + 4 + 13)?;
+            if b[0] & 0x7f != 0 || b[1..4] != [0, 0, 34] {
+                return None;
+            }
+            let si = &b[4..];
+            let rate = (u32::from(si[10]) << 12) | (u32::from(si[11]) << 4) | u32::from(si[12] >> 4);
+            (rate > 0).then_some(rate)
+        })
+}
+
+/// Bytes per block the drain thread hands over.
+const DRAIN_BLOCK: usize = 1 << 20;
+/// Blocks the drain queue may hold before it stops reading (512 MiB, ~7 s of a
+/// 75 MB/s live capture).
+const DRAIN_QUEUE_BLOCKS: usize = 512;
+
+/// Empties a live pipe on its own thread into a bounded queue of large blocks.
+/// The decoder is bursty (MTF/AGC redos, lead-in); read on demand, the pipe's
+/// small OS buffer fills during a stall and the writer drops blocks. The queue
+/// absorbs those stalls and turns thousands of small reads into 1 MiB ones. Once
+/// it is full the thread blocks, so the writer sees ordinary back-pressure.
+struct DrainReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    pos: usize,
+}
+
+impl DrainReader {
+    fn spawn(mut input: Box<dyn Read + Send>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DRAIN_QUEUE_BLOCKS);
+        std::thread::spawn(move || loop {
+            let mut block = vec![0u8; DRAIN_BLOCK];
+            let mut filled = 0usize;
+            while filled < block.len() {
+                match input.read(&mut block[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+            block.truncate(filled);
+            let eof = filled < DRAIN_BLOCK;
+            // A closed receiver means the decode is over: stop quietly.
+            if (filled > 0 && tx.send(Ok(block)).is_err()) || eof {
+                return;
+            }
+        });
+        Self { rx, current: Vec::new(), pos: 0 }
+    }
+}
+
+impl Read for DrainReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.current.len() {
+            match self.rx.recv() {
+                Ok(Ok(block)) => {
+                    self.current = block;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                // Sender gone: the pipe reached EOF.
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.current.len() - self.pos);
+        out[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Raw / packed capture read from a pipe: forward-only, so a seek can only
+/// skip ahead (decoding and dropping the samples in between).
+struct PipeSource {
+    input: Box<dyn Read + Send>,
+    group_bytes: usize,
+    samples_per_group: usize,
+    /// Decodes one `group_bytes` group into `samples_per_group` samples.
+    decode: fn(&[u8], &mut [f32]),
+    /// Tail of a group that did not fit the caller's buffer.
+    pending: Vec<f32>,
+    /// Absolute index of the next sample `read` will return.
+    pos: u64,
+}
+
+impl PipeSource {
+    fn new(
+        input: Box<dyn Read + Send>,
+        group_bytes: usize,
+        samples_per_group: usize,
+        decode: fn(&[u8], &mut [f32]),
+    ) -> Self {
+        Self {
+            input,
+            group_bytes,
+            samples_per_group,
+            decode,
+            pending: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl SampleSource for PipeSource {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        let mut written = 0usize;
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(out.len());
+            out[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            written = n;
+        }
+        let spg = self.samples_per_group;
+        let whole = (out.len() - written) / spg;
+        let mut buf = vec![0u8; whole * self.group_bytes];
+        let filled = read_fully(&mut self.input, &mut buf)?;
+        let groups = filled / self.group_bytes;
+        for g in 0..groups {
+            (self.decode)(
+                &buf[g * self.group_bytes..(g + 1) * self.group_bytes],
+                &mut out[written + g * spg..],
+            );
+        }
+        written += groups * spg;
+        // Fill the sub-group remainder of `out` from one more group.
+        if groups == whole && written < out.len() {
+            let mut group = vec![0u8; self.group_bytes];
+            if read_fully(&mut self.input, &mut group)? == self.group_bytes {
+                let mut samples = vec![0f32; spg];
+                (self.decode)(&group, &mut samples);
+                let n = out.len() - written;
+                out[written..].copy_from_slice(&samples[..n]);
+                self.pending.extend_from_slice(&samples[n..]);
+                written += n;
+            }
+        }
+        self.pos += written as u64;
+        Ok(written)
+    }
+
+    fn seek_samples(&mut self, sample: u64) -> Result<()> {
+        if sample < self.pos {
+            bail!(
+                "stdin is not seekable: cannot go back to sample {sample} (already at {})",
+                self.pos
+            );
+        }
+        let mut scratch = vec![0f32; 65536];
+        let mut remaining = sample - self.pos;
+        while remaining > 0 {
+            let want = remaining.min(scratch.len() as u64) as usize;
+            let n = self.read(&mut scratch[..want])?;
+            if n == 0 {
+                break;
+            }
+            remaining -= n as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Container of a FLAC capture.
@@ -101,7 +348,7 @@ fn find_container(buf: &[u8]) -> Option<(Container, usize)> {
 }
 
 /// Read as much of `file` as fits in `buf`, tolerating short reads.
-fn read_fully(file: &mut File, buf: &mut [u8]) -> Result<usize> {
+fn read_fully(file: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
     let mut filled = 0usize;
     while filled < buf.len() {
         match file.read(&mut buf[filled..]) {
@@ -145,7 +392,7 @@ fn unrecognised(path: &str, head: &[u8], size: u64) -> String {
 /// itself: a `.ldf` holding a bare FLAC stream (capture tools that skip the Ogg
 /// wrapper, files re-encoded later) must decode here too. Assuming `OggS` at
 /// offset 0 failed those files with "No Ogg capture pattern found".
-fn open_ldf(path: &str, mut file: File) -> Result<Box<dyn SampleSource>> {
+fn open_ldf(path: &str, mut file: File, rate_hz: u32) -> Result<Box<dyn SampleSource>> {
     let mut head = vec![0u8; PROBE_WINDOW];
     let n = read_fully(&mut file, &mut head)?;
     head.truncate(n);
@@ -165,7 +412,7 @@ fn open_ldf(path: &str, mut file: File) -> Result<Box<dyn SampleSource>> {
         // Bare FLAC follows the `.flac` route (ffmpeg first, claxon fallback),
         // but ffmpeg only probes the stream from offset 0 -- a shifted marker
         // goes straight to claxon positioned on it.
-        Container::Flac if offset == 0 => open_raw_flac(path, file, 0),
+        Container::Flac if offset == 0 => open_raw_flac(path, file, 0, rate_hz),
         Container::Flac => Ok(Box::new(RawFlacSource::open(path, file, offset)?)),
     }
 }
@@ -173,9 +420,9 @@ fn open_ldf(path: &str, mut file: File) -> Result<Box<dyn SampleSource>> {
 /// Open a bare-FLAC capture: ffmpeg child first (C-speed decode, s16 semantics
 /// identical to the Python reference's PyAV resampler), claxon fallback at
 /// `offset` when ffmpeg is unavailable or cannot probe the stream.
-fn open_raw_flac(path: &str, mut file: File, offset: u64) -> Result<Box<dyn SampleSource>> {
+fn open_raw_flac(path: &str, mut file: File, offset: u64, rate_hz: u32) -> Result<Box<dyn SampleSource>> {
     if offset == 0 && std::env::var_os("LD_NO_FFMPEG").is_none() {
-        if let Ok(src) = FfmpegFlacSource::spawn(path, 0) {
+        if let Ok(src) = FfmpegFlacSource::spawn(path, 0, rate_hz) {
             return Ok(Box::new(src));
         }
     }
@@ -627,12 +874,18 @@ struct FfmpegFlacSource {
     out_pos: usize,
     /// Samples to skip before serving the first sample (see `spawn`).
     discard: u64,
+    /// FLAC container rate in Hz: ffmpeg seeks by stream time.
+    rate_hz: u32,
+    /// Fed from stdin: forward-only, `seek_samples` can only skip ahead.
+    from_stdin: bool,
+    /// Absolute index of the next sample `read` returns (stdin seeks only).
+    pos: u64,
 }
 
 impl FfmpegFlacSource {
     /// Spawn `ffmpeg` decoding `path`, positioned at (or just before) sample
     /// `from_sample`. The container rate is 40 kHz fiction = one RF sample per
-    /// stream unit; `-ss` seeks by stream time.
+    /// stream unit (`rate_hz` per second); `-ss` seeks by stream time.
     ///
     /// `-ss` is placed AFTER `-i` (output seeking): on these raw FLAC files the
     /// demuxer has no seek table, so input-side `-ss` guesses a byte offset from
@@ -648,7 +901,7 @@ impl FfmpegFlacSource {
     /// target exceeds the proven range, spawn from the start (`-ss 0`) and
     /// discard the exact sample count in the reader — same full-file decode
     /// cost, guaranteed to deliver.
-    fn spawn(path: &str, from_sample: u64) -> Result<Self> {
+    fn spawn(path: &str, from_sample: u64, rate_hz: u32) -> Result<Self> {
         if std::env::var_os("LD_TRACE_SEEK").is_some() {
             ld_decode::teeprintln!("FFMPEG SPAWN from_sample={from_sample}");
         }
@@ -656,7 +909,7 @@ impl FfmpegFlacSource {
         let (seconds, discard) = if from_sample > MAX_SS_SAMPLE {
             (0.0, from_sample)
         } else {
-            (from_sample as f64 / 40_000.0, 0)
+            (from_sample as f64 / f64::from(rate_hz), 0)
         };
         if std::env::var_os("LD_TRACE_SEEK").is_some() {
             ld_decode::teeprintln!("FFMPEG SPAWN -ss={seconds:.6}s discard={discard}");
@@ -686,6 +939,54 @@ impl FfmpegFlacSource {
             out_bytes: Vec::new(),
             out_pos: 0,
             discard,
+            rate_hz,
+            from_stdin: false,
+            pos: 0,
+        })
+    }
+
+    /// Spawn `ffmpeg` decoding a FLAC / Ogg-FLAC stream arriving on our stdin.
+    /// `head` is what was already consumed to probe the container; a pump
+    /// thread replays it, then forwards the rest of stdin.
+    fn spawn_stdin(head: Vec<u8>, rate_hz: u32) -> Result<Self> {
+        if std::env::var_os("LD_NO_FFMPEG").is_some() {
+            bail!("LD_NO_FFMPEG is set");
+        }
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-v")
+            .arg("error")
+            .arg("-i")
+            .arg("pipe:0")
+            .arg("-f")
+            .arg("s16le")
+            .arg("-ac")
+            .arg("1")
+            .arg("pipe:1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().context("spawning ffmpeg for stdin decode")?;
+        demote_child_priority(&child);
+        let mut sink = child.stdin.take().context("ffmpeg stdin")?;
+        std::thread::spawn(move || {
+            if sink.write_all(&head).is_err() {
+                return;
+            }
+            // Ends on stdin EOF or when ffmpeg exits; dropping `sink` then
+            // closes ffmpeg's input.
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut sink);
+        });
+        let stdout = child.stdout.take().context("ffmpeg stdout")?;
+        Ok(Self {
+            path: "-".to_string(),
+            child,
+            out: std::io::BufReader::with_capacity(1 << 20, stdout),
+            out_bytes: Vec::new(),
+            out_pos: 0,
+            discard: 0,
+            rate_hz,
+            from_stdin: true,
+            pos: 0,
         })
     }
 
@@ -742,13 +1043,25 @@ impl SampleSource for FfmpegFlacSource {
             written += n;
             self.out_pos += n * 2;
         }
+        self.pos += written as u64;
         Ok(written)
     }
 
     fn seek_samples(&mut self, sample: u64) -> Result<()> {
+        if self.from_stdin {
+            if sample < self.pos {
+                bail!(
+                    "stdin is not seekable: cannot go back to sample {sample} (already at {})",
+                    self.pos
+                );
+            }
+            self.discard += sample - self.pos;
+            self.pos = sample;
+            return Ok(());
+        }
         let target = flac_pyseek(sample);
         self.kill();
-        *self = Self::spawn(&self.path, target)?;
+        *self = Self::spawn(&self.path, target, self.rate_hz)?;
         Ok(())
     }
 }
@@ -934,5 +1247,40 @@ impl SampleSource for NullSource {
     }
     fn seek_samples(&mut self, _sample: u64) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sample_rate_tests {
+    use super::*;
+
+    /// `fLaC` + STREAMINFO header + a STREAMINFO body declaring `rate` Hz.
+    fn header(prefix: &[u8], rate: u32) -> Vec<u8> {
+        let mut v = prefix.to_vec();
+        v.extend_from_slice(b"fLaC");
+        v.extend_from_slice(&[0x80, 0, 0, 34]);
+        let mut si = [0u8; 34];
+        si[10] = (rate >> 12) as u8;
+        si[11] = (rate >> 4) as u8;
+        si[12] = ((rate & 0xf) << 4) as u8;
+        v.extend_from_slice(&si);
+        v
+    }
+
+    #[test]
+    fn reads_rate_from_bare_flac() {
+        assert_eq!(flac_sample_rate(&header(&[], 40_000)), Some(40_000));
+    }
+
+    #[test]
+    fn reads_rate_behind_an_ogg_header() {
+        let ogg = [b"OggS".as_slice(), &[0u8; 23], &[0x7f], b"FLAC", &[1, 0, 0, 2]].concat();
+        assert_eq!(flac_sample_rate(&header(&ogg, 28_636)), Some(28_636));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(flac_sample_rate(b"fLaC not a streaminfo block at all"), None);
+        assert_eq!(flac_sample_rate(&[]), None);
     }
 }
