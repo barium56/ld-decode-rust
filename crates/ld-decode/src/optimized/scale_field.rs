@@ -266,14 +266,23 @@ pub(crate) fn scale_field_sinc(
                         let coord_int = coord[k] as usize;
                         let frac = coord[k] - coord_int as f32;
 
-                        // Fractional phase: Python (numba) linearly
-                        // interpolates between the two adjacent LUT phase
-                        // rows, with `alpha` computed in f32.
-                        let phase_pos = frac * SINC_PHASE_COUNT as f32;
-                        let phase_start = phase_pos as usize;
-                        alpha[k] = phase_pos - phase_start as f32;
+                        // Fractional phase. 7.4.0 replaced 7.3.0's blend of
+                        // the two adjacent phase rows with the nearest single
+                        // row -- `int(frac * sinc_phase_count + np.float32(0.5))`
+                        // -- on the reference's own reading that 2**16 phases
+                        // is "far below float32 precision ... for no change in
+                        // output". `alpha` is pinned to 0 rather than dropping
+                        // the gather's second row: the blend is then exactly
+                        // `w0`, so the arithmetic is the reference's and the
+                        // lane plumbing is untouched. (`phase` is clamped to
+                        // the last tabulated row; the table's final row is a
+                        // duplicate of it, which is what lets 7.4.0 index
+                        // `sinc_lut[65536]` at all.)
+                        let phase_pos = frac * SINC_PHASE_COUNT as f32 + 0.5;
+                        let phase = (phase_pos as usize).min(SINC_PHASE_COUNT - 1);
+                        alpha[k] = 0.0;
                         // The two adjacent phase rows are contiguous in the LUT.
-                        rowoff[k] = phase_start * SINC_TAP_COUNT;
+                        rowoff[k] = phase * SINC_TAP_COUNT;
                         start[k] = coord_int - half_taps_m1;
                     }
                     let r = gather_lanes_16(buf, sinc_lut, &start, &alpha, &rowoff);
@@ -313,15 +322,16 @@ pub(crate) fn scale_field_sinc(
                 let coord_int = coord as usize;
                 let frac = coord - coord_int as f32;
 
-                // Fractional phase: Python (numba) linearly interpolates
-                // between the two adjacent LUT phase rows, with `alpha`
-                // computed in f32.
-                let phase_pos = frac * SINC_PHASE_COUNT as f32;
-                let phase_start = phase_pos as usize;
-                let alpha = phase_pos - phase_start as f32;
+                // Fractional phase: 7.4.0 selects the nearest tabulated row
+                // (`int(frac * sinc_phase_count + np.float32(0.5))`) instead of
+                // blending the two neighbours; see the note in the lane loop
+                // above for why `alpha` is 0 and the two-row slice is kept.
+                let phase_pos = frac * SINC_PHASE_COUNT as f32 + 0.5;
+                let phase = (phase_pos as usize).min(SINC_PHASE_COUNT - 1);
+                let alpha = 0.0f32;
 
                 // The two adjacent phase rows are contiguous in the LUT.
-                let row = &sinc_lut[phase_start * SINC_TAP_COUNT..(phase_start + 2) * SINC_TAP_COUNT];
+                let row = &sinc_lut[phase * SINC_TAP_COUNT..(phase + 2) * SINC_TAP_COUNT];
 
                 let start = coord_int - half_taps_m1;
                 // numba types `result = 0.0` as float64 so the accumulator is
