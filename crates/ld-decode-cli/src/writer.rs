@@ -13,10 +13,10 @@ use serde::Serialize;
 use crate::async_db::AsyncDbWriter;
 
 /// The ld-decode version this port replicates bit-for-bit. The reference
-/// release build reports `release:7.3.0`, which is parsed (mirroring
-/// `build_json` in the reference) into `gitBranch=release` / `gitCommit=7.3.0`
+/// release build reports `release:7.4.0`, which is parsed (mirroring
+/// `build_json` in the reference) into `gitBranch=release` / `gitCommit=7.4.0`
 /// in the `.tbc.json` `videoParameters`.
-const REFERENCE_VERSION: &str = "release:7.3.0";
+const REFERENCE_VERSION: &str = "release:7.4.0";
 
 /// Opening of the JSON sidecar. During the decode only the fields array is
 /// written (`{"fields":[ ... ]}\r\n`); the reference emits the
@@ -326,8 +326,8 @@ fn append_header(
     metadata: &DecoderMetadata,
     field_count: usize,
 ) -> Result<()> {
-    // Mirror the reference `build_json` version parsing: `release:7.3.0`
-    // splits into branch `release` / commit `7.3.0`.
+    // Mirror the reference `build_json` version parsing: `release:7.4.0`
+    // splits into branch `release` / commit `7.4.0`.
     let (git_branch, git_commit) = match REFERENCE_VERSION.split_once(':') {
         Some((b, c)) => (b.to_string(), c.to_string()),
         None => (String::new(), String::new()),

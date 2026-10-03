@@ -202,6 +202,31 @@ void FN(ifft_batch_rows_ip)(int k, int n, double *buf) {
   }
 }
 
+// NOTE (7.4.0 port): there is deliberately no batched *real* inverse entry
+// here, although the 7.4.0 demod kernel inverts three half spectra per block
+// (the dropout-detection RF highpass and the two delayed video channels) and
+// batching is what makes the complex path 1.83x faster per transform. (EFM is
+// *not* one of them: 7.4.0 left it on the full complex `ifft` with a full-length
+// `Fefm`, so it stays in the batched complex group.)
+//
+// ducc's in-place `c2r` cannot express the layout it would need. Its
+// `sanity_check_cr` requires, on every non-transform axis,
+// `ar.stride == 2*ac.stride` (counted in each view's own element size), and on
+// the transform axis a stride of 1 for *both* views. For `k` rows of `n/2+1`
+// complex in and `n` real out that is unsatisfiable: a contiguous real row
+// (stride 1) is `n` doubles from the next row, so the complex rows would need a
+// stride of `n/2`, overlapping each row's last element with the next row's
+// first. Measured: the closest expressible layout prints "stride on
+// halfcomplex axis must be 1" and then silently computes garbage (a DC-only
+// spectrum inverts to 1.0 instead of 1/n).
+//
+// The out-of-place `c2r` has no such constraint, so a batch entry is possible
+// by giving it a separate output buffer -- `ifft_batch_rows` is exactly that
+// shape for the complex case. That is a real, worth-measuring follow-up, but it
+// was not taken here: the Rust kernel calls the scalar `irfft` once per
+// half-spectrum row, which is bit-identical to the reference's own call by
+// construction.
+
 } // extern "C"
 
 extern "C" {

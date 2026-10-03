@@ -1440,6 +1440,9 @@ pub(crate) struct AudioChannelFilters {
 pub(crate) struct Filters {
     /// Full-spectrum RF highpass used for dropout detection (complex f64).
     pub frfhpf: Vec<Complex64>,
+    /// Half spectrum of [`Self::frfhpf`] (`[: blocklen // 2 + 1]`), the 7.4.0
+    /// `Frfhpf_rfft`: the dropout detector now runs on `irfft` of this.
+    pub frfhpf_rfft: Vec<Complex64>,
     /// Full-spectrum MTF compensation filter (complex f64).
     pub mtf: Vec<Complex64>,
     /// Full-spectrum RF video filter including the Hilbert transform (f64).
@@ -1447,6 +1450,11 @@ pub(crate) struct Filters {
     /// The three full-spectrum post-demod filters (f64):
     /// [FVideo, FVideo05, FVideoBurst].
     pub fvideo: Vec<Vec<Complex64>>,
+    /// The three half spectra the 7.4.0 kernel actually filters
+    /// (`FVideo_rfft`): each is `FVideo[i][: n//2+1]` shifted by its own FIR
+    /// delay, `* np.exp(2j*pi*offset*bins/n)`. The time-domain `np.roll` is
+    /// gone; the delay is folded into the filter instead.
+    pub fvideo_rfft: Vec<Vec<Complex64>>,
     /// Full-spectrum 0.5 MHz filter (unshifted), for the sync-only path.
     pub fvideo05: Vec<Complex64>,
     pub f05_offset: usize,
@@ -1897,6 +1905,10 @@ fn compute_filters(
         }
     }
     let frfhpf_fft = filtfft(&frfhpf.0, &frfhpf.1, blocklen);
+    // 7.4.0: the dropout detector works on the half spectrum.
+    // Python: `SF["Frfhpf_rfft"] = SF["Frfhpf"][:blocklen // 2 + 1]`.
+    let rfft_len = blocklen / 2 + 1;
+    let frfhpf_rfft = frfhpf_fft[..rfft_len].to_vec();
 
     // MTF compensation filter: two poles symmetric about freq_half.
     let mtf_polef_lo = DP_MTF_FREQ / freq_half;
@@ -2081,10 +2093,54 @@ fn compute_filters(
         wf("_f05_taps.bin", &f05_taps);
         wf("_fburst_taps.bin", &fburst_taps);
     }
-    // The three post-demod filters are kept as full-spectrum f64; their FIR
-    // delays are applied as time-domain rolls in the demod (like the Python
-    // `np.roll`), not as frequency-domain phase shifts.
+    // The three post-demod filters are kept as full-spectrum f64 (the sync-only
+    // path still uses `fvideo05` unshifted), but the demod kernel filters the
+    // 7.4.0 half spectra below: each FIR delay is folded into its own filter as
+    // a unit-circle phase ramp, which is what replaced the time-domain
+    // `np.roll`.
     let fvideo = vec![fvideo, fvideo05.clone(), fvideo_burst];
+
+    // Python (computevideofilters, 7.4.0):
+    //
+    //     rfft_len = blocklen // 2 + 1
+    //     bins = np.arange(rfft_len)
+    //     def shifted_half_spectrum(filt, offset=0):
+    //         half = filt[:rfft_len]
+    //         if offset:
+    //             half = half * np.exp(2j * np.pi * offset * bins / blocklen)
+    //         return half
+    //
+    // with offsets `0`, `F05_offset` and `FVideoBurst_offset`. The phase comes
+    // from `numpy_sincos` (numpy's complex exp goes through the platform
+    // `sincos` entry point) and the product from `np_cmul` (numpy's FMA kernel),
+    // so this is a parity-bearing derivation of its own, not a rearrangement of
+    // the pinned full-spectrum filters -- pinned by the `fvideo_rfft{0,1,2}`
+    // entries in `construction_is_platform_independent`.
+    let fvideo_rfft = {
+        let phase_arg = |offset: usize| -> Vec<f64> {
+            (0..rfft_len)
+                .map(|b| 2.0 * PI * offset as f64 * b as f64 / blocklen as f64)
+                .collect()
+        };
+        let shift = |half: &[Complex64], offset: usize| -> Vec<Complex64> {
+            if offset == 0 {
+                return half.to_vec();
+            }
+            let arg = phase_arg(offset);
+            half.iter()
+                .zip(&arg)
+                .map(|(&v, &a)| {
+                    let (s, c) = numpy_sincos(a);
+                    np_cmul(v, Complex64::new(c, s))
+                })
+                .collect()
+        };
+        vec![
+            shift(&fvideo[0][..rfft_len], 0),
+            shift(&fvideo[1][..rfft_len], f05_offset),
+            shift(&fvideo[2][..rfft_len], fvideo_burst_offset),
+        ]
+    };
 
     // Analog audio channel filters and the EFM equalisation filter.
     let (audio, audio_fdiv) = compute_audio_filters(
@@ -2099,9 +2155,11 @@ fn compute_filters(
     Ok((
         Filters {
             frfhpf: frfhpf_fft,
+            frfhpf_rfft,
             mtf,
             rfvideo,
             fvideo,
+            fvideo_rfft,
             fvideo05,
             f05_offset,
             fvideo_burst_offset,
@@ -2450,6 +2508,16 @@ mod tests {
         for (i, f) in spec.filters.fvideo.iter().enumerate() {
             out.push((["fvideo0", "fvideo1", "fvideo2"][i], of_c(f)));
         }
+        // 7.4.0's half-spectrum twins. `frfhpf_rfft` is a slice of the pinned
+        // `frfhpf`, but `fvideo_rfft` is *new arithmetic* -- the reference's
+        // `shifted_half_spectrum` phase ramp (`* np.exp(2j*pi*offset*bins/n)`,
+        // i.e. `numpy_sincos` + `np_cmul`) that replaces the time-domain
+        // `np.roll` -- so it gets its own pins for the same reason every other
+        // constructed array has one: they must agree on Windows and Linux.
+        out.push(("frfhpf_rfft", of_c(&spec.filters.frfhpf_rfft)));
+        for (i, f) in spec.filters.fvideo_rfft.iter().enumerate() {
+            out.push((["fvideo_rfft0", "fvideo_rfft1", "fvideo_rfft2"][i], of_c(f)));
+        }
         for (i, a) in spec.filters.audio.iter().enumerate() {
             out.push((["audio0_filt1", "audio1_filt1"][i], of_c(&a.filt1)));
             out.push((["audio0_stage2", "audio1_stage2"][i], of_c(&a.audio2_filter)));
@@ -2565,22 +2633,26 @@ mod tests {
     ];
 
     const PINNED_DEFAULT: &[(&str, u64)] = &[
-            ("fefm", 0x605191da3f0f82b7),
-            ("frfhpf", 0x31fdf68497983a37),
-            ("mtf", 0x311f43941a5edeac),
-            ("rfvideo", 0xc388578009bd5664),
-            ("fvideo05", 0x05e27caa321c28ee),
-            ("fvideo0", 0x6adb021b068800bd),
-            ("fvideo1", 0x05e27caa321c28ee),
-            ("fvideo2", 0x1662d95d6b27b6e5),
-            ("audio0_filt1", 0x3725337de9170a70),
-            ("audio0_stage2", 0x6fbd947994a20b05),
-            ("audio0_freqs", 0x8bf9032c7159eea6),
-            ("audio1_filt1", 0xb9c85cb9287c2026),
-            ("audio1_stage2", 0x6fbd947994a20b05),
-            ("audio1_freqs", 0x58b59c67d4819029),
-            ("delays", 0x6730d61543d388df),
-            ("sinc_lut", 0xcc5ea0188b5afed3),
+        ("fefm", 0x605191da3f0f82b7),
+        ("frfhpf", 0x31fdf68497983a37),
+        ("mtf", 0x311f43941a5edeac),
+        ("rfvideo", 0xc388578009bd5664),
+        ("fvideo05", 0x05e27caa321c28ee),
+        ("fvideo0", 0x6adb021b068800bd),
+        ("fvideo1", 0x05e27caa321c28ee),
+        ("fvideo2", 0x1662d95d6b27b6e5),
+        ("frfhpf_rfft", 0x2ad6ac70370a48e4),
+        ("fvideo_rfft0", 0x84993cd4b1f493c8),
+        ("fvideo_rfft1", 0x5e1bee4781884b9f),
+        ("fvideo_rfft2", 0x585bafbef3e5f958),
+        ("audio0_filt1", 0x3725337de9170a70),
+        ("audio0_stage2", 0x6fbd947994a20b05),
+        ("audio0_freqs", 0x8bf9032c7159eea6),
+        ("audio1_filt1", 0xb9c85cb9287c2026),
+        ("audio1_stage2", 0x6fbd947994a20b05),
+        ("audio1_freqs", 0x58b59c67d4819029),
+        ("delays", 0x6730d61543d388df),
+        ("sinc_lut", 0xcc5ea0188b5afed3),
         ];
 
     /// `lowband: true` substitutes `FilterParams_NTSC_lowband` (three changed
@@ -2597,6 +2669,10 @@ mod tests {
         ("fvideo0", 0xc87a585556a2c1e1),
         ("fvideo1", 0xb1dfebd7b8a1b215),
         ("fvideo2", 0x7980f53fb7be11fb),
+        ("frfhpf_rfft", 0x2ad6ac70370a48e4),
+        ("fvideo_rfft0", 0xfefdfecfbd513ba3),
+        ("fvideo_rfft1", 0xb38a298ad8867b96),
+        ("fvideo_rfft2", 0xf6b8d4d37f6f0118),
         ("audio0_filt1", 0x3725337de9170a70),
         ("audio0_stage2", 0x6fbd947994a20b05),
         ("audio0_freqs", 0x8bf9032c7159eea6),
@@ -2616,6 +2692,10 @@ mod tests {
         ("fvideo0", 0x2dc5d1ae16b95563),
         ("fvideo1", 0x5db41ddfac73cc5e),
         ("fvideo2", 0xb997ee22d7e7e8f8),
+        ("frfhpf_rfft", 0x2ad6ac70370a48e4),
+        ("fvideo_rfft0", 0x476db6bf5b162d97),
+        ("fvideo_rfft1", 0xb93dc34161f9ee4b),
+        ("fvideo_rfft2", 0x1217d502d56742d4),
         ("audio0_filt1", 0x3725337de9170a70),
         ("audio0_stage2", 0x6fbd947994a20b05),
         ("audio0_freqs", 0x8bf9032c7159eea6),
@@ -2635,6 +2715,10 @@ mod tests {
         ("fvideo0", 0xae6f1921411feed7),
         ("fvideo1", 0x2316a3fdd5bab151),
         ("fvideo2", 0xca7fc5e372541be4),
+        ("frfhpf_rfft", 0x2ad6ac70370a48e4),
+        ("fvideo_rfft0", 0xd9233709c6da4764),
+        ("fvideo_rfft1", 0x0a68760819c8f166),
+        ("fvideo_rfft2", 0x96b0ff65ae6edf4b),
         ("audio0_filt1", 0x3725337de9170a70),
         ("audio0_stage2", 0x6fbd947994a20b05),
         ("audio0_freqs", 0x8bf9032c7159eea6),
@@ -2658,6 +2742,10 @@ mod tests {
         ("fvideo0", 0x7bcf330e9a2e0ff6),
         ("fvideo1", 0x572d10d260042608),
         ("fvideo2", 0x98c45f7c0dbee23f),
+        ("frfhpf_rfft", 0x2ad6ac70370a48e4),
+        ("fvideo_rfft0", 0xf1209137d5eca9f8),
+        ("fvideo_rfft1", 0x69cfaefb8c571f68),
+        ("fvideo_rfft2", 0xcb9f49421cd78196),
         ("audio0_filt1", 0x3725337de9170a70),
         ("audio0_stage2", 0x6fbd947994a20b05),
         ("audio0_freqs", 0x8bf9032c7159eea6),

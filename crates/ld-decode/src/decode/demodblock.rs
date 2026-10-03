@@ -671,14 +671,43 @@ pub(crate) fn demod_block_cpu(
     st.mark(1);
 
     // Batched inverse FFTs, in two groups per block. Four rows cover both: the
-    // early group is hilbert (row 0) + dropout-detection RF highpass (row 1),
-    // the late group is EFM (row 2) + the three post-demod video channels
-    // (rows 0, 1 and 3). Batching runs each transform ~1.83x faster than the
-    // per-transform call it replaces while staying bit-identical to it (see
-    // `ffi_ducc::ifft_batch_rows`).
+    // early group is hilbert (row 0) + EFM (row 1), the late group is the three
+    // post-demod video channels (rows 0, 2 and 3, each a scalar `irfft`).
+    // Batching runs each transform ~1.83x faster than the per-transform call it
+    // replaces while staying bit-identical to it (see
+    // `ffi_ducc::ifft_batch_rows`). The two complex rows are adjacent so the
+    // early group can still be one `k = 2` batch: ducc's batch entry takes `k`
+    // *contiguous* rows, and odd batch sizes are strictly worse than even ones.
     //
-    // Row 2 is filled here, with the block spectrum still live, and consumed
-    // after the late group: `demod_fft` overwrites `indata` in between.
+    // Row 1 is filled here, with the block spectrum still live, and consumed
+    // after the early group: `demod_fft` overwrites `indata` in between.
+    //
+    // 7.4.0 moved *three* of the four filtered quantities to the half-spectrum
+    // domain: `rfhpf` and the three `FVideo` channels are real (`.real` of a
+    // Hermitian product, or an outright real filter), so the reference inverts
+    // them with `rfft`/`irfft` and never materialises their imaginary halves.
+    // `irfft` is **not** bit-identical to `ifft(...).real` --
+    // `irfft_matches_c2c_real_parts` in `ffi_ducc` pins that divergence -- so
+    // this is a deliberate move onto the 7.4.0 arithmetic, not an optimisation
+    // of the 7.3.0 one. It is the half of the restructure that buys the speed:
+    // three of the six real-inverse transforms keep their full cost.
+    //
+    // EFM did **not** move: 7.4.0 still computes
+    //     efm_out = npfft.ifft(indata_fft * Filters["Fefm"])
+    // on the *full* complex spectrum with a full-length `Fefm`, so its row stays
+    // a full `blocklen` complex inverse. Converting it to a half spectrum (as
+    // the first cut of this port did) is a real arithmetic change and shows up
+    // as a byte-length difference in `.efm`.
+    //
+    // Row 0 (hilbert) and row 1 (EFM) are the full complex rows. The
+    // half-spectrum rows are padded to `blocklen` as well, so the whole buffer
+    // keeps its old `4 * blocklen` shape -- no extra working set for the eight
+    // prefetch workers.
+    let rfft_len = blocklen / 2 + 1;
+    let stride = blocklen;
+    const ROW_HILBERT: usize = 0;
+    const ROW_EFM: usize = 1;
+    const ROW_RFHPF: usize = 2;
     if batch_spec.len() < 4 * blocklen {
         batch_spec.resize(4 * blocklen, Complex64::new(0.0, 0.0));
     }
@@ -691,25 +720,53 @@ pub(crate) fn demod_block_cpu(
         Some(mf) => np_cmul3_slices(indata, &spec.filters.rfvideo, mf, &mut batch_spec[..blocklen]),
         None => np_cmul_slices(indata, &spec.filters.rfvideo, &mut batch_spec[..blocklen]),
     }
-    // Dropout-detection RF highpass. Python cuts with `video_rot` during field
-    // decode (delays set), and with 0 during the setup fakedecode (delays not
-    // yet computed) — the caller passes the matching value. Built directly into
-    // its row, so no clone-then-overwrite pass and the same np_cmul arithmetic.
+    // Dropout-detection RF highpass, on the 7.4.0 half spectrum:
+    //     rfhpf = npfft.irfft(indata_fft[:n//2+1] * Frfhpf_rfft, n=blocklen)
+    // Python cuts with `video_rot` during field decode (delays set), and with 0
+    // during the setup fakedecode (delays not yet computed) — the caller passes
+    // the matching value. Built directly into its row, so no clone-then-overwrite
+    // pass and the same np_cmul arithmetic.
     np_cmul_slices(
-        indata,
-        &spec.filters.frfhpf,
-        &mut batch_spec[blocklen..2 * blocklen],
+        &indata[..rfft_len],
+        &spec.filters.frfhpf_rfft,
+        &mut batch_spec[ROW_RFHPF * stride..ROW_RFHPF * stride + rfft_len],
     );
-    // EFM: efm_out = npfft.ifft(indata_fft * Fefm); .real; clip to i16; cut.
+    // EFM: efm_out = npfft.ifft(indata_fft * Fefm); clip to i16; cut. The
+    // *product* is parked in row 1 here, while the block spectrum is still live;
+    // its inverse FFT is the early group's, alongside hilbert's.
     np_cmul_slices(
         indata,
         &spec.filters.fefm,
-        &mut batch_spec[2 * blocklen..3 * blocklen],
+        &mut batch_spec[ROW_EFM * stride..ROW_EFM * stride + blocklen],
     );
     st.mark(2);
-    ffi_ducc::ifft_batch_rows_inplace(2, blocklen, &mut batch_spec[..2 * blocklen]);
+    // Early group: the complex `ifft` of the full hilbert spectrum (row 0), then
+    // the real inverse of the dropout-detection highpass (row 1).
+    //
+    // The complex one is batched (k=1 keeps the batch entry on the same scalar
+    // path `ifft` takes, and the row is already in place). The real inverse is
+    // a plain scalar `irfft`: ducc's in-place `c2r` cannot express a batch of
+    // half-spectrum rows, and the out-of-place form would need a second buffer
+    // -- see the note in `vendor/ducc_ffi.cc`. Scalar `irfft` is also exactly
+    // what the reference calls here, so this row is bit-exact by construction.
+    ffi_ducc::ifft_batch_rows_inplace(
+        2,
+        blocklen,
+        &mut batch_spec[ROW_HILBERT * stride..(ROW_EFM + 1) * stride],
+    );
+    {
+        let row = &mut batch_spec[ROW_RFHPF * stride..ROW_RFHPF * stride + rfft_len];
+        let real = ffi_ducc::irfft(row, blocklen);
+        for (c, v) in batch_spec[ROW_RFHPF * stride..ROW_RFHPF * stride + blocklen]
+            .iter_mut()
+            .zip(&real)
+        {
+            c.re = *v;
+            c.im = 0.0;
+        }
+    }
     if let Some(s) = dump {
-        let rfhpf_f64: Vec<f64> = batch_spec[blocklen..2 * blocklen]
+        let rfhpf_f64: Vec<f64> = batch_spec[ROW_RFHPF * stride..ROW_RFHPF * stride + blocklen]
             .iter()
             .map(|v| v.re)
             .collect();
@@ -719,7 +776,11 @@ pub(crate) fn demod_block_cpu(
             &pipe_f64(&rfhpf_f64),
         );
     }
-    let rfhpf = cut_rfhpf(&batch_spec[blocklen..2 * blocklen], spec, rotdelay);
+    let rfhpf = cut_rfhpf(
+        &batch_spec[ROW_RFHPF * stride..ROW_RFHPF * stride + blocklen],
+        spec,
+        rotdelay,
+    );
     st.mark(3);
 
     // Analog audio stage 1: per-channel sliced bandpass demod.
@@ -823,32 +884,42 @@ pub(crate) fn demod_block_cpu(
     }
     st.mark(10);
 
-    // Late batch: the three post-demod filters, each with its own known delay
-    // rolled in the time domain exactly like the reference, plus the EFM row
-    // parked in row 2 by the early group. Each product is built straight into
-    // its row (same np_cmul arithmetic, no per-channel clone of the demod
-    // spectrum) and the four inverse FFTs share one batched call.
+    // Late group: the three post-demod half-spectrum filters, each carrying its
+    // own FIR delay as a phase ramp (7.4.0 folded the time-domain `np.roll` into
+    // the filter). Each product is built straight into its row (same np_cmul
+    // arithmetic, no per-channel clone of the demod spectrum) and the three real
+    // inverses are scalar `irfft` calls -- the reference's own call, and the
+    // only bit-exact way to invert a half-spectrum row (`vendor/ducc_ffi.cc`).
     let (cstart, cend) = kept_range(indata.len(), spec, cut);
-    for (i, filter) in spec.filters.fvideo.iter().enumerate() {
-        let row = match i {
-            0 => 0,
-            1 => 1,
-            2 => 3,
-            _ => unreachable!(),
-        };
+    // Video rows: 0 is free once hilbert has been inverted and unwrapped, 2
+    // once `cut_rfhpf` has taken its copy, 3 was never used. Row 1 still holds
+    // the EFM time-domain row, so it is deliberately *not* reused here.
+    const VIDEO_ROWS: [usize; 3] = [ROW_HILBERT, ROW_RFHPF, 3];
+    for (i, filter) in spec.filters.fvideo_rfft.iter().enumerate() {
+        let row = VIDEO_ROWS[i];
         np_cmul_slices(
-            indata,
+            &indata[..rfft_len],
             filter,
-            &mut batch_spec[row * blocklen..(row + 1) * blocklen],
+            &mut batch_spec[row * stride..row * stride + rfft_len],
         );
     }
-    ffi_ducc::ifft_batch_rows_inplace(4, blocklen, &mut batch_spec[..4 * blocklen]);
+    for row_idx in VIDEO_ROWS {
+        let row = &mut batch_spec[row_idx * stride..row_idx * stride + rfft_len];
+        let real = ffi_ducc::irfft(row, blocklen);
+        for (c, v) in batch_spec[row_idx * stride..row_idx * stride + blocklen]
+            .iter_mut()
+            .zip(&real)
+        {
+            c.re = *v;
+            c.im = 0.0;
+        }
+    }
     st.mark(11);
 
     // EFM (row 2): the clip is element-wise, so building only the kept range
     // yields exactly the elements the full-length build then sliced out.
     let efm: Vec<i16> = {
-        let row = &batch_spec[2 * blocklen..3 * blocklen];
+        let row = &batch_spec[ROW_EFM * stride..ROW_EFM * stride + blocklen];
         let (start, end) = if cut {
             let start = spec.blockcut.min(row.len());
             let end = row.len().saturating_sub(spec.blockcut_end);
@@ -862,7 +933,7 @@ pub(crate) fn demod_block_cpu(
             .collect()
     };
     if let Some(s) = dump {
-        let efm_f64: Vec<f64> = batch_spec[2 * blocklen..3 * blocklen]
+        let efm_f64: Vec<f64> = batch_spec[ROW_EFM * stride..ROW_EFM * stride + blocklen]
             .iter()
             .map(|v| v.re)
             .collect();
@@ -885,13 +956,11 @@ pub(crate) fn demod_block_cpu(
     // Consume the late batch: each channel is cut/rolled and converted straight
     // to f32, identical arithmetic to the per-channel form.
     for (i, _filter) in spec.filters.fvideo.iter().enumerate() {
-        let row = match i {
-            0 => 0,
-            1 => 1,
-            2 => 3,
-            _ => unreachable!(),
-        };
-        let ch_out = &batch_spec[row * blocklen..(row + 1) * blocklen];
+        // Same row map as the late group's products: the two loops must agree or
+        // a channel is gathered from another channel's row (a `demod_05` read
+        // from the EFM row is silent data corruption, not a rounding error).
+        let row = VIDEO_ROWS[i];
+        let ch_out = &batch_spec[row * stride..row * stride + blocklen];
         if let Some(s) = dump {
             if i < 2 {
                 pipe_write(
@@ -905,13 +974,11 @@ pub(crate) fn demod_block_cpu(
                 );
             }
         }
-        let offset = match i {
-            0 => 0usize,
-            1 => spec.filters.f05_offset,
-            2 => spec.filters.fvideo_burst_offset,
-            _ => unreachable!(),
-        };
-        let out_f32 = rolled_f32_range(ch_out, offset, cstart, cend);
+        // No roll here: 7.4.0 folded each channel's FIR delay into its
+        // half-spectrum filter as a phase ramp (`FVideo_rfft`), so the inverse
+        // FFT output is *already* aligned and the reference gathers it plainly.
+        // Rolling again would double-shift `demod_05`/`demod_burst`.
+        let out_f32 = rolled_f32_range(ch_out, 0, cstart, cend);
         match i {
             0 => video.demod = out_f32,
             1 => video.demod_05 = out_f32,

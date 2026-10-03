@@ -16,9 +16,9 @@ use ld_decode::{DecoderMetadata, FieldInfoEntry};
 use rusqlite::{params, Connection};
 
 /// `gitBranch` / `gitCommit` reported in the `capture` table, from the
-/// reference version string `release:7.3.0` (kept in sync with writer.rs).
+/// reference version string `release:7.4.0` (kept in sync with writer.rs).
 const GIT_BRANCH: &str = "release";
-const GIT_COMMIT: &str = "7.3.0";
+const GIT_COMMIT: &str = "7.4.0";
 
 /// Schema, mirroring `create_db_schema` in the reference (table names,
 /// columns, constraints and `PRAGMA user_version = 1`).
