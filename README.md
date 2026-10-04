@@ -2,7 +2,7 @@
 
 A from-scratch Rust port of the NTSC LaserDisc RF decoder from
 [ld-decode](https://github.com/happycube/ld-decode) 7.4.0, whose
-`.tbc`/`.pcm`/`.efm` output is byte-identical to 7.3.0's.
+`.tbc`/`.pcm`/`.efm` output is byte-identical.
 
 The goal is not "a decoder that produces similar pictures". The goal is a
 decoder that produces **byte-identical output files** to the Python original:
@@ -102,7 +102,8 @@ other end closes the pipe early, the decode stops immediately with an error.
 
 ## Input formats
 
-The format is inferred from the file extension; `--format` overrides it.
+The format is inferred from the file extension; `--format` overrides it and is
+required for stdin (`INFILE` = `-`).
 
 | Extension | Content |
 | --- | --- |
