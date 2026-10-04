@@ -27,19 +27,25 @@ grep -q -- "--start" "$WORK/help.txt"
 grep -q -- "--threads" "$WORK/help.txt"
 
 # One second of zero samples. Nothing decodes, but the reader, the no-signal
-# recovery path and every writer (tbc/pcm/efm/json/db/log) must still run to
-# completion and exit cleanly.
+# recovery path and every writer (tbc/pcm/efm/db/log) must still run to
+# completion and exit cleanly. The json writer runs too, but a decode that
+# handles no frames must leave no `.tbc.json` at all -- Python 7.4.0's
+# JSONDumper never receives a snapshot and its `_enqueue` drops the None
+# (tests/test_json_dumper_empty.py there).
 head -c 40000000 /dev/zero > "$WORK/zeros.s16"
 "$BIN" -j 4 -l 4 "$WORK/zeros.s16" "$WORK/out"
 
-for ext in tbc pcm efm tbc.json tbc.db log; do
+for ext in tbc pcm efm tbc.db log; do
   if [ ! -f "$WORK/out.$ext" ]; then
     echo "Missing output: $WORK/out.$ext" >&2
     ls -la "$WORK"
     exit 1
   fi
 done
-grep -q '"fields":\[\]' "$WORK/out.tbc.json"
+if [ -e "$WORK/out.tbc.json" ]; then
+  echo "Unexpected .tbc.json after a zero-field decode: $WORK/out.tbc.json" >&2
+  exit 1
+fi
 grep -q "Decode finished" "$WORK/out.log"
 
 # Container sniffing for `.ldf`. The extension normally carries Ogg-wrapped
@@ -58,7 +64,7 @@ cmp "$WORK/flac.tbc" "$WORK/ldf.tbc"
 ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i "$WORK/zeros.s16" \
   -c:a flac -compression_level 6 -f ogg "$WORK/ogg.ldf"
 "$BIN" -j 4 -l 4 "$WORK/ogg.ldf" "$WORK/ogg"
-for ext in tbc pcm efm tbc.json tbc.db log; do
+for ext in tbc pcm efm tbc.db log; do
   if [ ! -f "$WORK/ogg.$ext" ]; then
     echo "Missing output: $WORK/ogg.$ext" >&2
     exit 1

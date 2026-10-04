@@ -372,7 +372,17 @@ fn main() -> Result<()> {
 
     let max_frames = args.length;
     let seekable = reader.is_seekable();
-    decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base, seekable)?;
+    let wrote_fields = decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base, seekable)?;
+    if !to_stdout && !wrote_fields {
+        // Python 7.4.0 leaves no `.tbc.json` at all on a decode that handles
+        // no frames -- its JSONDumper never receives a snapshot and `_enqueue`
+        // drops the `None` -- while this writer creates the placeholder
+        // eagerly. Remove it: `decode_all` joined the writer thread, so the
+        // file handle is closed and the unlink is clean on Windows too.
+        if let Err(e) = std::fs::remove_file(format!("{outfile}.tbc.json")) {
+            tracing::warn!("removing zero-field .tbc.json: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -502,7 +512,7 @@ fn decode_all(
     max_frames: Option<u64>,
     initial_base: u64,
     seekable: bool,
-) -> Result<()> {
+) -> Result<bool> {
     // Overlap the blocking sample reads with the decode: wrap the reader in
     // the prefetch worker. All reads are served FIFO by one thread, so the
     // sample stream the decoder sees is identical to the synchronous path.
@@ -680,8 +690,10 @@ fn decode_all(
         tracing::info!("Completed without handling any fields.");
     }
 
-    writer.close(decoder.metadata())?;
-    Ok(())
+    let metadata = decoder.metadata();
+    let wrote_fields = metadata.is_some();
+    writer.close(metadata)?;
+    Ok(wrote_fields)
 }
 
 /// Locate the disc frame `target` using VBI frame codes, mirroring ld-decode's
