@@ -155,7 +155,7 @@ fn open_stdin(format: SampleFormat) -> Result<Input> {
             let n = read_fully(&mut std::io::stdin().lock(), &mut head)?;
             head.truncate(n);
             let rate = flac_sample_rate(&head);
-            let source = FfmpegFlacSource::spawn_stdin(head, rate.unwrap_or(DEFAULT_FLAC_RATE_HZ))
+            let source = FfmpegSource::spawn_stdin(head, rate.unwrap_or(DEFAULT_FLAC_RATE_HZ))
                 .context("reading FLAC/.ldf from stdin needs ffmpeg on PATH")?;
             Ok(Input { source: Box::new(source), container_rate_hz: rate })
         }
@@ -408,6 +408,11 @@ fn unrecognised(path: &str, head: &[u8], size: u64) -> String {
 /// itself: a `.ldf` holding a bare FLAC stream (capture tools that skip the Ogg
 /// wrapper, files re-encoded later) must decode here too. Assuming `OggS` at
 /// offset 0 failed those files with "No Ogg capture pattern found".
+///
+/// Ogg-FLAC goes through the ffmpeg child first (the reference's own decoder,
+/// and ~2.7x claxon's throughput on the GGV1069 capture -- claxon alone cannot
+/// keep up with the demod pool and starves it); claxon stays the fallback for
+/// `LD_NO_FFMPEG` and for shifted streams ffmpeg cannot probe.
 fn open_ldf(path: &str, mut file: File, rate_hz: u32) -> Result<Box<dyn SampleSource>> {
     let mut head = vec![0u8; PROBE_WINDOW];
     let n = read_fully(&mut file, &mut head)?;
@@ -424,6 +429,12 @@ fn open_ldf(path: &str, mut file: File, rate_hz: u32) -> Result<Box<dyn SampleSo
     file.seek(SeekFrom::Start(offset))
         .with_context(|| format!("seeking {path}"))?;
     match container {
+        Container::Ogg if offset == 0 && std::env::var_os("LD_NO_FFMPEG").is_none() => {
+            if let Ok(src) = FfmpegSource::spawn(path, 0, rate_hz, FfmpegSeek::RestartDiscard) {
+                return Ok(Box::new(src));
+            }
+            Ok(Box::new(LdfSource::open(path, file, offset)?))
+        }
         Container::Ogg => Ok(Box::new(LdfSource::open(path, file, offset)?)),
         // Bare FLAC follows the `.flac` route (ffmpeg first, claxon fallback),
         // but ffmpeg only probes the stream from offset 0 -- a shifted marker
@@ -438,7 +449,7 @@ fn open_ldf(path: &str, mut file: File, rate_hz: u32) -> Result<Box<dyn SampleSo
 /// `offset` when ffmpeg is unavailable or cannot probe the stream.
 fn open_raw_flac(path: &str, mut file: File, offset: u64, rate_hz: u32) -> Result<Box<dyn SampleSource>> {
     if offset == 0 && std::env::var_os("LD_NO_FFMPEG").is_none() {
-        if let Ok(src) = FfmpegFlacSource::spawn(path, 0, rate_hz) {
+        if let Ok(src) = FfmpegSource::spawn(path, 0, rate_hz, FfmpegSeek::PySeek) {
             return Ok(Box::new(src));
         }
     }
@@ -895,11 +906,25 @@ fn demote_child_priority(child: &std::process::Child) {
     }
 }
 
-/// `.flac` input decoded by an `ffmpeg` child process (C-speed FLAC decode,
-/// output as raw s16le mono on stdout — the same sample values the Python
-/// reference gets from its PyAV s16 resampler). Falls back to claxon (see
-/// `RawFlacSource`) if ffmpeg cannot be spawned.
-struct FfmpegFlacSource {
+/// How `FfmpegSource` repositions the child on `seek_samples`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FfmpegSeek {
+    /// Raw `.flac`: reproduce Python's LoadLDF seek artifact (the 1000x scale
+    /// error `flac_pyseek` models) with an ffmpeg output-time `-ss` seek.
+    PySeek,
+    /// Ogg `.ldf`: restart the child at sample 0 and discard the exact sample
+    /// count in-process — the same semantics claxon's `LdfSource` uses, which
+    /// the `.ldf` seek gates were verified with. ffmpeg's `-ss` is never used
+    /// here: it rounds to microseconds (0.04 samples at 40 kHz container rate)
+    /// and a one-sample slip would shift the whole stream.
+    RestartDiscard,
+}
+
+/// `.flac`/`.ldf` input decoded by an `ffmpeg` child process (C-speed FLAC
+/// decode, output as raw s16le mono on stdout — the same sample values the
+/// Python reference gets from its PyAV s16 resampler). Falls back to claxon
+/// (see `RawFlacSource`/`LdfSource`) if ffmpeg cannot be spawned.
+struct FfmpegSource {
     path: String,
     child: std::process::Child,
     out: std::io::BufReader<std::process::ChildStdout>,
@@ -913,9 +938,11 @@ struct FfmpegFlacSource {
     from_stdin: bool,
     /// Absolute index of the next sample `read` returns (stdin seeks only).
     pos: u64,
+    /// Repositioning semantics for file-backed input.
+    seek: FfmpegSeek,
 }
 
-impl FfmpegFlacSource {
+impl FfmpegSource {
     /// Spawn `ffmpeg` decoding `path`, positioned at (or just before) sample
     /// `from_sample`. The container rate is 40 kHz fiction = one RF sample per
     /// stream unit (`rate_hz` per second); `-ss` seeks by stream time.
@@ -934,15 +961,15 @@ impl FfmpegFlacSource {
     /// target exceeds the proven range, spawn from the start (`-ss 0`) and
     /// discard the exact sample count in the reader — same full-file decode
     /// cost, guaranteed to deliver.
-    fn spawn(path: &str, from_sample: u64, rate_hz: u32) -> Result<Self> {
+    fn spawn(path: &str, from_sample: u64, rate_hz: u32, seek: FfmpegSeek) -> Result<Self> {
         if std::env::var_os("LD_TRACE_SEEK").is_some() {
             ld_decode::teeprintln!("FFMPEG SPAWN from_sample={from_sample}");
         }
         const MAX_SS_SAMPLE: u64 = 35_000_000_000;
-        let (seconds, discard) = if from_sample > MAX_SS_SAMPLE {
-            (0.0, from_sample)
-        } else {
-            (from_sample as f64 / f64::from(rate_hz), 0)
+        let (seconds, discard) = match seek {
+            FfmpegSeek::RestartDiscard => (0.0, 0),
+            FfmpegSeek::PySeek if from_sample > MAX_SS_SAMPLE => (0.0, from_sample),
+            FfmpegSeek::PySeek => (from_sample as f64 / f64::from(rate_hz), 0),
         };
         if std::env::var_os("LD_TRACE_SEEK").is_some() {
             ld_decode::teeprintln!("FFMPEG SPAWN -ss={seconds:.6}s discard={discard}");
@@ -975,6 +1002,7 @@ impl FfmpegFlacSource {
             rate_hz,
             from_stdin: false,
             pos: 0,
+            seek,
         })
     }
 
@@ -1020,6 +1048,8 @@ impl FfmpegFlacSource {
             rate_hz,
             from_stdin: true,
             pos: 0,
+            // Unused: stdin seeks take the forward-only branch.
+            seek: FfmpegSeek::RestartDiscard,
         })
     }
 
@@ -1053,7 +1083,7 @@ impl FfmpegFlacSource {
     }
 }
 
-impl SampleSource for FfmpegFlacSource {
+impl SampleSource for FfmpegSource {
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let mut written = 0usize;
         while written < out.len() {
@@ -1092,14 +1122,35 @@ impl SampleSource for FfmpegFlacSource {
             self.pos = sample;
             return Ok(());
         }
-        let target = flac_pyseek(sample);
-        self.kill();
-        *self = Self::spawn(&self.path, target, self.rate_hz)?;
+        match self.seek {
+            FfmpegSeek::PySeek => {
+                let target = flac_pyseek(sample);
+                self.kill();
+                *self = Self::spawn(&self.path, target, self.rate_hz, FfmpegSeek::PySeek)?;
+            }
+            FfmpegSeek::RestartDiscard => {
+                // Same strategy as `LdfSource::seek_samples`: restart from
+                // sample 0 and discard the exact count (the reference's ldf
+                // reader decodes from the start for these seeks too).
+                self.kill();
+                *self = Self::spawn(&self.path, 0, self.rate_hz, FfmpegSeek::RestartDiscard)?;
+                let mut scratch = vec![0f32; 65536];
+                let mut remaining = sample;
+                while remaining > 0 {
+                    let want = remaining.min(scratch.len() as u64) as usize;
+                    let n = self.read(&mut scratch[..want])?;
+                    if n == 0 {
+                        break;
+                    }
+                    remaining -= n as u64;
+                }
+            }
+        }
         Ok(())
     }
 }
 
-impl Drop for FfmpegFlacSource {
+impl Drop for FfmpegSource {
     fn drop(&mut self) {
         self.kill();
     }
