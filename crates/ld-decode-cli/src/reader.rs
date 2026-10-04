@@ -11,7 +11,7 @@ use anyhow::{bail, Context as _, Result};
 use claxon::FlacReader;
 
 /// Input encoding of a raw capture (the `--format` values).
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SampleFormat {
     /// Little-endian `i16`, one sample per word (`.s16`).
     #[value(name = "s16")]
@@ -19,6 +19,16 @@ pub enum SampleFormat {
     /// Little-endian `u16`, one sample per word (`.r16` / `.u16`).
     #[value(name = "r16", alias = "u16")]
     U16Le,
+    /// 8-bit unsigned, one byte per sample (`.r8` / `.u8`). The reference
+    /// keeps these raw (`np.frombuffer(..., "uint8")`), with no scaling to
+    /// the 16-bit range.
+    #[value(name = "r8", alias = "u8")]
+    U8Le,
+    /// Signed 8-bit (`.s8`), scaled by 256 to the 16-bit range exactly as the
+    /// reference (`int8 * 256`, the same values ffmpeg's `s8` -> `pcm_s16le`
+    /// conversion yields).
+    #[value(name = "s8")]
+    S8Le,
     /// Little-endian `f32` * 32768 (`.rf`).
     #[value(name = "rf")]
     F32Le,
@@ -50,6 +60,8 @@ pub fn infer_format(path: &str) -> Result<SampleFormat> {
         "s16" => Ok(SampleFormat::S16Le),
         "r16" | "u16" => Ok(SampleFormat::U16Le),
         "rf" => Ok(SampleFormat::F32Le),
+        "r8" | "u8" => Ok(SampleFormat::U8Le),
+        "s8" => Ok(SampleFormat::S8Le),
         "lds" => Ok(SampleFormat::Lds),
         "r30" => Ok(SampleFormat::R30),
         "ldf" => Ok(SampleFormat::Ldf),
@@ -98,6 +110,8 @@ fn open_source(path: &str, file: File, format: SampleFormat, rate_hz: u32) -> Re
     Ok(match format {
         SampleFormat::S16Le => Box::new(RawSource::new(file, 2, widen_s16)),
         SampleFormat::U16Le => Box::new(RawSource::new(file, 2, widen_u16)),
+        SampleFormat::U8Le => Box::new(RawSource::new(file, 1, widen_u8)),
+        SampleFormat::S8Le => Box::new(RawSource::new(file, 1, widen_s8)),
         SampleFormat::F32Le => Box::new(RawSource::new(file, 4, widen_f32)),
         SampleFormat::Lds => Box::new(PackedSource::new(file, 4, 5, unpack_lds)),
         SampleFormat::R30 => Box::new(PackedSource::new(file, 3, 4, unpack_r30)),
@@ -131,6 +145,8 @@ fn open_stdin(format: SampleFormat) -> Result<Input> {
     match format {
         SampleFormat::S16Le => raw(2, 1, widen_s16),
         SampleFormat::U16Le => raw(2, 1, widen_u16),
+        SampleFormat::U8Le => raw(1, 1, widen_u8),
+        SampleFormat::S8Le => raw(1, 1, widen_s8),
         SampleFormat::F32Le => raw(4, 1, widen_f32),
         SampleFormat::Lds => raw(5, 4, unpack_lds),
         SampleFormat::R30 => raw(4, 3, unpack_r30),
@@ -503,6 +519,23 @@ fn widen_s16(bytes: &[u8], out: &mut [f32]) {
 fn widen_u16(bytes: &[u8], out: &mut [f32]) {
     for (dst, word) in out.iter_mut().zip(bytes.chunks_exact(2)) {
         *dst = f32::from(u16::from_le_bytes([word[0], word[1]]));
+    }
+}
+
+/// The reference reads 8-bit unsigned captures raw
+/// (`np.frombuffer(_, "uint8")`), i.e. sample values 0..255 with no scaling
+/// to the 16-bit range.
+fn widen_u8(bytes: &[u8], out: &mut [f32]) {
+    for (dst, byte) in out.iter_mut().zip(bytes.iter()) {
+        *dst = f32::from(*byte);
+    }
+}
+
+/// `.s8` is `int8 * 256` in the reference -- the same values ffmpeg's
+/// `s8` -> `pcm_s16le` conversion produces.
+fn widen_s8(bytes: &[u8], out: &mut [f32]) {
+    for (dst, byte) in out.iter_mut().zip(bytes.iter()) {
+        *dst = f32::from(i16::from(*byte as i8)) * 256.0;
     }
 }
 
@@ -1235,6 +1268,24 @@ mod tests {
         assert!(gz.contains("1f 8b 08 00"), "{gz}");
         assert!(gz.contains("1234"), "{gz}");
         assert!(unrecognised("x.ldf", &[], 0).contains("empty"));
+    }
+
+    #[test]
+    fn infers_8bit_extensions() {
+        assert_eq!(infer_format("cap.s16").unwrap(), SampleFormat::S16Le);
+        assert_eq!(infer_format("cap.r8").unwrap(), SampleFormat::U8Le);
+        assert_eq!(infer_format("cap.u8").unwrap(), SampleFormat::U8Le);
+        assert_eq!(infer_format("cap.s8").unwrap(), SampleFormat::S8Le);
+    }
+
+    #[test]
+    fn widens_u8_raw_and_s8_scaled() {
+        let mut out = [0.0f32; 4];
+        widen_u8(&[0, 1, 128, 255], &mut out);
+        assert_eq!(out, [0.0, 1.0, 128.0, 255.0]);
+
+        widen_s8(&[0x80, 0xff, 0x00, 0x7f], &mut out);
+        assert_eq!(out, [-32768.0, -256.0, 0.0, 32512.0]);
     }
 }
 
