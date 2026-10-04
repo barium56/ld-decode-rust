@@ -1,7 +1,8 @@
 # ld-decode-rust
 
 A from-scratch Rust port of the NTSC LaserDisc RF decoder from
-[ld-decode](https://github.com/happycube/ld-decode) 7.3.0.
+[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, whose
+`.tbc`/`.pcm`/`.efm` output is byte-identical to 7.3.0's.
 
 The goal is not "a decoder that produces similar pictures". The goal is a
 decoder that produces **byte-identical output files** to the Python original:
@@ -15,18 +16,22 @@ exists; parity is the constraint it is built under.
 - **NTSC only.** PAL is deliberately not ported: it needs pilot-based lineloc
   refinement, a different V4300D notch and different field constants, and none
   of it has been verified. The code assumes NTSC.
-- **Byte-parity verified end-to-end** on four input paths:
+- **Byte-parity verified end-to-end** on five input paths:
   - a full `s16` capture (168,800 fields) — 4/4 outputs identical,
-  - a full `.ddd.flac` capture decoded from frame 300 — 4/4 outputs identical,
+  - a full `.ddd.flac` capture decoded from frame 300 (168,566 fields) — 4/4
+    outputs identical,
   - a full `.ldf` capture (50,722 fields, Pioneer GGV1069) — 4/4 outputs
-    identical,
+    identical to the Python **7.4.0** release,
   - a full `.ldf` capture from a different disc (71,710 fields, Diamond Time
-    CLV) — 4/4 outputs identical.
-- **Roughly 9–20x faster than the Python reference.** About 43 FPS at `-j 9`
-  on a Ryzen 7 5800X3D (10,000 fields in ~4 minutes) against ~2–5 FPS for
-  Python 3.12 + numpy 2.4.6 + scipy 1.18.0 on the same box. FPS is only
-  meaningful with the machine otherwise idle and the output disk not full: a
-  nearly-full `F:` measurably collapses throughput.
+    CLV) — 4/4 outputs identical,
+  - a full `.ldf` capture from a third disc (108,576 fields, GGV1016 CAV) —
+    4/4 outputs identical, JSON included.
+- **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw
+  `s16` (`-j 8`) and ~45 FPS for `.ldf` (`-j 10`/`11`) on a Ryzen 7 5800X3D
+  (10,000-field window) against ~2–5 FPS for Python 3.12 + numpy + scipy on the
+  same box; the full 50,722-field GGV1069 `.ldf` takes 575 s (44.1 FPS). FPS is
+  only meaningful with the machine otherwise idle and the output disk not full:
+  a nearly-full `F:` measurably collapses throughput.
 - Produces `.tbc`, `.tbc.json`, `.pcm`, `.efm` and `.tbc.db`, plus a `.log` that
   mirrors the console output.
 
@@ -47,9 +52,10 @@ Prerequisites:
   - **Linux**: `clang++` (preferred) or `g++`, and the C++ standard library
     headers — `sudo apt install build-essential clang` on Debian/Ubuntu.
     Override the choice with `CXX=...` if needed.
-- `ffmpeg` on `PATH` for `.flac` / `.ddd.flac` inputs (and for `.ldf` container
-  sniffing). Raw `.s16`/`.r16`/`.u16`/`.rf`/`.r30`/`.lds` capture decoding needs
-  nothing else.
+- `ffmpeg` on `PATH` for `.flac` / `.ddd.flac` and Ogg `.ldf` inputs; the
+  `.ldf` path falls back to the in-process claxon decoder with
+  `LD_NO_FFMPEG=1`. Raw `.s16`/`.r16`/`.u16`/`.r8`/`.u8`/`.s8`/`.rf`/`.r30`/
+  `.lds` capture decoding needs nothing else.
 
 ```bash
 cargo build --release    # target/release/ld-decode.exe on Windows, ld-decode elsewhere
@@ -59,21 +65,21 @@ Decode a capture:
 
 ```bash
 # whole file
-target/release/ld-decode -j 9 "capture.ddd.flac" out
+target/release/ld-decode -j 10 "capture.ddd.flac" out
 
 # start at frame 1000, decode 1000 frames (frames, not samples; 2 fields each)
-target/release/ld-decode -j 9 -s 1000 -l 1000 "capture.s16" out
+target/release/ld-decode -j 10 -s 1000 -l 1000 "capture.s16" out
 
 # run with no arguments for the full usage text (same output as --help)
 target/release/ld-decode
 ```
 
-`-j 9` is the measured sweet spot on an 8-core/16-thread machine, and the
-optimum is flat only over a narrow band: `-j` 8/9/10/11 measure 38.1/39.1/37.5/
-36.9 FPS. The demodulation pool is throughput-bound, so raising it past the
-physical core count loses (SMT sharing costs more than the extra worker gains):
-`-j` 12/14/16 fall to 34.6/32.0/28.8 FPS. The default scales with the core count
-(`logical/2 + 1`, minimum 2).
+`-j` matters more than it looks: the demodulation pool is throughput-bound, so
+raising the count past the physical core count loses, and the optimum moves with
+the input. On an 8-core/16-thread machine, raw `s16` peaks around `-j 8`
+(~46 FPS) while `.ldf` peaks at `-j 10`/`11` (~45 FPS; a window sweep gives
+8/9/10/11/12/13 = 41.1/44.1/44.2/45.1/43.1/40.1). The default scales with the
+core count (`logical * 5 / 8`, minimum 2 — 10 on a 16-thread box).
 
 ## Command line
 
@@ -84,9 +90,10 @@ ld-decode.exe [OPTIONS] <INFILE> <OUTFILE>
 Running the program with no arguments prints this same usage text, exactly as
 `--help` does.
 
-`INFILE` is what to decode, `OUTFILE` is the base name for the outputs
-(`out` produces `out.tbc`, `out.tbc.json`, `out.pcm`, `out.efm`, `out.tbc.db`
-and `out.log`).
+`INFILE` is what to decode — a file, or `-` for stdin (stdin needs `--format`,
+and `-s`/`-S` can only move forward there). `OUTFILE` is the base name for the
+outputs (`out` produces `out.tbc`, `out.tbc.json`, `out.pcm`, `out.efm`,
+`out.tbc.db` and `out.log`).
 
 `OUTFILE` may also be `-`, which streams the `.tbc` picture to stdout as raw
 little-endian `uint16` and disables every sidecar output (the JSON header
@@ -95,8 +102,8 @@ picture bytes — in this mode the console log goes to stderr instead):
 
 ```bash
 # pipe the picture straight into something else
-ld-decode.exe -j 9 "capture.s16" - > out.tbc
-ld-decode.exe -j 9 "capture.s16" - | ffmpeg -f rawvideo ...
+ld-decode.exe -j 10 "capture.s16" - > out.tbc
+ld-decode.exe -j 10 "capture.s16" - | ffmpeg -f rawvideo ...
 ```
 
 The bytes are identical to what a normal run writes, so `out.tbc` above is the
@@ -109,8 +116,9 @@ decoding the rest of the disc into a broken pipe (same for a filled disk).
 | `-s`, `--start <n>` | `0` | Rough jump to **frame** `n` of the capture (2 fields per frame). |
 | `-l`, `--length <n>` | until EOF | Decode at most `n` **frames**. |
 | `-S`, `--seek <n>` | off | Seek to a specific VBI frame number; needs readable CAV/CLV frame codes on the disc and fails gracefully without them. |
-| `-j`, `--threads <n>` | `logical/2 + 1`, min 2 | Demodulation worker threads. The serial tail's parallel sections get a quarter of this, so the split matters more than the total. |
-| `--inputfreq <MHz>` | `40` | Input sample rate. |
+| `-j`, `--threads <n>` | `logical * 5 / 8`, min 2 | Demodulation worker threads. The serial tail's parallel sections get a quarter of this, so the split matters more than the total. |
+| `--format <fmt>` | from the extension | Input sample format when it cannot be inferred (required for stdin): `s16`, `r16`/`u16`, `r8`/`u8`, `s8`, `rf`, `lds`, `r30`, `ldf`, `flac`. |
+| `--inputfreq <MHz>` | from FLAC metadata, else `40` | Input sample rate. The rate a `.flac`/`.ldf` capture declares in kHz is its RF sample rate in MHz. |
 | `--mtf <x>` | `1.0` | MTF compensation multiplier. |
 | `--mtf-offset <x>` | `0.0` | MTF compensation offset. |
 | `--deemp-str <x>` | `1.0` | De-emphasis strength multiplier. |
@@ -127,17 +135,19 @@ The output prefix doubles as the log path, so each run writes `<outfile>.log`
 
 ## Input formats
 
-The format is inferred from the file extension; there is no stdin support and no
-explicit format flag.
+The format is inferred from the file extension; `--format` overrides it and is
+required for stdin (`INFILE` = `-`).
 
 | Extension | Content |
 | --- | --- |
 | `.s16` | Raw signed 16-bit little-endian RF samples. |
 | `.r16`, `.u16` | Raw unsigned 16-bit samples. |
+| `.r8`, `.u8` | Raw unsigned 8-bit samples, kept raw (0..255 — the reference's `uint8` view, not scaled). |
+| `.s8` | Signed 8-bit, scaled by 256 (`int8 * 256`, the same values ffmpeg's s8 conversion yields). |
 | `.rf` | Raw 32-bit float samples. |
 | `.lds` | Packed 10-bit DdD format (4 samples in 5 bytes). |
 | `.r30` | Packed 10-bit legacy format (3 samples in 4 bytes). |
-| `.ldf` | FLAC capture. The container is sniffed, like PyAV does for the Python reference: Ogg-wrapped FLAC (what the Domesday Duplicator writes) is decoded in-process by claxon with seeking restarting the decoder, while a bare FLAC stream is handled exactly like `.flac`. Trailing tags or a stray capture header before the magic are tolerated. |
+| `.ldf` | FLAC capture. The container is sniffed, like PyAV does for the Python reference: Ogg-wrapped FLAC (what the Domesday Duplicator writes) is decoded by the same `ffmpeg` s16le subprocess the `.flac` path uses — the reference's own decoder, and ~2.7x claxon's throughput here; `LD_NO_FFMPEG=1` falls back to the in-process claxon decoder. Seeks restart the child and discard the exact sample count rather than use `ffmpeg -ss`, matching the Python reader's semantics. A bare FLAC stream is handled exactly like `.flac`. Trailing tags or a stray capture header before the magic are tolerated. |
 | `.flac`, `.ddd.flac` | Raw (non-Ogg) FLAC capture, decoded by an `ffmpeg` subprocess; set `LD_NO_FFMPEG=1` to fall back to the in-process decoder. |
 
 ## Output files
@@ -154,10 +164,10 @@ explicit format flag.
 ## Verifying parity
 
 The end-to-end gate is a hash comparison of all four decodable artifacts. On a
-machine that has the reference outputs and the Python 7.3.0 tree:
+machine that has the reference outputs and the Python 7.4.0 tree:
 
 ```bash
-ld-decode.exe -j 9 "capture.s16" rust_full
+ld-decode.exe -j 10 "capture.s16" rust_full
 b3sum rust_full.tbc rust_full.pcm rust_full.efm rust_full.tbc.json
 # compare against the hashes recorded for the Python run of the same input
 ```
@@ -174,8 +184,8 @@ is not trustworthy (a concurrent `cargo build` on the same box once produced a
 +4% "win" that a clean 4-round re-measure showed to be noise).
 
 ```bash
-ld-decode.exe -j 9 -s 1000 -l 1000 "capture.s16" new
-ld-decode.exe -j 9 -s 1000 -l 1000 "capture.s16" old
+ld-decode.exe -j 10 -s 1000 -l 1000 "capture.s16" new
+ld-decode.exe -j 10 -s 1000 -l 1000 "capture.s16" old
 # compare new.tbc/pcm/efm/tbc.json against old.* with b3sum
 ```
 
@@ -184,9 +194,10 @@ artifacts, so a cheap prefix comparison is available when the change cannot
 touch long-run state:
 
 ```bash
-ld-decode.exe -j 9 -l 500 "capture.s16" head500
+ld-decode.exe -j 10 -l 500 "capture.s16" head500
+REF=/path/to/python/full-run          # same capture, from field 0
 for x in tbc pcm efm; do
-  cmp -n "$(stat -c%s head500.$x)" head500.$x "_stock_s16_full_7.3.0/capture.$x"
+  cmp -n "$(stat -c%s head500.$x)" "head500.$x" "$REF.$x"
 done
 ```
 
@@ -211,8 +222,8 @@ clean, the decoder is in its reference configuration.
 
 | Variable | Effect |
 | --- | --- |
-| `LD_FFT_ENGINE=sse2\|avx2fma\|avx2` | Pick one of the three ducc0 builds linked into the binary. **`sse2` is the default and the one to use**: all three are bit-identical, but both AVX2 engines measure ~21% *slower* in situ at `-j 9` (34.0/33.7 FPS vs 43.1/43.0) because of an AVX2/FMA frequency-offset penalty under load. The engine in use is logged at startup. |
-| `LD_NO_FFMPEG=1` | Decode `.flac` with claxon instead of `ffmpeg`. Bit-identical, but slower (33.7 vs 37.1 FPS), so `ffmpeg` stays the default. |
+| `LD_FFT_ENGINE=sse2\|avx2fma\|avx2` | Pick one of the three ducc0 builds linked into the binary. **`sse2` is the default and the only parity-safe choice.** Each engine has its own entry symbols since a 2026-09-22 symbol-aliasing fix; the AVX2 engines evaluate a different, differently-rounded sequence (4 lanes per transform), so they are *not* bit-identical to the golden. Isolated they are faster (a single `r2c` 2.7x, a batched inverse 1.5x), but in situ the win shrinks to +1-4% (`s16`) / +4-8% (`.flac`). The engine in use is logged at startup. |
+| `LD_NO_FFMPEG=1` | Decode `.flac` and Ogg `.ldf` with claxon instead of `ffmpeg`. Bit-identical (the `.ldf` gates were run both ways), but slower — on `.ldf` claxon starves the demod pool (37.1 vs 44.2 FPS at `-j 10`) — so `ffmpeg` stays the default. |
 | `LD_PF_POOL=n`, `LD_SIDE_POOL=n` | Override the demod/side worker pool split. Both optima are measured and closed: the demod pool is throughput-bound at one thread per physical core, and widening the tail/side pools is a loss. |
 | `LD_START_SAMPLE=n` | Start at an absolute sample instead of a frame. |
 | `LD_NO_ASYNC_PREFETCH=1`, `LD_NO_DOD_PRE=1` | Disable the async demod prefetch and the dropout pre-pass. |
@@ -239,33 +250,36 @@ scipy 1.18.0 spectra (1024 and 32768, the size the pipeline actually
 transforms), numpy's pairwise summation and `std` against generated cases,
 `butter`/`firwin`/`filtfft`/emphasis filters against scipy coefficients, the
 sinc LUT against its reference table, and the batched inverse FFT against the
-per-transform scalar form it replaced. The stored spectra are committed per
-platform (see [Platform support](#platform-support)), so the suite runs
-unchanged on Windows and Linux with no extra tooling. Expect **36 passed, 3
-ignored**, plus one test that is filtered out or skipped:
+per-transform scalar form it replaced. The stored spectra are committed as one
+set for both platforms (see [Platform support](#platform-support)), so the suite
+runs unchanged on Windows and Linux with no extra tooling. Expect **55 passed,
+5 ignored**, plus one test that is filtered out or skipped:
 
 - `pll_matches_stock_field_stream` needs `LD_PLL_DIR` pointing at a golden
   field stream dumped from a stock Python run; it fails loudly without it, so
   the CI commands pass `--skip pll_matches_stock_field_stream`. A local run
   without that variable will therefore report one failure — that is the known
   environmental one, not a regression.
-- The three `#[ignore]`d tests (`probe_block`, `atan2_cmp`,
-  `probe_sizes_vs_scipy`) read dumps that are not in the repo. Run them
-  explicitly with `cargo test -- --ignored` where those dumps exist.
+- The five `#[ignore]`d tests (`probe_block`, `atan2_cmp`,
+  `probe_sizes_vs_scipy`, `kernel_shape_speed_census`,
+  `construction_fingerprint_probe`) read dumps that are not in the repo or take
+  minutes to report timings. Run them explicitly with `cargo test -- --ignored`
+  where those dumps exist.
 
-Two known release-only fidelity failures exist in the notes for
-`fefm_stage_isolation` and `fefm_bit_exact_matches_scipy_118` (nightly codegen
-drift in `gen_bpf_supergauss`, ~1.4e-14); the tolerances sit at 1e-12 and the
-debug profile passes exactly.
+The two `fefm` fidelity tests (`fefm_stage_isolation`,
+`fefm_bit_exact_matches_scipy_118`) have a historical 1-ulp-sensitive spot
+(nightly codegen drift in `gen_bpf_supergauss`, ~1.4e-14) and sit at a 1e-12
+tolerance; they pass in both profiles.
 
 CI (`.github/workflows/ci.yml`) runs the same job on **Windows x86-64 and Linux
 x86-64** and does what CI can do without the captures: release build, the test
 suite in both the debug and the release profile, and the shared smoke test
 (`.github/scripts/smoke.sh`, used by every workflow) — a zero-signal decode that
-must exit cleanly and write all six output artifacts, plus the `.ldf`
-container-sniffing, pipe-to-stdout and argument-parsing paths. `ffmpeg` is
-installed in CI because the `.ldf` smoke test shells out to it to build a
-bare-FLAC fixture. The `b3sum` 4/4 gate needs the capture files and hours of
+must exit cleanly and write its outputs (`.tbc`/`.pcm`/`.efm`/`.tbc.db`/`.log`,
+and **no** `.tbc.json`: a decode that handles no fields must not leave one,
+matching Python 7.4.0), plus the `.ldf` container-sniffing, pipe-to-stdout and
+argument-parsing paths. `ffmpeg` is installed in CI because the `.ldf` smoke
+test shells out to it to build its bare-FLAC and Ogg-FLAC fixtures. The `b3sum` 4/4 gate needs the capture files and hours of
 runtime, so it stays a local, manual check. The Rust toolchain is pinned in CI to
 the nightly the parity tolerances are calibrated against; do not set `RUSTFLAGS`
 in a workflow, because that would replace the `target-cpu=x86-64-v3` setting in
@@ -282,10 +296,13 @@ older distributions.
 ## Platform support
 
 **Windows x86-64 and Linux x86-64 are both supported**, and both are held to the
-same bar: byte-identical output files against the Windows Python 7.3.0 reference
-— the same hashes on both platforms, not "close on each". What makes that
-portable is that the parity-critical pieces are either platform-independent or
-served by bit-exact ports of the one platform's math library:
+same bar: byte-identical output files against the Python reference — the same
+hashes on both platforms, not "close on each". The port targets the **7.4.0**
+release; 7.4.0 is byte-identical to 7.3.0 on `.tbc`/`.pcm`/`.efm`, and the only
+`.tbc.json` difference is the version stanza (`release:7.4.0`,
+`gitCommit=7.4.0`). What makes that portable is that the parity-critical pieces
+are either platform-independent or served by bit-exact ports of the one
+platform's math library:
 
 - **The FFT is the vendored ducc0 source, at a fixed SIMD width.** `scipy.fft`
   dispatches to ducc0; the shipped scipy 1.18.0 wheel for Windows x86-64 uses
@@ -298,14 +315,18 @@ served by bit-exact ports of the one platform's math library:
   defined by ducc0's source, not by the compiler. The `engine_simd_widths` test
   asserts the compiled lane widths, so a silently dropped or added ISA flag
   fails the suite rather than quietly changing results.
-- **AVX2 builds are linked in but not used.** `avx2`/`avx2fma` engines are
-  runtime-selectable via `LD_FFT_ENGINE`; they are bit-identical on every golden
-  and end-to-end, but measure **~21% slower** in situ at `-j 9` (34.0/33.7 FPS
-  against 43.1/43.0) — the isolated microbenchmark that once showed all engines
-  equal was measuring one transform on an idle core. So `sse2` stays the default
-  for parity *and* speed, and any codegen change needs an in-situ A/B before it
-  can be called neutral. Off x86 they are compiled from the same portable TU and
-  the runtime feature gate never selects them.
+- **AVX2 builds are linked in but not used, and the old "all engines are
+  identical" claim was an artifact.** Every engine used to link to one shared set
+  of `ducc0::detail_fft` symbols — the linker silently kept the SSE2 copy, so all
+  three measured the same because they were the same code. Each engine has its
+  own entry symbols since 2026-09-22; the genuinely 4-lane AVX2 kernels evaluate
+  a different, differently-rounded sequence, so they are **not** bit-exact
+  (tens of thousands of bins of the 32768-point golden differ). Isolated they
+  are faster (2.7x for a single `r2c`, 1.5x for the batched inverse), but in situ
+  that shrinks to +1-4% (`s16`) / +4-8% (`.flac`) — not a trade the parity
+  contract allows. So `sse2` stays the default, and any codegen change needs an
+  in-situ A/B before it can be called neutral. Off x86 they are compiled from
+  the same portable TU and the runtime feature gate never selects them.
 - **The reference's libm calls are the parity target, and Linux does not call
   glibc for them.** `sin`/`cos` come from bit-exact ports of UCRT
   (`optimized/ucrt_math.rs`), because UCRT and glibc disagree by 1-2 ulp on a few
@@ -416,9 +437,10 @@ against 156.1 s in WSL2 at `-j 9`** (the decoder logs frames/s, so those print a
 
 The strongest statement available is a **full-disc** one, and Linux now meets it.
 The complete 168 800-field s16 decode (36.5 FPS, 2310 s in WSL2) reproduces the
-Windows Python 7.3.0 reference **byte-for-byte on all three bit-compared
-outputs** — `.tbc` (80 797 808 000 bytes), `.pcm` and `.efm`, each sha256-equal
-to `_stock_s16_full_7.3.0`. That supersedes the windowed table above: the
+Python reference **byte-for-byte on all three bit-compared outputs** — `.tbc`
+(80 797 808 000 bytes), `.pcm` and `.efm`, each sha256-equal to the stored
+full-disc hashes (`824339c4…`, `4da47019…`, `6f83a0be…`). That supersedes the
+windowed table above: the
 long-run state the windowed runs cannot reach (AGC/MTF history) is reproduced
 too, and the one-byte field-11656 drift is gone.
 
@@ -490,6 +512,9 @@ alternative changed output bytes.
   identically; it is a dev tool, not a parity bug.
 - On one disc band the reference's own `uint16` arithmetic rejects a field the
   maths says should pass, and the port reproduces that.
+- A decode that handles no fields writes no `.tbc.json` at all: Python 7.4.0's
+  JSON dumper drops its `None` snapshot and the port matches that (7.3.0 left a
+  truncated temp file behind instead).
 
 ## Repository layout
 
@@ -524,7 +549,7 @@ without a C++ toolchain (check-only: it will not link).
 Speed is the point of the port, so the measurement discipline is part of the
 design. The pipeline is **CPU-saturated, not latency-bound**: at `-j 9` roughly
 97% of the eight physical cores are busy, and about 84% of that CPU is the
-demodulation kernel, of which ~76% is ducc FFT. That has two consequences that
+demodulation kernel, of which ~76% is ducc FFT. That has consequences that
 repeatedly decide experiments:
 
 - **Deleting CPU anywhere pays**, because it frees cores and memory bandwidth for
@@ -533,6 +558,13 @@ repeatedly decide experiments:
   demand `dcpu/9` ~9.8 ms per field), and the prefetch fold wait correlates +0.88
   with that field's batch span. So a driver-side saving becomes pool wait, and
   only pool-side span or CPU cuts pay one for one.
+- **The reader can starve the pool on compressed inputs, and that is invisible
+  in decode CPU.** The `.ldf` path originally decoded Ogg-FLAC in-process and
+  spent 18.6 s of a 10,000-field run outside `decode()` (raw `s16`: 5.4 s) —
+  claxon delivers ~54M samples/s against the ~137 MB/s the demod pool consumes.
+  The `.ldf` reader now uses the same `ffmpeg` s16le child the `.flac` path
+  already spawned (~143M samples/s), which removed the starvation and moved the
+  full-disc GGV1069 run from 36.7 to 44.1 FPS.
 
 Before proposing an optimization, check whether it is already recorded as a dead
 end. Several plausible ones are, with the measurement that killed them: finer
