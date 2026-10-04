@@ -1,8 +1,8 @@
 # ld-decode-rust
 
 A from-scratch Rust port of the NTSC LaserDisc RF decoder from
-[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, whose
-`.tbc`/`.pcm`/`.efm` output is byte-identical.
+[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, byte-identical on
+`.tbc`/`.pcm`/`.efm`.
 
 The goal is not "a decoder that produces similar pictures". The goal is a
 decoder that produces **byte-identical output files** to the Python original:
