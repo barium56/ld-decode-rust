@@ -68,7 +68,7 @@ impl<'a> DemodSpecRef<'a> {
             freq_hz,
             blocklen,
             blockcut: 1024,
-            blockcut_end: filters.f05_offset,
+            blockcut_end: filters.block_cut_end(),
             filters,
             levels,
         }

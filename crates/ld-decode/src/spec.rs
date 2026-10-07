@@ -1468,6 +1468,42 @@ pub(crate) struct Filters {
     pub fefm: Vec<Complex64>,
 }
 
+impl Filters {
+    /// Samples cut from the end of each demod block.
+    ///
+    /// The post-demod FIR delay (`f05_offset`) is the minimum. It is rounded up
+    /// to a multiple of the analog-audio decimation: the stage-1 audio is cut
+    /// by `blockcut_end / audio_fdiv`, and unless that division is exact the
+    /// audio blocks no longer tile at the video block stride (`blocksize /
+    /// audio_fdiv` would not be a whole number of audio samples), so the audio
+    /// drifts against the video. `audio_fdiv` follows the input rate (32 at
+    /// 30-40 MHz, 64 at 75 MHz), so this is what keeps other rates aligned. At
+    /// 40 MHz `f05_offset == audio_fdiv == 32` and the result is the reference's
+    /// 32.
+    pub(crate) fn block_cut_end(&self) -> usize {
+        self.f05_offset.div_ceil(self.audio_fdiv.max(1)) * self.audio_fdiv.max(1)
+    }
+}
+
+/// The input rate must leave every RF filter edge below Nyquist: a Butterworth
+/// edge at or past it has no digital equivalent, and the filter bank would come
+/// out as garbage rather than fail. Refused up front with the rate that works.
+fn check_nyquist(freq_hz_half: f64, edges: &[(&str, f64)]) -> Result<()> {
+    for &(name, hz) in edges {
+        if hz >= freq_hz_half {
+            bail!(
+                "input rate {:.3} MHz is too low: the {name} ({:.2} MHz) must be below \
+                 Nyquist ({:.3} MHz); this setting needs an input rate above {:.2} MHz",
+                freq_hz_half * 2.0 / 1e6,
+                hz / 1e6,
+                freq_hz_half / 1e6,
+                hz * 2.0 / 1e6
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Filter delays measured from a synthetic signal (`computedelays`).
 pub(crate) struct Delays {
     /// Delay of the sync path in samples (used by VITS black-level RF metrics).
@@ -1605,6 +1641,17 @@ impl DecoderSpec {
         }
         let deemp_strength = request.deemp_str;
 
+        check_nyquist(
+            freq_hz_half,
+            &[
+                ("video band-pass high edge", video_bpf_high),
+                ("video band-pass low edge", video_bpf_low),
+                ("video low-pass", video_lpf_freq),
+                ("MTF pole frequency", DP_MTF_FREQ * 1e6),
+                ("dropout RF high-pass", DP_VIDEO_HPF_FREQ),
+            ],
+        )?;
+
         let blocklen = BLOCKSIZE;
         let blockcut = 1024;
         let audio_lfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 146.25;
@@ -1622,7 +1669,7 @@ impl DecoderSpec {
             deemp_strength,
             request.ntsc_color_notch,
         )?;
-        let blockcut_end = filters.f05_offset;
+        let blockcut_end = filters.block_cut_end();
         let blocksize = blocklen - blockcut - blockcut_end;
 
         let delays = compute_delays(
@@ -1854,7 +1901,7 @@ fn compute_filters(
     ntsc_color_notch: bool,
 ) -> Result<(Filters, Vec<Complex64>, Vec<Complex64>)> {
     // RF highpass for dropout detection.
-    let frfhpf = butter_ba(1, &[10.0 / freq_half], FilterBandType::Highpass)?;
+    let frfhpf = butter_ba(1, &[DP_VIDEO_HPF_FREQ / 1e6 / freq_half], FilterBandType::Highpass)?;
     if std::env::var_os("LD_DUMP_BA").is_some() {
         let hp = butter_ba(
             DP_VIDEO_BPF_LOW_ORDER,
@@ -1866,7 +1913,7 @@ fn compute_filters(
             &[video_bpf_high / freq_hz_half],
             FilterBandType::Lowpass,
         )?;
-        let frfhpf_d = butter_ba(1, &[10.0 / freq_half], FilterBandType::Highpass)?;
+        let frfhpf_d = butter_ba(1, &[DP_VIDEO_HPF_FREQ / 1e6 / freq_half], FilterBandType::Highpass)?;
         let video_lpf_d = butter_ba(
             DP_VIDEO_LPF_ORDER,
             &[DP_VIDEO_LPF_FREQ / freq_hz_half],
@@ -2466,6 +2513,53 @@ fn ifft_real(data: &[Complex64], blocklen: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec_at(mhz: f64) -> Result<DecoderSpec> {
+        let mut request = crate::request::DecodeRequest::default();
+        request.inputfreq = mhz;
+        DecoderSpec::new(&request)
+    }
+
+    /// Nothing the spec derives may depend on the input rate being 40 MHz: the
+    /// audio blocks must tile at the video block stride (whole audio samples per
+    /// block) and the cuts must never fall below the FIR delay they hide.
+    #[test]
+    fn blocks_tile_at_every_supported_input_rate() {
+        for mhz in [28.0, 30.0, 37.5, 40.0, 45.0, 60.0, 75.0] {
+            let spec = spec_at(mhz).unwrap_or_else(|e| panic!("{mhz} MHz: {e:#}"));
+            let fdiv = spec.filters.audio_fdiv;
+            assert!(fdiv >= 1 && spec.blocklen % fdiv == 0, "{mhz} MHz: fdiv {fdiv}");
+            assert_eq!(spec.blockcut % fdiv, 0, "{mhz} MHz: blockcut");
+            assert_eq!(spec.blockcut_end % fdiv, 0, "{mhz} MHz: blockcut_end");
+            assert_eq!(spec.blocksize % fdiv, 0, "{mhz} MHz: blocksize");
+            assert!(spec.blockcut_end >= spec.filters.f05_offset, "{mhz} MHz");
+            assert_eq!(
+                spec.blocksize,
+                spec.blocklen - spec.blockcut - spec.blockcut_end,
+                "{mhz} MHz"
+            );
+        }
+    }
+
+    /// The reference's cut at 40 MHz is unchanged by the rate-following rule.
+    #[test]
+    fn blockcut_end_at_40mhz_is_the_reference_value() {
+        let spec = spec_at(40.0).unwrap();
+        assert_eq!(spec.filters.audio_fdiv, 32);
+        assert_eq!(spec.blockcut_end, 32);
+        assert_eq!(spec.blocksize, 31712);
+    }
+
+    /// A rate whose Nyquist is under the 13.8 MHz video band edge is refused
+    /// with a message, not decoded through a nonsensical filter bank.
+    #[test]
+    fn too_low_an_input_rate_is_refused_with_the_reason() {
+        let err = match spec_at(20.0) {
+            Ok(_) => panic!("20 MHz must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("too low") && err.contains("27.60"), "{err}");
+    }
 
     /// Every value the spec *constructs*, as a `(name, FNV-1a hash)` list: the
     /// whole filter bank (which is the ducc-FFT output of the constructed

@@ -440,7 +440,7 @@ fn open_ldf(path: &str, mut file: File, rate_hz: u32) -> Result<Box<dyn SampleSo
         // but ffmpeg only probes the stream from offset 0 -- a shifted marker
         // goes straight to claxon positioned on it.
         Container::Flac if offset == 0 => open_raw_flac(path, file, 0, rate_hz),
-        Container::Flac => Ok(Box::new(RawFlacSource::open(path, file, offset)?)),
+        Container::Flac => Ok(Box::new(RawFlacSource::open(path, file, offset, rate_hz)?)),
     }
 }
 
@@ -457,7 +457,7 @@ fn open_raw_flac(path: &str, mut file: File, offset: u64, rate_hz: u32) -> Resul
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("seeking {path}"))?;
     }
-    Ok(Box::new(RawFlacSource::open(path, file, offset)?))
+    Ok(Box::new(RawFlacSource::open(path, file, offset, rate_hz)?))
 }
 
 /// Streams input as raw `f32` samples and seeks by sample index.
@@ -826,13 +826,15 @@ struct RawFlacSource {
     /// Byte offset of the FLAC marker, from the container sniff (0 for ordinary
     /// `.flac` files; non-zero for a `.ldf` holding a shifted FLAC stream).
     offset: u64,
+    /// FLAC container rate in Hz (selects the Python-compat seek shim).
+    rate_hz: u32,
     flac: FlacReader<BufReader<File>>,
     block: Vec<i32>,
     block_pos: usize,
 }
 
 impl RawFlacSource {
-    fn open(path: &str, mut file: File, offset: u64) -> Result<Self> {
+    fn open(path: &str, mut file: File, offset: u64, rate_hz: u32) -> Result<Self> {
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
                 .with_context(|| format!("seeking {path}"))?;
@@ -841,6 +843,7 @@ impl RawFlacSource {
         Ok(Self {
             path: path.to_string(),
             offset,
+            rate_hz,
             flac,
             block: Vec::new(),
             block_pos: 0,
@@ -1124,7 +1127,7 @@ impl SampleSource for FfmpegSource {
         }
         match self.seek {
             FfmpegSeek::PySeek => {
-                let target = flac_pyseek(sample);
+                let target = flac_pyseek(sample, self.rate_hz);
                 self.kill();
                 *self = Self::spawn(&self.path, target, self.rate_hz, FfmpegSeek::PySeek)?;
             }
@@ -1180,7 +1183,7 @@ impl SampleSource for RawFlacSource {
         if std::env::var_os("LD_TRACE_SEEK").is_some() {
             ld_decode::teeprintln!("FLAC SEEK to {sample}");
         }
-        let sample = flac_pyseek(sample);
+        let sample = flac_pyseek(sample, self.rate_hz);
         let mut file = File::open(&self.path)
             .with_context(|| format!("reopening {} for seek", self.path))?;
         if self.offset > 0 {
@@ -1218,10 +1221,14 @@ impl SampleSource for RawFlacSource {
 /// same decode pipeline is bit-exact, so reproducing this delivery offset is
 /// what makes rust's .flac output md5-identical to the python reference's.
 ///
+/// The constants above (40000, 102400) are those of a 40 kHz container label.
+/// At any other rate nothing is known about what the reference delivers, so the
+/// seek is honest and sample-exact rather than a guess at its artifact.
+///
 /// `LD_NO_FLAC_PYSEEK=1` restores honest sample-exact seeking;
 /// `LD_FLAC_SHIFT=n` overrides the computed shift for A/B tests.
-fn flac_pyseek(sample: u64) -> u64 {
-    if std::env::var_os("LD_NO_FLAC_PYSEEK").is_some() {
+fn flac_pyseek(sample: u64, rate_hz: u32) -> u64 {
+    if rate_hz != DEFAULT_FLAC_RATE_HZ || std::env::var_os("LD_NO_FLAC_PYSEEK").is_some() {
         return sample;
     }
     if let Ok(s) = std::env::var("LD_FLAC_SHIFT") {
