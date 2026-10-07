@@ -48,15 +48,19 @@ pub(crate) struct EfmPll {
     t_counter: i8,
 }
 
-impl Default for EfmPll {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// The rate the reference ld-decode hard-codes (40 MSPS).
+#[cfg(test)]
+const REFERENCE_RATE_HZ: f64 = 40000000.0;
+
+/// EFM channel bit rate (T1 clock) in Hz.
+const EFM_BIT_RATE_HZ: f64 = 4321800.0;
 
 impl EfmPll {
-    pub fn new() -> Self {
-        let base_period = 40000000.0 / 4321800.0; // T1 clock period 40MSPS / bit-rate
+    /// `sample_rate_hz` is the rate of the samples fed to `process` (the decode
+    /// input rate): the T1 clock period is that many samples per EFM bit. At
+    /// 40 MHz this is exactly the reference's `40000000.0 / 4321800.0`.
+    pub fn new(sample_rate_hz: f64) -> Self {
+        let base_period = sample_rate_hz / EFM_BIT_RATE_HZ; // T1 clock period
         Self {
             zc_previous_input: 0,
             delta: 0.0,
@@ -210,7 +214,9 @@ impl EfmPll {
 /// the same machine and runs the same `process`, so the bytes are identical by
 /// construction rather than by re-implementation.
 pub(crate) fn process_pll_detached(state: EfmPllState, input: &[i16]) -> (EfmPllState, Vec<i8>) {
-    let mut pll = EfmPll::new();
+    // `set_state` overwrites every field, including the periods, so the rate
+    // given here is never used.
+    let mut pll = EfmPll::new(state.base_period * EFM_BIT_RATE_HZ);
     pll.set_state(state);
     let out = pll.process(input);
     (pll.state(), out)
@@ -243,13 +249,40 @@ mod tests {
         out
     }
 
+    /// At 40 MHz the periods are the reference's exact constants (bit for bit),
+    /// so the parity with Python ld-decode cannot move.
+    #[test]
+    fn pll_at_40mhz_keeps_the_reference_periods() {
+        let base: f64 = 40000000.0 / 4321800.0;
+        let s = EfmPll::new(40_000_000.0).state();
+        assert_eq!(s.base_period.to_bits(), base.to_bits());
+        assert_eq!(s.minimum_period.to_bits(), (base * 0.90).to_bits());
+        assert_eq!(s.maximum_period.to_bits(), (base * 1.10).to_bits());
+        assert_eq!(s.period_adjust_base.to_bits(), (base * 0.0001).to_bits());
+        assert_eq!(s.current_period.to_bits(), base.to_bits());
+    }
+
+    /// At another input rate the T1 period follows it (30 MHz: 6.94 samples,
+    /// not the 9.26 of 40 MHz) and the +/-10 % window is centred on it.
+    #[test]
+    fn pll_at_30mhz_scales_the_periods() {
+        let base: f64 = 30000000.0 / 4321800.0;
+        let s = EfmPll::new(30_000_000.0).state();
+        assert_eq!(s.base_period.to_bits(), base.to_bits());
+        assert_eq!(s.minimum_period.to_bits(), (base * 0.90).to_bits());
+        assert_eq!(s.maximum_period.to_bits(), (base * 1.10).to_bits());
+        assert_eq!(s.period_adjust_base.to_bits(), (base * 0.0001).to_bits());
+        assert_eq!(s.current_period.to_bits(), base.to_bits());
+        assert_ne!(s, EfmPll::new(40_000_000.0).state());
+    }
+
     /// The detached path must be bit-identical to the inline path across
     /// carried state, including buffer-growth boundaries.
     #[test]
     fn detached_pll_matches_inline_bitwise() {
         let sizes = [1usize, 2, 17, 4096, 65535, 65536, 65537, 70000];
-        let mut inline = EfmPll::new();
-        let mut detached_state = EfmPll::new().state();
+        let mut inline = EfmPll::new(REFERENCE_RATE_HZ);
+        let mut detached_state = EfmPll::new(REFERENCE_RATE_HZ).state();
         for (k, &n) in sizes.iter().enumerate() {
             let input = pseudo_efm(0x9E3779B97F4A7C15 ^ (k as u64), n);
             let want = inline.process(&input);
@@ -333,7 +366,7 @@ mod tests {
         // capture dump many more).
         let symbols: usize = pairs.iter().map(|(_, w)| w.len()).sum();
         assert!(symbols >= 1000, "only {symbols} reference symbols");
-        let mut pll = EfmPll::new();
+        let mut pll = EfmPll::new(REFERENCE_RATE_HZ);
         for (n, (input, want)) in pairs.iter().enumerate() {
             let out = pll.process(input);
             let m = out.len().min(want.len());

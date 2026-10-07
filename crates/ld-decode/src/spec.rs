@@ -1814,7 +1814,10 @@ fn compute_fefm(freq_hz: f64, blocklen: usize) -> Vec<Complex64> {
         *v *= 8.0;
     }
     // self.Filters["Fefm"] *= gen_bpf_supergauss(20000, 1600000, 60, 20000000, blocklen)
-    let bpf = gen_bpf_supergauss(20000.0, 1600000.0, 60, 20000000.0, blocklen);
+    // The reference hard-codes the 40 MHz Nyquist (20 MHz); here it follows the
+    // input rate, which is the same value at 40 MHz and keeps the 20 kHz-1.6 MHz
+    // band put at any other rate.
+    let bpf = gen_bpf_supergauss(20000.0, 1600000.0, 60, freq_hz / 2.0, blocklen);
     if let Some(dir) = std::env::var_os("LD_DUMP_GD") {
         use std::io::Write;
         let d = dir.to_string_lossy().into_owned();

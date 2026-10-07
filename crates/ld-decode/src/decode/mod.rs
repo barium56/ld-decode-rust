@@ -719,6 +719,9 @@ impl Decoder {
         let bytes_per_field = spec.bytes_per_field() as f64;
         let linelen = spec.linelen;
         let readlen = ((linelen * 350) / 16384) * 16384;
+        // Read before `spec` moves into the struct: the EFM PLL clocks at the
+        // input rate.
+        let sample_rate_hz = spec.freq_hz;
         Self {
             spec,
             dbg: DbgTiming {
@@ -756,7 +759,7 @@ impl Decoder {
             firstfield_linecode: None,
             lastvalidfield: [None, None],
             last_written: None,
-            efm_pll: EfmPll::new(),
+            efm_pll: EfmPll::new(sample_rate_hz),
             // Under LD_DUMP_PLL the reference debug stream comes straight from
             // the inline call, so keep speculation out of that path entirely.
             pll_spec: PllSpec::new(std::env::var_os("LD_DUMP_PLL").is_some()),
