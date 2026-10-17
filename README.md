@@ -59,7 +59,7 @@ target/release/ld-decode -t 10 "capture.ddd.flac" out
 target/release/ld-decode -t 10 -s 1000 -l 1000 "capture.s16" out
 ```
 
-`-j` matters because the demodulation pool is throughput-bound: raising it past
+`-t` matters because the demodulation pool is throughput-bound: raising it past
 the physical core count loses, and the optimum moves with the input. On an
 8-core/16-thread machine, `s16` peaks around `-t 8` (~46 FPS) and `.ldf` at
 `-t 10`/`11` (~45 FPS). The default is `logical * 5 / 8` (minimum 2).
