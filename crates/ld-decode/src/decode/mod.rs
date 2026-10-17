@@ -512,6 +512,10 @@ pub struct Decoder {
     /// Vits metrics computed in the decode loop for the current field, reused
     /// by buildmetadata (wSNR/bPSNR don't depend on the previous field).
     cached_vits: Option<vits::VitsOutcome>,
+    /// Port of `LDdecode.blackIRE`: the IRE level reported as `black16bIre`.
+    /// The reference's decoder starts at 0 and `main.py` sets 7.5 for NTSC
+    /// (``--NTSCJ`` leaves it at 0, which is the Japanese 0 IRE black level).
+    black_ire: f64,
     frame_number: Option<i64>,
     /// Linecodes of the last valid field decoded by `scan_field` (the seek
     /// path's `prevfield`), paired with the next valid field to read a frame
@@ -619,6 +623,7 @@ impl Decoder {
             pll_gen: 0,
             pll_token: 0,
             cached_vits: None,
+            black_ire: 0.0,
             frame_number: None,
             scan_prev_linecode: None,
             is_clv: false,
@@ -2131,6 +2136,12 @@ impl Decoder {
         self.scan_prev_linecode = None;
     }
 
+    /// Set the IRE level reported as `black16bIre` (port of `LDdecode.blackIRE`:
+    /// 7.5 for NTSC setup, 0 for `--NTSCJ`).
+    pub fn set_black_ire(&mut self, ire: f64) {
+        self.black_ire = ire;
+    }
+
     /// Position the decoder at an absolute input sample offset (used by the
     /// LD_START_SAMPLE diagnostic override).
     pub fn set_position_samples(&mut self, samples: u64) {
@@ -2379,8 +2390,9 @@ impl Decoder {
         let badj = -1.4;
         let to_sample = |us: f64| ((us * self.spec.sys_outfreq) + badj).round() as i64;
 
-        // NTSC setup (blackIRE = 7.5, matching main.py); blanking stays at 0 IRE.
-        let black = ire_to_output(7.5);
+        // NTSC setup: main.py sets `blackIRE = 7.5` unless `--NTSCJ` was given
+        // (Japanese discs are 0 IRE black). Blanking is always 0 IRE.
+        let black = ire_to_output(self.black_ire);
         let blanking = ire_to_output(0.0);
         let white = ire_to_output(100.0);
         Some(DecoderMetadata {

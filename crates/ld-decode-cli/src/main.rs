@@ -61,6 +61,11 @@ struct Args {
     /// Use lower-bandwidth (lowband) decode settings
     #[arg(long)]
     lowband: bool,
+    /// Source is in NTSC-J format (IRE 0 black): `black16bIre` stays at the
+    /// 0 IRE level instead of NTSC's 7.5 IRE setup. No `-j` short form here
+    /// (that is `--threads`, as in `ld-decode`'s own `-t`).
+    #[arg(long = "NTSCJ", visible_aliases = ["ntscj", "ntsc-j"])]
+    ntscj: bool,
     /// De-emphasis strength multiplier
     #[arg(long, default_value_t = 1.0)]
     deemp_str: f64,
@@ -327,6 +332,9 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
+    // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
+    // decoder itself starts at 0, exactly like `LDdecode.__init__`.
+    decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });
     if args.disable_analog_audio {
         decoder.set_analog_audio(0.0);
     }
@@ -881,4 +889,25 @@ fn run_seek(
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--NTSCJ` is the reference's spelling; the lowercase and hyphenated
+    /// aliases are ours. `-j` is deliberately *not* one of them: it is
+    /// `--threads` here (the reference's `-j` is NTSCJ, its threads flag is
+    /// `-t`), so the two must never fight over the short flag.
+    #[test]
+    fn ntscj_flag_parses_and_leaves_j_for_threads() {
+        for flag in ["--NTSCJ", "--ntscj", "--ntsc-j"] {
+            let args = Args::parse_from(["ld-decode", "in.s16", "out", flag]);
+            assert!(args.ntscj, "{flag} should set ntscj");
+        }
+        assert!(!Args::parse_from(["ld-decode", "in.s16", "out"]).ntscj);
+        let short = Args::parse_from(["ld-decode", "in.s16", "out", "-j", "4"]);
+        assert!(!short.ntscj, "-j must stay --threads, not NTSCJ");
+        assert_eq!(short.threads, 4);
+    }
 }
