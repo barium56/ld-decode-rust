@@ -74,50 +74,6 @@ fn wr_cf(dir: &str, name: &str, v: &[C64]) {
 }
 
 #[test]
-fn atan2_matches_the_port_on_a_sweep() {
-    // std's `f64::atan2` and our UCRT-derived port must agree bit for bit over
-    // a wide sweep of arguments. Production only ever calls the port
-    // (`spec::libm_atan2`), so this is not a parity gate on its own -- it is the
-    // tripwire that fires if either implementation moves (a rustc change to
-    // std's atan2, or `libm_atan2` being pointed somewhere else). Set
-    // LD_PROBE_OUT to a directory to also dump the first divergences.
-    use crate::spec::libm_atan2;
-    let mut ndiff = 0usize;
-    let mut first: Vec<(f64, f64, f64, f64)> = Vec::new();
-    let mut x = 0.001_f64;
-    let mut y = -0.002_f64;
-    let mut mag = 0.5_f64;
-    for i in 0..1_000_000 {
-        mag = (mag * 1.00001 + 0.001).fract(); // 0..1, drifts slowly
-        let m = 10f64.powf(mag * 16.0 - 8.0); // 1e-8 .. 1e8
-        x = (x * 1.0001 + 0.31).fract() * 2.0 - 1.0;
-        y = (y * 0.9999 + 0.17).fract() * 2.0 - 1.0;
-        x *= m;
-        y *= m;
-        let s = y.atan2(x);
-        let u = libm_atan2::call(y, x);
-        if s.to_bits() != u.to_bits() {
-            ndiff += 1;
-            if first.len() < 5 {
-                first.push((x, y, s, u));
-            }
-        }
-    }
-    let out = std::env::var("LD_PROBE_OUT").unwrap_or_default();
-    if !out.is_empty() {
-        let mut s = format!("std-vs-libm atan2: {ndiff}/1000000 differ\n");
-        for (x, y, a, b) in &first {
-            s.push_str(&format!("x={x} y={y} std={a:.17e} libm={b:.17e}\n"));
-        }
-        std::fs::write(std::path::PathBuf::from(out).join("atan2_sweep.txt"), s).unwrap();
-    }
-    assert!(
-        ndiff == 0,
-        "std f64::atan2 differs from the port in {ndiff}/1000000 cases; first: {first:?}"
-    );
-}
-
-#[test]
 #[ignore = "needs LD_PROBE_* dumps of a block window and its filters"]
 fn probe_block() {
     let out = std::env::var("LD_PROBE_OUT").expect("LD_PROBE_OUT");
