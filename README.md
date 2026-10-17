@@ -24,7 +24,7 @@ exists; parity is the constraint it is built under.
   - Diamond Time CLV `.ldf` (71,710 fields) — 4/4 outputs identical,
   - GGV1016 CAV `.ldf` (108,576 fields) — 4/4 outputs identical, JSON included.
 - **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw
-  `s16` (`-j 8`) and ~45 FPS for `.ldf` (`-j 10`/`11`) on a Ryzen 7 5800X3D
+  `s16` (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D
   (10,000-field window), against ~2–5 FPS for Python 3.12 + numpy + scipy on the
   same box; the full GGV1069 `.ldf` takes 575 s (44.1 FPS). FPS is only
   meaningful with the machine otherwise idle and the output disk not full.
@@ -53,16 +53,16 @@ Prerequisites:
 cargo build --release    # target/release/ld-decode.exe on Windows, ld-decode elsewhere
 
 # whole file
-target/release/ld-decode -j 10 "capture.ddd.flac" out
+target/release/ld-decode -t 10 "capture.ddd.flac" out
 
 # start at frame 1000, decode 1000 frames (frames, not samples; 2 fields each)
-target/release/ld-decode -j 10 -s 1000 -l 1000 "capture.s16" out
+target/release/ld-decode -t 10 -s 1000 -l 1000 "capture.s16" out
 ```
 
 `-j` matters because the demodulation pool is throughput-bound: raising it past
 the physical core count loses, and the optimum moves with the input. On an
-8-core/16-thread machine, `s16` peaks around `-j 8` (~46 FPS) and `.ldf` at
-`-j 10`/`11` (~45 FPS). The default is `logical * 5 / 8` (minimum 2).
+8-core/16-thread machine, `s16` peaks around `-t 8` (~46 FPS) and `.ldf` at
+`-t 10`/`11` (~45 FPS). The default is `logical * 5 / 8` (minimum 2).
 
 ## Command line
 
@@ -86,8 +86,8 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `-s`, `--start <n>` | `0` | Rough jump to **frame** `n` of the capture (2 fields per frame). |
 | `-l`, `--length <n>` | until EOF | Decode at most `n` **frames**. |
 | `-S`, `--seek <n>` | off | Seek to a specific VBI frame number; needs readable CAV/CLV frame codes and fails gracefully without them. Scans from `-s` when it is non-zero, otherwise straight from the target frame (like the reference). |
-| `--NTSCJ` | off | Source is NTSC-J (0 IRE black): `black16bIre` stays at the 0 IRE level instead of NTSC's 7.5 IRE setup. Also spelled `--ntscj` / `--ntsc-j`; there is no `-j` short form here (`-j` is `--threads`, the reference's `-t`). |
-| `-j`, `--threads <n>` | `logical * 5 / 8`, min 2 | Demodulation worker threads; the serial tail's parallel sections get a quarter of this. |
+| `-j`, `--NTSCJ` | off | Source is NTSC-J (0 IRE black): `black16bIre` stays at the 0 IRE level instead of NTSC's 7.5 IRE setup. Also spelled `--ntscj` / `--ntsc-j`. |
+| `-t`, `--threads <n>` | `logical * 5 / 8`, min 2 | Demodulation worker threads; the serial tail's parallel sections get a quarter of this (the reference defaults to `4`). |
 | `--format <fmt>` | from the extension | Input sample format (required for stdin): `s16`, `r16`/`u16`, `r8`/`u8`, `s8`, `rf`, `lds`, `r30`, `ldf`, `flac`. |
 | `--inputfreq <MHz>` | from FLAC metadata, else `40` | Input sample rate; a capture's declared kHz rate is its RF rate in MHz. |
 | `--mtf <x>` | `1.0` | MTF compensation multiplier. |
@@ -100,6 +100,10 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
+
+Short flags are the reference's exactly: `-t` is threads and `-j` is NTSC-J
+(`-j` was `--threads` in this port before 2026-10-17, so older command lines
+need `-t`).
 
 ## Input formats
 

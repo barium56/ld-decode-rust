@@ -62,9 +62,8 @@ struct Args {
     #[arg(long)]
     lowband: bool,
     /// Source is in NTSC-J format (IRE 0 black): `black16bIre` stays at the
-    /// 0 IRE level instead of NTSC's 7.5 IRE setup. No `-j` short form here
-    /// (that is `--threads`, as in `ld-decode`'s own `-t`).
-    #[arg(long = "NTSCJ", visible_aliases = ["ntscj", "ntsc-j"])]
+    /// 0 IRE level instead of NTSC's 7.5 IRE setup.
+    #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
     ntscj: bool,
     /// De-emphasis strength multiplier
     #[arg(long, default_value_t = 1.0)]
@@ -90,7 +89,7 @@ struct Args {
     /// Number of demodulation worker threads (default: 1.25x the physical
     /// cores = 5/8 of the logical count). The serial tail's parallel sections
     /// get a quarter of this; `LD_PF_POOL` overrides the split.
-    #[arg(long, short = 'j', default_value_t = default_threads())]
+    #[arg(long, short = 't', default_value_t = default_threads())]
     threads: usize,
 }
 
@@ -100,26 +99,26 @@ struct Args {
 /// the total — and the ideal split moves with how much work the tail has. It
 /// was three quarters of the cores when the tail still carried the EFM PLL
 /// inline; after that was offloaded, `half plus one` won: measured `-l 5000` on
-/// a 16-thread box, 2 rounds each — `-j 9` 38.29/38.20, `-j 10` 37.87/37.65,
-/// `-j 8` 37.18/36.95, `-j 12` 36.19/35.40 (the old default).
+/// a 16-thread box, 2 rounds each — `-t 9` 38.29/38.20, `-t 10` 37.87/37.65,
+/// `-t 8` 37.18/36.95, `-t 12` 36.19/35.40 (the old default).
 ///
 /// Re-swept after the 4-lane `atan2` cut took most of the pool's non-FFT work
 /// out: with the pool no longer the binding side, the ninth thread is pure SMT
-/// contention. `-l 2000`, 3 rounds — `-j 8` 46.81/46.95, `-j 9` 46.48/46.87,
-/// `-j 10` 45.67/45.29; then `-l 5000`, 2 rounds — `-j 8` 47.10/47.15,
-/// `-j 9` 46.81/47.07; and 4 further `-l 2000` rounds — `-j 8`
-/// 46.77/46.79/47.04/46.83 against `-j 9` 46.93/46.64/46.54/46.67. Small but
-/// consistent, and `-j 8` has the tighter spread. Output is byte-identical
+/// contention. `-l 2000`, 3 rounds — `-t 8` 46.81/46.95, `-t 9` 46.48/46.87,
+/// `-t 10` 45.67/45.29; then `-l 5000`, 2 rounds — `-t 8` 47.10/47.15,
+/// `-t 9` 46.81/47.07; and 4 further `-l 2000` rounds — `-t 8`
+/// 46.77/46.79/47.04/46.83 against `-t 9` 46.93/46.64/46.54/46.67. Small but
+/// consistent, and `-t 8` has the tighter spread. Output is byte-identical
 /// across the two (`-l 5000`, both rounds, .tbc/.pcm/.efm).
 ///
 /// Re-swept once more (2026-09-23) after the in-place batched inverse FFTs and
 /// the engine-independence fix cut the pool's per-worker memory traffic, which
 /// is what had made a second thread per core lose before. Two env-only sweeps
 /// (each config's own round evidence, `-l 1000`): a first screen gave base
-/// `-j 8` 45.67/46.20 against `-j 10` 47.67/47.77 and `-j 6` 41.30/41.39; the
+/// `-t 8` 45.67/46.20 against `-t 10` 47.67/47.77 and `-t 6` 41.30/41.39; the
 /// upward screen gave 49.93/47.58, 48.61/47.66, 47.68/47.06, 45.74/44.67 and
-/// 42.45/42.15 for `-j` 10/11/12/13/14 against a per-round base of 49.24/45.57.
-/// So the optimum moved to **1.25x the physical cores** (`-j 10` here = 8
+/// 42.45/42.15 for `-t` 10/11/12/13/14 against a per-round base of 49.24/45.57.
+/// So the optimum moved to **1.25x the physical cores** (`-t 10` here = 8
 /// physical + 2 SMT siblings), and beyond it the trend is monotonically worse,
 /// as the SMT contention model predicts. Re-sweep after any change that moves
 /// the pool's balance or its memory traffic.
@@ -895,19 +894,22 @@ fn run_seek(
 mod tests {
     use super::*;
 
-    /// `--NTSCJ` is the reference's spelling; the lowercase and hyphenated
-    /// aliases are ours. `-j` is deliberately *not* one of them: it is
-    /// `--threads` here (the reference's `-j` is NTSCJ, its threads flag is
-    /// `-t`), so the two must never fight over the short flag.
+    /// Short flags follow the reference exactly: `-j` is `--NTSCJ` (a plain
+    /// flag, no value) and `-t` is `--threads`. `-j 4` must therefore fail the
+    /// way the reference's argparse fails it, instead of silently taking 4 as a
+    /// thread count.
     #[test]
-    fn ntscj_flag_parses_and_leaves_j_for_threads() {
+    fn ntscj_and_threads_short_flags_match_the_reference() {
         for flag in ["--NTSCJ", "--ntscj", "--ntsc-j"] {
             let args = Args::parse_from(["ld-decode", "in.s16", "out", flag]);
             assert!(args.ntscj, "{flag} should set ntscj");
         }
+        assert!(Args::parse_from(["ld-decode", "in.s16", "out", "-j"]).ntscj);
         assert!(!Args::parse_from(["ld-decode", "in.s16", "out"]).ntscj);
-        let short = Args::parse_from(["ld-decode", "in.s16", "out", "-j", "4"]);
-        assert!(!short.ntscj, "-j must stay --threads, not NTSCJ");
+
+        let short = Args::parse_from(["ld-decode", "in.s16", "out", "-t", "4"]);
         assert_eq!(short.threads, 4);
+        assert!(!short.ntscj);
+        assert!(Args::try_parse_from(["ld-decode", "in.s16", "out", "-j", "4"]).is_err());
     }
 }

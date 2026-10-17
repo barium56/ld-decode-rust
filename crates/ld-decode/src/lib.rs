@@ -28,7 +28,7 @@ static DEMOD_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// on a 16-thread box: 12 demod + 3 tail beats 12 + 12 by ~7%).
 ///
 /// Re-checked under the new balance (driver-binding after the MTF fix):
-/// a sweep of 1/2/3/4/6 tail threads at `-j 9` was flat-to-worse (4/4 wins
+/// a sweep of 1/2/3/4/6 tail threads at `-t 9` was flat-to-worse (4/4 wins
 /// 2, 3/4/6 all lose FPS because they steal physical cores from the demod pool,
 /// causing SMT contention that inflates pffold). The split stays `n/4`.
 /// Call before the first decode.
