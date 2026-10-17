@@ -118,15 +118,12 @@ jobs:
 
       - name: Test (release profile)
         shell: bash
-        # `pll_matches_stock_field_stream` needs the LD_PLL_DIR golden field
-        # stream dumped from a stock Python run, which is not in the repo.
-        #
         # This step needs no Python: there is one committed scipy golden set and
         # both platforms reproduce it, because non-Windows targets take their
         # sin/cos from the bit-exact UCRT ports rather than from glibc. `ci.yml`
         # owns the `--verify` gate on that set (Windows) and the drift census
         # (Linux).
-        run: cargo test --workspace --release --target "${{ matrix.target }}" -- --skip pll_matches_stock_field_stream
+        run: cargo test --workspace --release --target "${{ matrix.target }}"
 
       - name: Smoke test the decoder
         shell: bash

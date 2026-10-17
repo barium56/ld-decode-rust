@@ -120,14 +120,14 @@ jobs:
         shell: bash
         # The debug profile is where the filter/FFT fidelity gates are exact;
         # release codegen drifts ~1e-14 on `gen_bpf_supergauss`, which is why
-        # the test tolerances sit at 1e-12. `pll_matches_stock_field_stream`
-        # needs the LD_PLL_DIR golden field stream dumped from a stock Python
-        # run, which is not in the repo, so it is skipped in both profiles.
-        run: cargo test --workspace -- --skip pll_matches_stock_field_stream
+        # the test tolerances sit at 1e-12. Every gate runs in both profiles:
+        # the EFM PLL's reference stream is the committed synthetic fixture, so
+        # no test needs data from outside the repo.
+        run: cargo test --workspace
 
       - name: Test (release profile)
         shell: bash
-        run: cargo test --workspace --release -- --skip pll_matches_stock_field_stream
+        run: cargo test --workspace --release
 
       - name: Upload decoder binary
         # Pull requests do not need a downloadable binary; release.yml is the
@@ -196,10 +196,10 @@ jobs:
           "$PY" scripts/gen_scipy_fft_goldens.py --census
 
       - name: Test (debug profile)
-        run: cargo test --workspace -- --skip pll_matches_stock_field_stream
+        run: cargo test --workspace
 
       - name: Test (release profile)
-        run: cargo test --workspace --release -- --skip pll_matches_stock_field_stream
+        run: cargo test --workspace --release
 
       - name: Upload decoder binary
         if: github.event_name == 'push'

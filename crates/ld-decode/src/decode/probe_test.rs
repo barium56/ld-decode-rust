@@ -74,11 +74,13 @@ fn wr_cf(dir: &str, name: &str, v: &[C64]) {
 }
 
 #[test]
-#[ignore]
-fn atan2_cmp() {
-    // Compare std f64::atan2 vs the platform C library's atan2 (UCRT on
-    // Windows, libm elsewhere) on a sweep of arguments, dump divergences so the
-    // caller can inspect which implementation numpy matches.
+fn atan2_matches_the_port_on_a_sweep() {
+    // std's `f64::atan2` and our UCRT-derived port must agree bit for bit over
+    // a wide sweep of arguments. Production only ever calls the port
+    // (`spec::libm_atan2`), so this is not a parity gate on its own -- it is the
+    // tripwire that fires if either implementation moves (a rustc change to
+    // std's atan2, or `libm_atan2` being pointed somewhere else). Set
+    // LD_PROBE_OUT to a directory to also dump the first divergences.
     use crate::spec::libm_atan2;
     let mut ndiff = 0usize;
     let mut first: Vec<(f64, f64, f64, f64)> = Vec::new();
@@ -107,13 +109,16 @@ fn atan2_cmp() {
         for (x, y, a, b) in &first {
             s.push_str(&format!("x={x} y={y} std={a:.17e} libm={b:.17e}\n"));
         }
-        std::fs::write(std::path::PathBuf::from(out).join("atan2_cmp.txt"), s).unwrap();
+        std::fs::write(std::path::PathBuf::from(out).join("atan2_sweep.txt"), s).unwrap();
     }
-    panic!("atan2_cmp ndiff={ndiff}");
+    assert!(
+        ndiff == 0,
+        "std f64::atan2 differs from the port in {ndiff}/1000000 cases; first: {first:?}"
+    );
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs LD_PROBE_* dumps of a block window and its filters"]
 fn probe_block() {
     let out = std::env::var("LD_PROBE_OUT").expect("LD_PROBE_OUT");
     let raw = rd_f64("LD_PROBE_RAW");

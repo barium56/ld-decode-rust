@@ -2761,7 +2761,7 @@ mod tests {
     /// an off-line script can report the first differing index and the worst ulp
     /// gap per filter. For cross-platform diffing by hand.
     #[test]
-    #[ignore]
+    #[ignore = "prints filter fingerprints; LD_FILTERDUMP=<dir> dumps the arrays"]
     fn construction_fingerprint_probe() {
         use crate::request::DecodeRequest;
         let mut lowband = DecodeRequest::default();
