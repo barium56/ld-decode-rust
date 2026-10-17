@@ -147,6 +147,26 @@ pub struct FieldInfoEntry {
     pub ac3_symbols: usize,
 }
 
+/// One `Decoder::scan_field` result (the seek path's view of a field).
+pub enum ScannedField {
+    /// The window does not hold the demod blocks this field needs yet; the
+    /// value is the earliest sample offset it needs to keep.
+    NeedData(u64),
+    /// End of the available demod data (the reference's `decodefield` ->
+    /// `None`).
+    Eof,
+    /// A field was decoded (it may still be invalid).
+    Field {
+        valid: bool,
+        /// The field's `readloc` (what the reference's `seek` divides by
+        /// `bytes_per_field` to get its final position).
+        readloc: u64,
+        /// Frame number completed by this field, paired with the previous valid
+        /// field of the same scan.
+        frame_number: Option<i64>,
+    },
+}
+
 /// Decoder-level metadata for the JSON sidecar (port of `build_json`).
 #[derive(Clone)]
 pub struct DecoderMetadata {
@@ -493,6 +513,10 @@ pub struct Decoder {
     /// by buildmetadata (wSNR/bPSNR don't depend on the previous field).
     cached_vits: Option<vits::VitsOutcome>,
     frame_number: Option<i64>,
+    /// Linecodes of the last valid field decoded by `scan_field` (the seek
+    /// path's `prevfield`), paired with the next valid field to read a frame
+    /// code exactly like `seek_getframenr`'s local `prevfield`/`curfield`.
+    scan_prev_linecode: Option<Vec<Option<i64>>>,
     // CLV/CAV VBI state.
     is_clv: bool,
     early_clv: bool,
@@ -596,6 +620,7 @@ impl Decoder {
             pll_token: 0,
             cached_vits: None,
             frame_number: None,
+            scan_prev_linecode: None,
             is_clv: false,
             early_clv: false,
             clv_minutes: None,
@@ -2100,6 +2125,10 @@ impl Decoder {
     pub fn rough_seek(&mut self, field_index: i64) {
         self.fdoffset = (field_index.max(0) as u64) * self.spec.bytes_per_field() as u64;
         self.fdoffset_frac = 0.0;
+        // Python's `roughseek` also clears `prevPhaseID`, and the seek scan's
+        // frame-code pairing starts fresh at each scan position.
+        self.frame_number = None;
+        self.scan_prev_linecode = None;
     }
 
     /// Position the decoder at an absolute input sample offset (used by the
@@ -2128,6 +2157,54 @@ impl Decoder {
     /// The current decode position, in absolute input samples.
     pub fn position(&self) -> u64 {
         self.fdoffset
+    }
+
+    /// Decode one field the way the reference's `seek_getframenr` does: a bare
+    /// `decodefield(fdoffset, 0)` with no previous-field hint, and none of the
+    /// `readfield`-side work (MTF/AGC calibration, downscale, writeout, field
+    /// info, output). The MTF level 0 is not a shortcut -- the reference passes
+    /// 0 there, and those blocks stay in the demod cache for the real decode
+    /// to reuse -- and the field's recalibrated RF levels carry over, because
+    /// `getpulses` updates the shared levels in place.
+    ///
+    /// `frame_number` is computed from the previous *valid* field of this scan
+    /// (the reference's local `prevfield`/`curfield` pair), never from state
+    /// left by an earlier scan.
+    pub fn scan_field(
+        &mut self,
+        data: &[f32],
+        data_start: u64,
+        final_chunk: bool,
+    ) -> Result<ScannedField> {
+        let start = self.fdoffset_abs();
+        let outcome =
+            self.assemble_field(data, data_start, final_chunk, start, None, false, 0.0)?;
+        let (mut field, offset) = match outcome {
+            AssembleOutcome::NeedData(needed) => return Ok(ScannedField::NeedData(needed)),
+            AssembleOutcome::Eof => return Ok(ScannedField::Eof),
+            AssembleOutcome::Field(assembled) => self.finish_field(assembled)?,
+        };
+        if let Some(off) = offset {
+            self.advance_fdoffset(off);
+        }
+        // `getpulses` recalibrates the shared RF levels in place, so a scan
+        // field's levels are what the next field (and the real decode) sees.
+        self.levels = field.levels;
+        // `decodefield` never updates the readfield-side previous-field hint,
+        // so the first field of the decode after a seek is decoded without one.
+        self.prevfield = None;
+
+        let frame_number = if field.valid {
+            let prev = self.scan_prev_linecode.replace(field.linecode.clone());
+            prev.and_then(|p| self.decode_frame_number(&p, &field.linecode))
+        } else {
+            None
+        };
+        Ok(ScannedField::Field {
+            valid: field.valid,
+            readloc: field.readloc,
+            frame_number,
+        })
     }
 
     /// Port of `writeout`: run the EFM PLL, record the field info and hand the

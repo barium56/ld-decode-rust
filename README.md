@@ -85,7 +85,7 @@ other end closes the pipe early, the decode stops immediately with an error.
 | --- | --- | --- |
 | `-s`, `--start <n>` | `0` | Rough jump to **frame** `n` of the capture (2 fields per frame). |
 | `-l`, `--length <n>` | until EOF | Decode at most `n` **frames**. |
-| `-S`, `--seek <n>` | off | Seek to a specific VBI frame number; needs readable CAV/CLV frame codes and fails gracefully without them. |
+| `-S`, `--seek <n>` | off | Seek to a specific VBI frame number; needs readable CAV/CLV frame codes and fails gracefully without them. Scans from `-s` when it is non-zero, otherwise straight from the target frame (like the reference). |
 | `-j`, `--threads <n>` | `logical * 5 / 8`, min 2 | Demodulation worker threads; the serial tail's parallel sections get a quarter of this. |
 | `--format <fmt>` | from the extension | Input sample format (required for stdin): `s16`, `r16`/`u16`, `r8`/`u8`, `s8`, `rf`, `lds`, `r30`, `ldf`, `flac`. |
 | `--inputfreq <MHz>` | from FLAC metadata, else `40` | Input sample rate; a capture's declared kHz rate is its RF rate in MHz. |

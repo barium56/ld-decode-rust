@@ -20,7 +20,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use ld_decode::{ColorSystem, DecodeRequest, Decoder, DecoderSpec, BLOCKSIZE};
+use ld_decode::{ColorSystem, DecodeRequest, Decoder, DecoderSpec, ScannedField, BLOCKSIZE};
 use reader::DecodeReader;
 use writer::DecodeWriter;
 
@@ -332,43 +332,57 @@ fn main() -> Result<()> {
     }
     decoder.set_digital_audio(!args.no_efm);
 
+    // Reference `main.py`: `roughseek(firstframe * 2)` always runs, and
+    // `seek()` scans from frame `args.start` when one was given, else from the
+    // target frame itself (on CAV a frame's code sits at field = 2 * frame, so
+    // that first guess is already the answer).
+    let mut start_base = 0u64;
     if let Some(target) = args.seek {
+        let seek_start = if args.start > 0 { args.start as i64 } else { target };
+        decoder.rough_seek(seek_start * 2);
         match run_seek(&mut reader, &spec, &mut decoder, target)? {
             true => tracing::info!("Finished seek, starting decode at frame {}", target),
             false => {
                 ld_decode::teeprintln!("ERROR: Seeking to frame {} failed (no readable frame code on the disc?)", target);
+                // The reference exits here before reading a field, so it never
+                // creates a `.tbc.json` and finishes its `.tbc.db` cleanly.
+                // Close the sidecars and drop the eagerly-created json (the
+                // same rule the zero-field decode follows).
+                if let Err(e) = writer.close(None) {
+                    tracing::warn!("closing the writer after a failed seek: {e:#}");
+                }
+                if !to_stdout {
+                    let _ = std::fs::remove_file(format!("{outfile}.tbc.json"));
+                }
                 std::process::exit(1);
             }
         }
-    }
-
-    // Reference: `--start n` is a rough jump to frame n (`roughseek(n*2)`), so
-    // position the reader just before the decoder's read begin (the decoder
-    // skips straight to that field once decoding starts).
-    let start_base = if args.start > 0 {
-        if args.seek.is_none() {
-            if let Some(s) = std::env::var_os("LD_START_SAMPLE") {
-                let target = s.to_string_lossy().parse::<u64>()?;
-                // Treat `target` as the *read* position (like setup_start's
-                // read_start) and place the decoder a margin ahead of it, so
-                // the decode behaves exactly like a normal --start run.
-                let blocksize = spec.blocksize() as u64;
-                let margin = spec.blockcut() as u64 + 2 * blocksize;
-                tracing::info!("LD_START_SAMPLE: reading from absolute sample {target}");
-                reader.seek_samples(target)?;
-                decoder.set_position_samples(target + margin);
-                target
-            } else {
-                let s = setup_start(&mut reader, &spec, &mut decoder, args.start)?;
-                tracing::info!("read start at sample {s}");
-                s
-            }
+        // The decoder now sits at the target field; put the reader just before
+        // its read begin so `decode_all` builds the same window a `--start` run
+        // would (and labels it with the matching absolute base).
+        start_base = read_start_for(&spec, decoder.position());
+        reader.seek_samples(start_base)?;
+    } else if args.start > 0 {
+        // Reference: `--start n` is a rough jump to frame n (`roughseek(n*2)`),
+        // so position the reader just before the decoder's read begin (the
+        // decoder skips straight to that field once decoding starts).
+        if let Some(s) = std::env::var_os("LD_START_SAMPLE") {
+            let target = s.to_string_lossy().parse::<u64>()?;
+            // Treat `target` as the *read* position (like setup_start's
+            // read_start) and place the decoder a margin ahead of it, so
+            // the decode behaves exactly like a normal --start run.
+            let blocksize = spec.blocksize() as u64;
+            let margin = spec.blockcut() as u64 + 2 * blocksize;
+            tracing::info!("LD_START_SAMPLE: reading from absolute sample {target}");
+            reader.seek_samples(target)?;
+            decoder.set_position_samples(target + margin);
+            start_base = target;
         } else {
-            0
+            let s = setup_start(&mut reader, &spec, &mut decoder, args.start)?;
+            tracing::info!("read start at sample {s}");
+            start_base = s;
         }
-    } else {
-        0
-    };
+    }
 
     let max_frames = args.length;
     let seekable = reader.is_seekable();
@@ -495,11 +509,7 @@ fn setup_start(
 ) -> Result<u64> {
     // Reference: `ldd.roughseek(firstframe * 2)` -> fdoffset = frame*2 fields.
     decoder.rough_seek((start_frame as i64) * 2);
-    let blocksize = spec.blocksize() as u64;
-    let read_start = (decoder.position() as i64
-        - (spec.blockcut() as i64 + 2 * blocksize as i64))
-        .max(0) as u64;
-    let read_start = read_start.div_euclid(blocksize) * blocksize;
+    let read_start = read_start_for(spec, decoder.position());
     reader.seek_samples(read_start)?;
     Ok(read_start)
 }
@@ -696,85 +706,178 @@ fn decode_all(
     Ok(wrote_fields)
 }
 
+/// One `seek_getframenr` scan result.
+struct SeekHit {
+    /// VBI frame number read at the scan position.
+    frame: i64,
+    /// `readloc` of the field that completed the frame code (the reference's
+    /// `f.readloc`).
+    readloc: u64,
+    /// Start field the scan really began at: the requested one, or 0 if a
+    /// dead location made it fall back to the start of the file.
+    startfield: i64,
+}
+
+/// Sample position the reader must start at to feed a decoder sitting at
+/// `position`: behind its read begin by the block cut plus two demod blocks,
+/// floored onto the demod (`blocksize`) grid. Shared by `--start` and the
+/// post-seek setup so both build the same sliding window.
+fn read_start_for(spec: &DecoderSpec, position: u64) -> u64 {
+    let blocksize = spec.blocksize() as u64;
+    let start = (position as i64 - (spec.blockcut() as i64 + 2 * blocksize as i64)).max(0) as u64;
+    start.div_euclid(blocksize) * blocksize
+}
+
+/// Port of `seek_getframenr`: from `startfield`, decode up to ten fields over a
+/// sliding read window and return the first VBI frame number seen. A `None`
+/// scan means no readable frame code there; like the reference, a non-zero
+/// start location falls back to the start of the file once before giving up.
+fn seek_getframenr(
+    reader: &mut DecodeReader,
+    spec: &DecoderSpec,
+    decoder: &mut Decoder,
+    startfield: i64,
+) -> Result<Option<SeekHit>> {
+    let mut startfield = startfield;
+    let chunk = spec.readlen() + 4 * spec.blocksize();
+    // The window must cover the decoder's whole look-ahead: its read length,
+    // the DemodCache prefetch range (~88 blocks: four fields), and a rewind
+    // band. A smaller window makes every call return NeedData without decoding
+    // anything, which is what used to make `--seek` fail on every input.
+    let max_keep = decode_rewind(spec) + spec.readlen() as u64 + 130 * spec.blocksize() as u64;
+
+    let mut window: Vec<f32> = Vec::new();
+    let mut read_buffer = vec![0.0f32; chunk];
+
+    decoder.rough_seek(startfield);
+    let mut base = read_start_for(spec, decoder.position());
+    reader.seek_samples(base)?;
+    let mut read_pos = base;
+    let mut need_end = base + max_keep;
+    let mut final_chunk = false;
+    let mut fields_seen = 0usize;
+
+    loop {
+        while !final_chunk && read_pos < need_end {
+            let read = reader.read(&mut read_buffer)?;
+            window.extend_from_slice(&read_buffer[..read]);
+            read_pos += read as u64;
+            if read < chunk {
+                final_chunk = true;
+            }
+        }
+
+        let scanned = decoder.scan_field(&window, base, final_chunk)?;
+        if std::env::var_os("LD_TRACE_SEEK").is_some() {
+            let what = match &scanned {
+                ScannedField::NeedData(n) => format!("need={n}"),
+                ScannedField::Eof => "eof".to_string(),
+                ScannedField::Field { valid, readloc, frame_number } => format!(
+                    "valid={valid} readloc={readloc} fnr={frame_number:?}"
+                ),
+            };
+            ld_decode::teeprintln!(
+                "SEEK {what} pos={} base={base} read_pos={read_pos} final={final_chunk} seen={fields_seen}",
+                decoder.position()
+            );
+        }
+
+        match scanned {
+            ScannedField::Field { frame_number: Some(frame), readloc, .. } => {
+                return Ok(Some(SeekHit { frame, readloc, startfield }));
+            }
+            ScannedField::Field { .. } => {
+                // The reference scans ten fields per attempt and no more.
+                fields_seen += 1;
+                if fields_seen >= 10 {
+                    return Ok(None);
+                }
+                need_end = decoder.position().saturating_add(max_keep);
+            }
+            ScannedField::NeedData(needed) => {
+                if needed < base {
+                    // A position behind the window: only reachable if a scan
+                    // ever stepped backwards, but keep it correct and cheap.
+                    base = read_start_for(spec, needed);
+                    reader.seek_samples(base)?;
+                    window.clear();
+                    read_pos = base;
+                    need_end = base + max_keep;
+                    final_chunk = false;
+                } else if final_chunk {
+                    // Nothing more to read: `decodefield` would return None.
+                    if startfield != 0 {
+                        startfield = 0;
+                        decoder.rough_seek(0);
+                        base = read_start_for(spec, 0);
+                        reader.seek_samples(base)?;
+                        window.clear();
+                        read_pos = base;
+                        need_end = base + max_keep;
+                        final_chunk = false;
+                        continue;
+                    }
+                    return Ok(None);
+                } else {
+                    need_end = needed.saturating_add(max_keep).max(read_pos);
+                }
+            }
+            ScannedField::Eof => {
+                if startfield != 0 {
+                    // `seek_getframenr` retries a dead location at the start of
+                    // the file once, continuing the same ten-field budget.
+                    startfield = 0;
+                    decoder.rough_seek(0);
+                    base = read_start_for(spec, 0);
+                    reader.seek_samples(base)?;
+                    window.clear();
+                    read_pos = base;
+                    need_end = base + max_keep;
+                    final_chunk = false;
+                    continue;
+                }
+                return Ok(None);
+            }
+        }
+    }
+}
+
 /// Locate the disc frame `target` using VBI frame codes, mirroring ld-decode's
 /// `seek` / `seek_getframenr`. On success the decoder is left positioned at the
 /// start of the target frame (and true is returned); a false return means the
 /// frame could not be found (e.g. the disc has no frame codes).
+///
+/// The scan starts at the decoder's current position, which the caller sets to
+/// `roughseek(startframe * 2)` as the reference's `main.py` does.
 fn run_seek(
     reader: &mut DecodeReader,
     spec: &DecoderSpec,
     decoder: &mut Decoder,
     target: i64,
 ) -> Result<bool> {
-    // The buffer must cover the demod window (readlen + 2 blocks) plus the
-    // DemodCache prefetch range (~46 blocks) or decode() stalls on NeedData
-    // (this loop doesn't retry the way decode_all does).
-    let chunk = spec.readlen() + 56 * spec.blocksize();
-    let mut buffer = vec![0.0f32; chunk];
-    let blocksize = spec.blocksize() as u64;
-
-    // Start seeking from the current decode position (port of ld-decode's
-    // `startframe = firstframe`).
     let mut startfield = decoder.field_index();
 
     for _retry in 0..3 {
-        decoder.rough_seek(startfield);
-
-        // Decode up to 10 fields looking for the first readable VBI frame code.
-        let mut got: Option<(i64, i64)> = None; // (frame_number, field_index)
-        let mut prev_pos = decoder.position();
-        let mut fields_seen = 0i64;
-
-        while fields_seen < 10 && got.is_none() {
-            // (Re)build a fresh window from scratch at the decoder's position.
-            let read_start = (decoder.position() as i64
-                - (spec.blockcut() as i64 + 2 * blocksize as i64))
-                .max(0) as u64;
-            let read_start = read_start.div_euclid(blocksize) * blocksize;
-            reader.seek_samples(read_start)?;
-            let read = reader.read(&mut buffer)?;
-            let final_chunk_local = read < chunk;
-            let (consumed, _wrote) = decoder.decode(&buffer[..read], read_start, final_chunk_local)?;
-
-            if let Some(fnr) = decoder.frame_number() {
-                got = Some((fnr, decoder.field_index()));
-                break;
-            }
-
-            let new_pos = decoder.position();
-            if new_pos > prev_pos {
-                // A field was actually decoded: keep scanning.
-                fields_seen += 1;
-                prev_pos = new_pos;
-            } else {
-                // No field decoded this call (EOF, decoder wait, or a blank
-                // region): stop scanning this start position.
-                let _ = consumed;
-                break;
-            }
-        }
-
-        let Some((fnr, fieldidx)) = got else {
-            // Per ld-decode: an invalid start location falls back to the start
-            // of the file once, otherwise seeking failed.
-            if startfield != 0 {
-                startfield = 0;
-                continue;
-            }
+        let Some(hit) = seek_getframenr(reader, spec, decoder, startfield)? else {
+            // The reference's `seek` returns as soon as a scan finds no frame
+            // code (it does not retry a dead location).
             return Ok(false);
         };
 
-        if fnr == target {
-            decoder.rough_seek(fieldidx);
-            tracing::info!("Finished seeking, starting at frame {}", fnr);
+        if hit.frame == target {
+            // Reference: `cur = int(readloc / bytes_per_field)` then
+            // `roughseek(cur)`, i.e. the found field's own location, not the
+            // decoder's position after it.
+            let cur = (hit.readloc / spec.bytes_per_field() as u64) as i64;
+            decoder.rough_seek(cur);
+            tracing::info!("Finished seeking, starting at frame {}", hit.frame);
             return Ok(true);
         }
 
-        // Home in: fields are two per frame.
-        startfield = fieldidx + (target - fnr) * 2 - 1;
-        if startfield < 0 {
-            startfield = 0;
-        }
+        // Home in: two fields per frame. The reference advances from the start
+        // field the scan was given (not the matched field): `curfield +=
+        // ((target - fnr) * 2) - 1`.
+        startfield = (hit.startfield + (target - hit.frame) * 2 - 1).max(0);
     }
 
     Ok(false)

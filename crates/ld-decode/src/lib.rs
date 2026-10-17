@@ -10,8 +10,8 @@ mod spec;
 mod vec_utils;
 
 pub use decode::{
-    Decoder, DecoderMetadata, DropOuts, FieldInfoEntry, LumaOutput, VitsMetrics, WriteableField,
-    BLOCKSIZE,
+    Decoder, DecoderMetadata, DropOuts, FieldInfoEntry, LumaOutput, ScannedField, VitsMetrics,
+    WriteableField, BLOCKSIZE,
 };
 pub use request::{ColorSystem, DecodeRequest, WowInterpolation};
 pub use spec::DecoderSpec;
