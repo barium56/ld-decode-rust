@@ -125,11 +125,12 @@ struct Scratch {
     /// Batched spectra: four `blocklen` rows of filter products, inverse
     /// transformed in two batched calls per block (see the kernel body).
     batch_spec: Vec<Complex64>,
-    /// There is deliberately no second row-aligned output buffer: the batched
-    /// inverse FFTs run *in place* over `batch_spec` (see
-    /// `ffi_ducc::ifft_batch_rows_inplace`), which is bit-identical and keeps
-    /// 2 MB per worker out of the eight concurrent prefetch working sets.
-    ///
+    /// Output of the batched *real* inverse (`irfft_batch_rows_strided`),
+    /// which unlike the complex one cannot run in place: ducc's c2r forbids a
+    /// batch that aliases its input. Two `blocklen` rows, allocated on first
+    /// use and reused -- the scalar `irfft` it replaces allocated a fresh
+    /// `blocklen` buffer per channel, so this is no more memory than before.
+    real_batch: Vec<f64>,
     /// `unwrap_hilbert` output, clamped in place for the second r2c.
     demod_buf: Vec<f64>,
 }
@@ -617,10 +618,13 @@ impl Drop for DemodProf {
 const ROW_HILBERT: usize = 0;
 const ROW_EFM: usize = 1;
 const ROW_RFHPF: usize = 2;
-/// Video rows: 0 is free once hilbert has been inverted and unwrapped, 2 once
-/// `cut_rfhpf` has taken its copy, 3 was never used. Row 1 still holds the EFM
-/// time-domain row, so it is deliberately *not* reused here.
-const VIDEO_ROWS: [usize; 3] = [ROW_HILBERT, ROW_RFHPF, 3];
+/// Video rows. All three head rows are dead by the late group (hilbert and EFM
+/// were inverted and consumed in the head, `cut_rfhpf` took its copy), so the
+/// video products take 0, 1 and 2 *consecutively*: the batched real inverse
+/// reads two adjacent rows as one strided view, which a scattered map like
+/// `[0, 2, 3]` could not express without a gather. The product loop and the
+/// gather loop still share this one map.
+const VIDEO_ROWS: [usize; 3] = [ROW_HILBERT, ROW_EFM, ROW_RFHPF];
 
 /// Everything the *head* of a block produces, before the late group.
 ///
@@ -742,6 +746,7 @@ fn demod_head(
         indata,
         batch_spec,
         demod_buf,
+        ..
     } = &mut *sc;
 
     // indata_fft = npfft.fft(data[:blocklen])  -- f64 (the f32 input samples
@@ -1013,6 +1018,7 @@ fn late_group_cpu(
     let Scratch {
         indata,
         batch_spec,
+        real_batch,
         ..
     } = sc;
     // `demod_fft`, written over `indata`: that spectrum is dead here (the audio
@@ -1041,7 +1047,32 @@ fn late_group_cpu(
             &mut batch_spec[row * stride..row * stride + rfft_len],
         );
     }
-    for row_idx in VIDEO_ROWS {
+    // Two of the three inverses go through the batched real-inverse entry: a
+    // pair transforms at ~1.6x per transform (236 us against 371 at
+    // n = blocklen) and `irfft_batch_matches_scalar_transforms` pins the batch
+    // bit-identical to the scalar `irfft` the reference calls. k = 2 is the
+    // measured sweet spot -- three in one call is slower per transform than a
+    // pair (311 us, odd groups lose) -- so the third channel stays scalar.
+    real_batch.resize(2 * blocklen, 0.0);
+    ffi_ducc::irfft_batch_rows_strided(
+        2,
+        blocklen,
+        &batch_spec[VIDEO_ROWS[0] * stride..],
+        stride,
+        real_batch,
+    );
+    for (i, row_idx) in VIDEO_ROWS.iter().take(2).enumerate() {
+        let real = &real_batch[i * blocklen..(i + 1) * blocklen];
+        for (c, v) in batch_spec[*row_idx * stride..*row_idx * stride + blocklen]
+            .iter_mut()
+            .zip(real)
+        {
+            c.re = *v;
+            c.im = 0.0;
+        }
+    }
+    {
+        let row_idx = VIDEO_ROWS[2];
         let row = &mut batch_spec[row_idx * stride..row_idx * stride + rfft_len];
         let real = ffi_ducc::irfft(row, blocklen);
         for (c, v) in batch_spec[row_idx * stride..row_idx * stride + blocklen]

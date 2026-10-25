@@ -20,6 +20,14 @@ use super::sinc::{build_kaiser_lut, SINC_PHASE_COUNT, SINC_TAP_COUNT};
 /// orders finite non-NaN values identically (wow factors and their abs-diffs
 /// contain no NaN; ±0.0 pairs, if any, are equal in magnitude and do not
 /// affect the median of a real-valued signal).
+///
+/// Two faster-looking alternatives were measured on a real field (n = 239 330,
+/// 2-3 runs each) and both lost, so this stays:
+/// - MSD radix select on an order-preserving f64 key: 1.8-4.5 ms/field against
+///   this 1.47. Wow factors cluster into a handful of leading bytes, so the
+///   histogram's read-modify-write chain serializes on store forwarding.
+/// - `np.median`-style partitioning of both halves: the quickselect below is
+///   already one pass plus a max scan of the left half.
 fn median_f64(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty());
     let mid = values.len() / 2;
@@ -36,37 +44,38 @@ fn median_f64(values: &mut [f64]) -> f64 {
 /// Four independent 16-tap gathers, each accumulated in the exact serial f64
 /// order the scalar loop uses.
 ///
-/// The per-tap weight blend (`ws + alpha * (wt - ws)`) and the f32 product are
-/// pure per-lane arithmetic, so computing them eight taps at a time with AVX2
-/// yields bit-identical values to the scalar form — no reassociation, no
-/// contraction, and each f32 op keeps its own rounding. Only the *loads* are
-/// vectorized, which is the point: the scalar shape issues three loads per tap
-/// (two LUT rows plus the sample), i.e. 48 loads per output sample against
-/// Zen's three load ports, and the loop measures ~4.8 cycles/tap. Widening with
-/// `cvtps_pd` is exact (f32 to f64 is lossless), and the accumulation then
-/// replays t = 0..15 into four independent chains, so every f64 add rounds
-/// exactly as before.
+/// The f32 product is pure per-lane arithmetic, so computing it eight taps at a
+/// time with AVX2 yields bit-identical values to the scalar form — no
+/// reassociation, no contraction, and each f32 op keeps its own rounding. Only
+/// the *loads* are vectorized, which is the point: the scalar shape issues two
+/// loads per tap (the LUT row plus the sample), i.e. 32 loads per output sample
+/// against Zen's three load ports. Widening with `cvtps_pd` is exact (f32 to
+/// f64 is lossless), and the accumulation then replays t = 0..15 into four
+/// independent chains, so every f64 add rounds exactly as before.
+///
+/// There is no two-row weight blend here: 7.4.0 picks the nearest tabulated
+/// phase (`int(frac * sinc_phase_count + 0.5)`), so the blend weight is a
+/// literal `0.0` and `ws + 0*(wt - ws)` is `ws` — its second LUT row load and
+/// three ALU ops were pure dead work. Dropping them cannot move a value except
+/// the sign of an all-zero result (`-0.0 + 0.0` is `+0.0`), which the u16
+/// output path cannot observe.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
 unsafe fn gather_lanes_16(
     buf: &[f32],
     sinc_lut: &[f32],
     start: &[usize; 4],
-    alpha: &[f32; 4],
     rowoff: &[usize; 4],
 ) -> [f64; 4] {
     use std::arch::x86_64::*;
     let mut prod = [[0.0f64; SINC_TAP_COUNT]; 4];
     for k in 0..4 {
-        let a = _mm256_set1_ps(*alpha.get_unchecked(k));
         let lut = sinc_lut.as_ptr().add(*rowoff.get_unchecked(k));
         let b = buf.as_ptr().add(*start.get_unchecked(k));
         let dst = prod[k].as_mut_ptr();
         let mut t = 0;
         while t < SINC_TAP_COUNT {
-            let ws = _mm256_loadu_ps(lut.add(t));
-            let wt = _mm256_loadu_ps(lut.add(SINC_TAP_COUNT + t));
-            let w = _mm256_add_ps(ws, _mm256_mul_ps(a, _mm256_sub_ps(wt, ws)));
+            let w = _mm256_loadu_ps(lut.add(t));
             let p = _mm256_mul_ps(_mm256_loadu_ps(b.add(t)), w);
             let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(p));
             let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(p, 1));
@@ -92,16 +101,14 @@ unsafe fn gather_lanes_16(
     buf: &[f32],
     sinc_lut: &[f32],
     start: &[usize; 4],
-    alpha: &[f32; 4],
     rowoff: &[usize; 4],
 ) -> [f64; 4] {
     let mut r = [0.0f64; 4];
     for t in 0..SINC_TAP_COUNT {
         for k in 0..4 {
-            let ws = *sinc_lut.get_unchecked(rowoff[k] + t);
-            let w = ws + alpha[k]
-                * (*sinc_lut.get_unchecked(rowoff[k] + SINC_TAP_COUNT + t) - ws);
-            r[k] += f64::from(*buf.get_unchecked(start[k] + t) * w);
+            r[k] += f64::from(
+                *buf.get_unchecked(start[k] + t) * *sinc_lut.get_unchecked(rowoff[k] + t),
+            );
         }
     }
     r
@@ -236,7 +243,6 @@ pub(crate) fn scale_field_sinc(
             while j + 4 <= n {
                 let mut coord = [0.0f32; 4];
                 let mut start = [0usize; 4];
-                let mut alpha = [0.0f32; 4];
                 let mut rowoff = [0usize; 4];
                 let mut adj = [0.0f64; 4];
                 unsafe {
@@ -280,12 +286,10 @@ pub(crate) fn scale_field_sinc(
                         // `sinc_lut[65536]` at all.)
                         let phase_pos = frac * SINC_PHASE_COUNT as f32 + 0.5;
                         let phase = (phase_pos as usize).min(SINC_PHASE_COUNT - 1);
-                        alpha[k] = 0.0;
-                        // The two adjacent phase rows are contiguous in the LUT.
                         rowoff[k] = phase * SINC_TAP_COUNT;
                         start[k] = coord_int - half_taps_m1;
                     }
-                    let r = gather_lanes_16(buf, sinc_lut, &start, &alpha, &rowoff);
+                    let r = gather_lanes_16(buf, sinc_lut, &start, &rowoff);
                     // The final level_adjust * result multiply happens in f64
                     // and rounds to f32 on the store. Reuses adj[] computed above
                     // (same arithmetic, no redundant recompute).
@@ -324,14 +328,10 @@ pub(crate) fn scale_field_sinc(
 
                 // Fractional phase: 7.4.0 selects the nearest tabulated row
                 // (`int(frac * sinc_phase_count + np.float32(0.5))`) instead of
-                // blending the two neighbours; see the note in the lane loop
-                // above for why `alpha` is 0 and the two-row slice is kept.
+                // blending the two neighbours, so only that row is read.
                 let phase_pos = frac * SINC_PHASE_COUNT as f32 + 0.5;
                 let phase = (phase_pos as usize).min(SINC_PHASE_COUNT - 1);
-                let alpha = 0.0f32;
-
-                // The two adjacent phase rows are contiguous in the LUT.
-                let row = &sinc_lut[phase * SINC_TAP_COUNT..(phase + 2) * SINC_TAP_COUNT];
+                let base = phase * SINC_TAP_COUNT;
 
                 let start = coord_int - half_taps_m1;
                 // numba types `result = 0.0` as float64 so the accumulator is
@@ -341,9 +341,9 @@ pub(crate) fn scale_field_sinc(
                 let mut result = 0.0f64;
                 unsafe {
                     for t in 0..SINC_TAP_COUNT {
-                        let ws = *row.get_unchecked(t);
-                        let w = ws + alpha * (*row.get_unchecked(SINC_TAP_COUNT + t) - ws);
-                        result += f64::from(*buf.get_unchecked(start + t) * w);
+                        result += f64::from(
+                            *buf.get_unchecked(start + t) * *sinc_lut.get_unchecked(base + t),
+                        );
                     }
                 }
                 out[jj] = (adjust * result) as f32;
