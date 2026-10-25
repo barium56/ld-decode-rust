@@ -152,8 +152,10 @@ mod tests {
         ),
         (
             "decode/demodblock.rs",
-            // All three sit behind a cached `LD_DUMP_PIPE`/once-flag gate.
-            &[("demod_block_cpu", 3)],
+            // The block kernel is split into `demod_head` + `late_group_cpu` so
+            // `--gpu` can run the tail for a whole field's blocks at once; every
+            // one of these sits behind a cached `LD_DUMP_PIPE`/once-flag gate.
+            &[("demod_head", 3), ("late_group_cpu", 1)],
         ),
         (
             "optimized/scale_field.rs",

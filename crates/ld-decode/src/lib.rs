@@ -35,7 +35,16 @@ static DEMOD_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 pub fn set_worker_threads(n: usize) {
     let n = n.max(1);
     DEMOD_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
-    let tail = (n / 4).max(1);
+    // `LD_TAIL_THREADS` overrides the `n/4` split. Read once, before any decode
+    // starts, so it costs nothing per field. It exists to re-sweep the split
+    // whenever the balance of work changes -- which `--gpu` does, by taking the
+    // demod late group off the pool -- instead of editing and rebuilding for
+    // every point of the sweep.
+    let tail = std::env::var("LD_TAIL_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or_else(|| (n / 4).max(1));
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(tail)
         .build_global();

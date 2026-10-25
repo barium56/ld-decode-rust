@@ -61,6 +61,11 @@ struct Args {
     /// Use lower-bandwidth (lowband) decode settings
     #[arg(long)]
     lowband: bool,
+    /// Run the demod late group (demod_fft + the three video channels) on an
+    /// OpenCL device, batched over a field's blocks. Output is byte-identical;
+    /// this is a speed knob only, and it needs an fp64 OpenCL device.
+    #[arg(long)]
+    gpu: bool,
     /// Source is in NTSC-J format (IRE 0 black): `black16bIre` stays at the
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
@@ -331,6 +336,12 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
+    if args.gpu {
+        match decoder.enable_gpu() {
+            Ok(what) => tracing::info!("GPU late group: {what}"),
+            Err(e) => anyhow::bail!("--gpu: {e}"),
+        }
+    }
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
     decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });

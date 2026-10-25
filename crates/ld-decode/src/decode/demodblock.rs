@@ -259,9 +259,39 @@ fn cut_block(data: &[f32], spec: &DemodSpecRef) -> Vec<f32> {
     }
 }
 
+/// The head on its own, for the batched late-group path (`--gpu`): returns the
+/// head and the stage-dump sequence number, and hands the scratch back to the
+/// thread-local so the next call on this thread reuses it.
+pub(crate) fn demod_head_only(
+    data: &[f32],
+    mtf_level: f64,
+    spec: &DemodSpecRef,
+    cut: bool,
+    mtf_pow: Option<&[Complex64]>,
+    rotdelay: i64,
+    block_no: u64,
+) -> (DemodHead, Option<usize>) {
+    let (head, dump, sc) = demod_head(data, mtf_level, spec, cut, mtf_pow, rotdelay, block_no);
+    SCRATCH.with(|c| *c.borrow_mut() = Some(sc));
+    (head, dump)
+}
+
+/// The late group on the CPU for a head produced elsewhere.
+pub(crate) fn demod_late_cpu(
+    head: &DemodHead,
+    spec: &DemodSpecRef,
+    cut: bool,
+    dump: Option<usize>,
+) -> [Vec<f32>; 3] {
+    let mut sc = SCRATCH.with(|c| c.borrow_mut().take().unwrap_or_default());
+    let videos = late_group_cpu(head, spec, cut, &mut sc, dump);
+    SCRATCH.with(|c| *c.borrow_mut() = Some(sc));
+    videos
+}
+
 /// The output range one channel keeps: `[blockcut : -blockcut_end]` when the
 /// caller asked for a cut, the whole array otherwise.
-fn kept_range(len: usize, spec: &DemodSpecRef, cut: bool) -> (usize, usize) {
+pub(crate) fn kept_range(len: usize, spec: &DemodSpecRef, cut: bool) -> (usize, usize) {
     if cut {
         (
             spec.blockcut.min(len),
@@ -581,6 +611,33 @@ impl Drop for DemodProf {
     }
 }
 
+/// Row map for the per-block spectra. The product loop and the gather loop must
+/// use the same map: with them out of step a channel is read from another
+/// channel's row, which is silent corruption rather than a rounding error.
+const ROW_HILBERT: usize = 0;
+const ROW_EFM: usize = 1;
+const ROW_RFHPF: usize = 2;
+/// Video rows: 0 is free once hilbert has been inverted and unwrapped, 2 once
+/// `cut_rfhpf` has taken its copy, 3 was never used. Row 1 still holds the EFM
+/// time-domain row, so it is deliberately *not* reused here.
+const VIDEO_ROWS: [usize; 3] = [ROW_HILBERT, ROW_RFHPF, 3];
+
+/// Everything the *head* of a block produces, before the late group.
+///
+/// The split exists so the late group -- one forward real transform and three
+/// real inverses, all at `blocklen` -- can be issued for a whole field at once
+/// on a device (`decode::gpu_fft`) instead of one block at a time. The CPU path
+/// calls the two halves back to back, so this is a structural split, not an
+/// arithmetic one.
+pub(crate) struct DemodHead {
+    pub rfhpf: Vec<f32>,
+    pub efm: Vec<i16>,
+    pub audio: [Vec<f32>; 2],
+    pub demod_raw: Vec<f32>,
+    /// The clamped demod series the late group transforms (`demod_buf`).
+    pub demod_clamped: Vec<f64>,
+}
+
 pub(crate) fn demod_block_cpu(
     data: &[f32],
     mtf_level: f64,
@@ -590,6 +647,30 @@ pub(crate) fn demod_block_cpu(
     rotdelay: i64,
     block_no: u64,
 ) -> BlockDecode {
+    let (mut head, dump, mut sc) = demod_head(data, mtf_level, spec, cut, mtf_pow, rotdelay, block_no);
+    let videos = late_group_cpu(&head, spec, cut, &mut sc, dump);
+    // Put the block-length series back in the scratch rather than dropping it:
+    // the next block on this thread then reuses the allocation, which is what
+    // kept the pre-split kernel allocation-free per block.
+    sc.demod_buf = std::mem::take(&mut head.demod_clamped);
+    SCRATCH.with(|c| *c.borrow_mut() = Some(sc));
+    demod_assemble(head, videos)
+}
+
+/// The head half: everything up to and including the clamped demod series.
+///
+/// Returns the stage-dump sequence number (when `LD_DUMP_PIPE` selected this
+/// block) so the tail can keep writing the same `s{n}_*` files, and the scratch
+/// the caller must hand back.
+fn demod_head(
+    data: &[f32],
+    mtf_level: f64,
+    spec: &DemodSpecRef,
+    cut: bool,
+    mtf_pow: Option<&[Complex64]>,
+    rotdelay: i64,
+    block_no: u64,
+) -> (DemodHead, Option<usize>, Box<Scratch>) {
     let blocklen = spec.blocklen;
     let _prof = DemodProf::start();
     let mut st = StageT::new(0);
@@ -705,9 +786,6 @@ pub(crate) fn demod_block_cpu(
     // prefetch workers.
     let rfft_len = blocklen / 2 + 1;
     let stride = blocklen;
-    const ROW_HILBERT: usize = 0;
-    const ROW_EFM: usize = 1;
-    const ROW_RFHPF: usize = 2;
     if batch_spec.len() < 4 * blocklen {
         batch_spec.resize(4 * blocklen, Complex64::new(0.0, 0.0));
     }
@@ -872,52 +950,12 @@ pub(crate) fn demod_block_cpu(
         *v = (*v).clamp(1_500_000.0, freq_hz * 0.75);
     }
     st.mark(9);
-    // `demod_fft`, written over `indata`: that spectrum is dead here (the audio
-    // slice and the video-filter product were its last users).
-    ffi_ducc::fft_real_full_into(demod_buf, indata);
-    if let Some(s) = dump {
-        pipe_write(
-            pipe_dir.as_deref().unwrap(),
-            &format!("s{}_demod_fft.bin", s),
-            &pipe_cf(indata),
-        );
-    }
-    st.mark(10);
 
-    // Late group: the three post-demod half-spectrum filters, each carrying its
-    // own FIR delay as a phase ramp (7.4.0 folded the time-domain `np.roll` into
-    // the filter). Each product is built straight into its row (same np_cmul
-    // arithmetic, no per-channel clone of the demod spectrum) and the three real
-    // inverses are scalar `irfft` calls -- the reference's own call, and the
-    // only bit-exact way to invert a half-spectrum row (`vendor/ducc_ffi.cc`).
-    let (cstart, cend) = kept_range(indata.len(), spec, cut);
-    // Video rows: 0 is free once hilbert has been inverted and unwrapped, 2
-    // once `cut_rfhpf` has taken its copy, 3 was never used. Row 1 still holds
-    // the EFM time-domain row, so it is deliberately *not* reused here.
-    const VIDEO_ROWS: [usize; 3] = [ROW_HILBERT, ROW_RFHPF, 3];
-    for (i, filter) in spec.filters.fvideo_rfft.iter().enumerate() {
-        let row = VIDEO_ROWS[i];
-        np_cmul_slices(
-            &indata[..rfft_len],
-            filter,
-            &mut batch_spec[row * stride..row * stride + rfft_len],
-        );
-    }
-    for row_idx in VIDEO_ROWS {
-        let row = &mut batch_spec[row_idx * stride..row_idx * stride + rfft_len];
-        let real = ffi_ducc::irfft(row, blocklen);
-        for (c, v) in batch_spec[row_idx * stride..row_idx * stride + blocklen]
-            .iter_mut()
-            .zip(&real)
-        {
-            c.re = *v;
-            c.im = 0.0;
-        }
-    }
-    st.mark(11);
-
-    // EFM (row 2): the clip is element-wise, so building only the kept range
-    // yields exactly the elements the full-length build then sliced out.
+    // EFM (row 1): the clip is element-wise, so building only the kept range
+    // yields exactly the elements the full-length build then sliced out. It is
+    // taken here, before the late group, purely so the head owns every output
+    // that does not depend on `demod_fft` -- the row it reads is not written
+    // again, so the values and their order are unchanged.
     let efm: Vec<i16> = {
         let row = &batch_spec[ROW_EFM * stride..ROW_EFM * stride + blocklen];
         let (start, end) = if cut {
@@ -944,27 +982,90 @@ pub(crate) fn demod_block_cpu(
         );
     }
 
-    let mut video = VideoChannels {
-        demod: Vec::new(),
-        demod_raw,
-        demod_05: Vec::new(),
-        demod_burst: Vec::new(),
-        audio,
-        efm,
+    // The clamped series leaves the scratch: the tail (CPU or device) owns it
+    // now, and the next block on this thread resizes `demod_buf` again.
+    let demod_clamped = std::mem::take(demod_buf);
+    (
+        DemodHead {
+            rfhpf,
+            efm,
+            audio,
+            demod_raw,
+            demod_clamped,
+        },
+        dump,
+        sc,
+    )
+}
+
+/// The late group on the CPU: `demod_fft`, the three post-demod half-spectrum
+/// filters, their inverses, and the per-channel cut to f32.
+fn late_group_cpu(
+    head: &DemodHead,
+    spec: &DemodSpecRef,
+    cut: bool,
+    sc: &mut Scratch,
+    dump: Option<usize>,
+) -> [Vec<f32>; 3] {
+    let blocklen = spec.blocklen;
+    let rfft_len = blocklen / 2 + 1;
+    let stride = blocklen;
+    let Scratch {
+        indata,
+        batch_spec,
+        ..
+    } = sc;
+    // `demod_fft`, written over `indata`: that spectrum is dead here (the audio
+    // slice and the video-filter product were its last users).
+    ffi_ducc::fft_real_full_into(&head.demod_clamped, indata);
+    let pipe_dir: Option<String> = match dump {
+        Some(_) => std::env::var_os("LD_DUMP_PIPE").map(|p| p.to_string_lossy().into_owned()),
+        None => None,
     };
+    if let (Some(s), Some(dir)) = (dump, pipe_dir.as_deref()) {
+        pipe_write(dir, &format!("s{}_demod_fft.bin", s), &pipe_cf(indata));
+    }
+
+    // Late group: the three post-demod half-spectrum filters, each carrying its
+    // own FIR delay as a phase ramp (7.4.0 folded the time-domain `np.roll` into
+    // the filter). Each product is built straight into its row (same np_cmul
+    // arithmetic, no per-channel clone of the demod spectrum) and the three real
+    // inverses are scalar `irfft` calls -- the reference's own call, and the
+    // only bit-exact way to invert a half-spectrum row (`vendor/ducc_ffi.cc`).
+    let (cstart, cend) = kept_range(indata.len(), spec, cut);
+    for (i, filter) in spec.filters.fvideo_rfft.iter().enumerate() {
+        let row = VIDEO_ROWS[i];
+        np_cmul_slices(
+            &indata[..rfft_len],
+            filter,
+            &mut batch_spec[row * stride..row * stride + rfft_len],
+        );
+    }
+    for row_idx in VIDEO_ROWS {
+        let row = &mut batch_spec[row_idx * stride..row_idx * stride + rfft_len];
+        let real = ffi_ducc::irfft(row, blocklen);
+        for (c, v) in batch_spec[row_idx * stride..row_idx * stride + blocklen]
+            .iter_mut()
+            .zip(&real)
+        {
+            c.re = *v;
+            c.im = 0.0;
+        }
+    }
 
     // Consume the late batch: each channel is cut/rolled and converted straight
     // to f32, identical arithmetic to the per-channel form.
-    for (i, _filter) in spec.filters.fvideo.iter().enumerate() {
+    let mut out: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (i, (dst, _filter)) in out.iter_mut().zip(spec.filters.fvideo.iter()).enumerate() {
         // Same row map as the late group's products: the two loops must agree or
         // a channel is gathered from another channel's row (a `demod_05` read
         // from the EFM row is silent data corruption, not a rounding error).
         let row = VIDEO_ROWS[i];
         let ch_out = &batch_spec[row * stride..row * stride + blocklen];
-        if let Some(s) = dump {
+        if let (Some(s), Some(dir)) = (dump, pipe_dir.as_deref()) {
             if i < 2 {
                 pipe_write(
-                    pipe_dir.as_deref().unwrap(),
+                    dir,
                     &format!(
                         "s{}_{}.bin",
                         s,
@@ -978,18 +1079,25 @@ pub(crate) fn demod_block_cpu(
         // half-spectrum filter as a phase ramp (`FVideo_rfft`), so the inverse
         // FFT output is *already* aligned and the reference gathers it plainly.
         // Rolling again would double-shift `demod_05`/`demod_burst`.
-        let out_f32 = rolled_f32_range(ch_out, 0, cstart, cend);
-        match i {
-            0 => video.demod = out_f32,
-            1 => video.demod_05 = out_f32,
-            2 => video.demod_burst = out_f32,
-            _ => unreachable!(),
-        }
+        *dst = rolled_f32_range(ch_out, 0, cstart, cend);
     }
-    st.mark(12);
-    // Hand the work buffers back for the next block on this thread.
-    SCRATCH.with(|c| *c.borrow_mut() = Some(sc));
-    BlockDecode { video, rfhpf }
+    out
+}
+
+/// Join a head with its three late-group channels into a decoded block.
+pub(crate) fn demod_assemble(head: DemodHead, videos: [Vec<f32>; 3]) -> BlockDecode {
+    let [demod, demod_05, demod_burst] = videos;
+    BlockDecode {
+        video: VideoChannels {
+            demod,
+            demod_raw: head.demod_raw,
+            demod_05,
+            demod_burst,
+            audio: head.audio,
+            efm: head.efm,
+        },
+        rfhpf: head.rfhpf,
+    }
 }
 
 /// Demodulate only the 0.5 MHz path (port of `demodblock_sync`), used for
