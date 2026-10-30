@@ -718,7 +718,7 @@ impl Decoder {
         let output_lines = spec.output_lines();
         let bytes_per_field = spec.bytes_per_field() as f64;
         let linelen = spec.linelen;
-        let readlen = ((linelen * 350) / 16384) * 16384;
+        let readlen = if spec.sys.pal { linelen * 400 } else { ((linelen * 350) / 16384) * 16384 };
         // Read before `spec` moves into the struct: the EFM PLL clocks at the
         // input rate.
         let sample_rate_hz = spec.freq_hz;
@@ -2594,7 +2594,8 @@ impl Decoder {
                 let minute_seconds = clv_minutes * 60;
                 if let Some(clv_seconds) = self.clv_seconds {
                     // newer CLV
-                    return Some((minute_seconds + clv_seconds) * 30 + self.clv_frame_num.unwrap_or(0));
+                    let clvfps = if self.spec.sys.pal { 25 } else { 30 };
+                    return Some((minute_seconds + clv_seconds) * clvfps + self.clv_frame_num.unwrap_or(0));
                 } else {
                     self.early_clv = true;
                     return Some(minute_seconds);

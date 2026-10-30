@@ -230,6 +230,32 @@ pub(crate) fn compute_vits_metrics(
 ) -> VitsOutcome {
     let mut metrics: Vec<(&str, f64)> = Vec::new();
 
+    if field.spec.sys.pal {
+        // computeMetricsPAL: grey level on line 13 (first fields), the 50%
+        // burst level on the same line (second fields).
+        if field.is_first_field() {
+            let wl = field.lineslice_tbc(13, Some(4.7 + 15.5), Some(3.0));
+            if wl.1 <= field.dspicture.len() && wl.1 > wl.0 {
+                if let Some(snr) = calcsnr(field, wl, true) {
+                    metrics.push(("greyPSNR", snr));
+                }
+                let ire: Vec<f64> = field.dspicture[wl.0..wl.1].iter().map(|&v| output_to_ire_u16(field, v)).collect();
+                metrics.push(("greyIRE", mean(&ire)));
+            }
+        } else {
+            let b50 = field.lineslice_tbc(13, Some(36.0), Some(20.0));
+            if b50.1 <= field.dspicture.len() && b50.1 > b50.0 {
+                let v: Vec<f64> = field.dspicture[b50.0..b50.1].iter().map(|&v| f64::from(v)).collect();
+                let m = mean(&v);
+                let rms = (v.iter().map(|&x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64).sqrt();
+                metrics.push(("palVITSBurst50Level", rms / field.out_scale));
+            }
+        }
+    }
+
+    let rawdata = &field.data.input;
+    let delay_white = spec.delays.video_white as i64;
+    if !field.spec.sys.pal {
     // Check for a white flag - only on earlier discs, and only on first
     // "frame" fields.
     let wf_slice = field.lineslice_tbc(11, Some(15.0), Some(40.0));
@@ -281,8 +307,6 @@ pub(crate) fn compute_vits_metrics(
     }
 
     let ire50_rawslice = field.lineslice(19, Some(36.0), Some(10.0), None, 0.0);
-    let rawdata = &field.data.input;
-    let delay_white = spec.delays.video_white as i64;
     if let Some(raw) = slice_shifted(rawdata, ire50_rawslice, delay_white) {
         metrics.push(("greyRFLevel", std_from_int16_f64(&raw)));
     }
@@ -305,6 +329,7 @@ pub(crate) fn compute_vits_metrics(
                 metrics.push(("ntscLine19Burst0IRE", std::f64::consts::SQRT_2 * rms / field.out_scale));
             }
         }
+    }
     }
 
     // FIXME: these should probably be computed in the Field class.

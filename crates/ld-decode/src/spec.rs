@@ -180,7 +180,7 @@ pub(crate) const PAL: SysTable = SysTable {
     field_phases: 8,
     vits_whitelocs: &[[19, 12, 8]],
     vits_code_slices: &[[16, 11, 49, 85], [17, 11, 49, 85]],
-    audio_notchwidth: 150_000.0,
+    audio_notchwidth: 200_000.0,
     audio_notchorder: 2,
     audio_filterwidth: 100_000.0,
     audio_filterorder: 900,
@@ -1627,6 +1627,11 @@ pub(crate) struct Filters {
     pub fvideo05: Vec<Complex64>,
     pub f05_offset: usize,
     pub fvideo_burst_offset: usize,
+    /// PAL only: 7.4's `FVideoBurst` (video LPF x de-emphasis x fsc band-pass,
+    /// delay folded in), as a half spectrum. The third channel carries the
+    /// pilot on PAL, so the burst is rebuilt from the raw demod on the few
+    /// lines the field phase needs.
+    pub pal_burst_rfft: Option<Vec<Complex64>>,
     /// Analog audio channel filters, [left, right].
     pub audio: [AudioChannelFilters; 2],
     /// Sample-rate decimation of the stage-1 audio (blocklen / nbins).
@@ -1908,7 +1913,11 @@ impl DecoderSpec {
 
     /// Samples read per field (port of `LDdecode.readlen` for NTSC).
     pub fn readlen(&self) -> usize {
-        ((self.linelen * 350) / 16384) * 16384
+        if self.sys.pal {
+            self.linelen * 400
+        } else {
+            ((self.linelen * 350) / 16384) * 16384
+        }
     }
 
     /// Demod block stride in input samples; the cut output of consecutive
@@ -2389,6 +2398,21 @@ fn compute_filters(
         ]
     };
 
+    let pal_burst_rfft = if sys.pal {
+        let fb = filtfft(&fburst_taps, &[1.0], blocklen);
+        Some(
+            (0..rfft_len)
+                .map(|k| {
+                    let v = np_cmul(np_cmul(fvideo_lpf_eff[k], fdeemp[k]), fb[k]);
+                    let (s, c) = numpy_sincos(2.0 * PI * 40.0 * k as f64 / blocklen as f64);
+                    np_cmul(v, Complex64::new(c, s))
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     // Analog audio channel filters and the EFM equalisation filter.
     let (audio, audio_fdiv) = compute_audio_filters(
         sys,
@@ -2411,6 +2435,7 @@ fn compute_filters(
             fvideo05,
             f05_offset,
             fvideo_burst_offset,
+            pal_burst_rfft,
             audio,
             audio_fdiv,
             fefm,

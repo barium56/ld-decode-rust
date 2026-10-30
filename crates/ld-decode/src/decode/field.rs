@@ -58,6 +58,8 @@ pub(crate) struct PrevField {
     pub outlinecount: usize,
     pub phase_adjust_median: f64,
     pub field_phase_id: i64,
+    /// PAL: the burst phase adjustments of lines 7, 11, 15, 19.
+    pub pal_phase_adjust: [f64; 4],
     /// TBC picture of the previous field (for 3D comb metrics).
     pub dspicture: Arc<Vec<u16>>,
     pub out_scale: f64,
@@ -160,6 +162,9 @@ pub(crate) struct Field {
     pub is_first_field: Option<bool>,
     pub needrerun: bool,
     pub skipdetected: bool,
+    /// PAL: the burst phase adjustments of lines 7, 11, 15, 19 (seeds the
+    /// next field's).
+    pub pal_phase_adjust: [f64; 4],
     pub phase_adjust_median: f64,
     pub field_phase_id: i64,
     pub burstmedian: f64,
@@ -609,6 +614,7 @@ impl Field {
             needrerun: false,
             skipdetected: false,
             phase_adjust_median: 0.0,
+            pal_phase_adjust: [0.0; 4],
             field_phase_id: 1,
             burstmedian: 0.0,
             linecode: vec![None; 3],
@@ -649,6 +655,7 @@ impl Field {
             outlinecount: self.outlinecount,
             phase_adjust_median: self.phase_adjust_median,
             field_phase_id: self.field_phase_id,
+            pal_phase_adjust: self.pal_phase_adjust,
             dspicture: Arc::new(std::mem::take(&mut self.dspicture)),
             out_scale: self.out_scale,
         }
@@ -2386,9 +2393,16 @@ impl Field {
     pub fn get_burstlevel(&self, l: usize, linelocs: Option<&[f64]>) -> f64 {
         let (start, end) = self.lineslice(l, Some(5.5), Some(2.4), linelocs, 0.0);
         if start >= end || end > self.data.video.demod.len() {
-            return 0.0;
+            return if self.spec.sys.pal { f64::NAN } else { 0.0 };
         }
         let burstarea = &self.data.video.demod[start..end];
+        if self.spec.sys.pal {
+            // `FieldPAL.get_burstlevel`: None (NaN here) above 30 IRE.
+            let m = mean_f32(burstarea);
+            if burstarea.iter().any(|&v| f64::from(v - m) > 30.0 * self.levels.hz_ire) {
+                return f64::NAN;
+            }
+        }
         f64::from(rms(burstarea)) * std::f64::consts::SQRT_2
     }
 
@@ -2400,6 +2414,7 @@ impl Field {
         let burstlevel: Vec<f64> = lines
             .into_par_iter()
             .map(|l| self.get_burstlevel(l, None))
+            .filter(|v| !v.is_nan())
             .collect();
         let median = if burstlevel.is_empty() {
             0.0
@@ -2836,12 +2851,92 @@ impl Field {
             .iter()
             .map(|&l| self.decodephillipscode(spec, l + self.lineoffset))
             .collect();
-        // The 8-field PAL sequence, continued from the previous field (the
-        // burst-based determination is not ported).
-        self.field_phase_id = match &self.prevfield {
-            Some(p) if p.valid => p.field_phase_id % 8 + 1,
-            _ => 1,
+        self.field_phase_id = self.determine_field_number();
+    }
+
+    /// `get_following_field_number`: the previous field's phase + 1 (8 -> 1).
+    fn following_field_number(&self) -> i64 {
+        match &self.prevfield {
+            Some(p) => p.field_phase_id % 8 + 1,
+            None => 1,
+        }
+    }
+
+    /// `FieldPAL.determine_field_number`: the 4-field sequence from the
+    /// parity and the burst on line 6 (present on fields 2 and 3), then fields
+    /// 5-8 told from 1-4 by the burst phase on lines 7, 11, 15, 19.
+    fn determine_field_number(&mut self) -> i64 {
+        let bl6 = self.get_burstlevel(6, None);
+        if bl6.is_nan() {
+            return self.following_field_number();
+        }
+        let bl6 = bl6 / self.levels.hz_ire;
+        let hasburst = if inrange(bl6, self.burstmedian * 0.8, self.burstmedian * 1.2) {
+            true
+        } else if bl6 < self.burstmedian * 0.2 {
+            false
+        } else {
+            return self.following_field_number();
         };
+        let m4 = match (self.is_first_field(), hasburst) {
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
+            (false, false) => 4,
+        };
+
+        // The burst channel for those lines (the third channel holds the
+        // pilot on PAL); `compute_line_bursts` reads it as `demod_burst`.
+        let lines = [7usize, 11, 15, 19];
+        let burst = self.pal_burst_signal(&lines);
+        let saved = std::mem::replace(&mut self.data.video.demod_burst, burst);
+        let prev: [f64; 4] = self.prevfield.as_ref().map_or([0.0; 4], |p| p.pal_phase_adjust);
+        let linelocs = self.linelocs.clone();
+        let (mut rcount, mut count) = (0, 0);
+        for (k, &line) in lines.iter().enumerate() {
+            let (rising, adj) = self.compute_line_bursts(&linelocs, line, prev[k]);
+            self.pal_phase_adjust[k] = adj;
+            if let Some(r) = rising {
+                rcount += usize::from(r);
+                count += 1;
+            }
+        }
+        self.data.video.demod_burst = saved;
+
+        if count == 0 || rcount * 2 == count {
+            return self.following_field_number();
+        }
+        let mut is_firstfour = rcount * 2 > count;
+        if m4 == 2 {
+            is_firstfour = !is_firstfour;
+        }
+        m4 + if is_firstfour { 0 } else { 4 }
+    }
+
+    /// 7.4's burst channel (`FVideoBurst` on the clamped raw demod) around
+    /// the given lines, one demod block per line; zero elsewhere.
+    fn pal_burst_signal(&self, lines: &[usize]) -> Vec<f32> {
+        let raw = &self.data.video.demod_raw;
+        let mut out = vec![0.0f32; raw.len()];
+        let Some(filt) = self.spec.filters.pal_burst_rfft.as_ref() else { return out };
+        let n = self.spec.blocklen;
+        if raw.len() < n {
+            return out;
+        }
+        let hi = self.spec.freq_hz * 0.75;
+        for &l in lines {
+            let Some(&loc) = self.linelocs.get(l + self.lineoffset) else { continue };
+            let s = loc.max(0.0) as usize;
+            let a = s.saturating_sub(n / 2).min(raw.len() - n);
+            let block: Vec<f64> = raw[a..a + n].iter().map(|&v| f64::from(v).clamp(1_500_000.0, hi)).collect();
+            let prod: Vec<rustfft::num_complex::Complex64> = crate::ffi_ducc::rfft(&block).iter().zip(filt).map(|(&x, &h)| x * h).collect();
+            let real = crate::ffi_ducc::irfft(&prod, n);
+            let e = (s + 2 * self.inlinelen).min(a + n);
+            for i in s..e {
+                out[i] = real[i - a] as f32;
+            }
+        }
+        out
     }
 
     /// `FieldPAL.refine_linelocs_pilot` (`refine_pilot_zcs`): each line is
@@ -2853,23 +2948,18 @@ impl Field {
         let pilot = &self.data.video.demod_burst;
         let freq = self.spec.freq;
         let linelen = self.inlinelen as f64;
-        let length_px = self.usectoinpx(6.0, None, None);
         let mut zcs = vec![0.0f64; n];
         let mut plen = vec![0.0f64; n];
         let mut prev = 0.0;
         for l in 0..n {
             let mut adjfreq = freq;
             if l > 1 {
-                let spacing = (linelocs[l] - linelocs[l - 1]) / linelen;
-                if spacing > 0.1 {
-                    adjfreq = freq / spacing;
-                }
+                adjfreq /= (linelocs[l] - linelocs[l - 1]) / linelen;
             }
             let pl = (adjfreq / self.spec.sys.pilot_mhz) / 2.0;
             plen[l] = pl;
-            let begin = linelocs[l];
-            let start = begin.max(0.0) as usize;
-            let stop = ((begin + length_px + 1.0).max(0.0) as usize).min(pilot.len());
+            let (start, stop) = self.lineslice(l, Some(0.0), Some(6.0), Some(linelocs), 0.0);
+            let stop = stop.min(pilot.len());
             let zc = if start < stop {
                 let pilots = &pilot[start..stop];
                 let peakloc = pilots
@@ -2877,7 +2967,7 @@ impl Field {
                     .enumerate()
                     .fold((0usize, -1.0f32), |m, (i, &v)| if v.abs() > m.1 { (i, v.abs()) } else { m })
                     .0;
-                calczc_do(pilots, peakloc, 0.0, 0, 16).map(|z| (z - (begin - start as f64)) / pl)
+                calczc_do(pilots, peakloc, 0.0, 0, 10).map(|z| (z - (linelocs[l] - start as f64)) / pl)
             } else {
                 None
             };
