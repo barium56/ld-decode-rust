@@ -288,15 +288,16 @@ fn platform_sin(x: f64) -> f64 {
 // libm's `cos`/`sin`, which is where the bulk of the Linux-vs-Windows FFT drift
 // came from. On non-Windows targets `build.rs` defines `DUCC_UCRT_SHIM` and the
 // header calls these instead, so the two platforms build identical twiddles
-// from identical numbers.
+// from identical numbers. The gate matches `build.rs` (every non-MSVC target,
+// so windows-gnu too, whose mingw libm is not UCRT's).
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(target_env = "msvc"))]
 #[no_mangle]
 pub extern "C" fn ld_ucrt_cos(x: f64) -> f64 {
     cos_or_libm(x)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(target_env = "msvc"))]
 #[no_mangle]
 pub extern "C" fn ld_ucrt_sin(x: f64) -> f64 {
     sin_or_libm(x)
