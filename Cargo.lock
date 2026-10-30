@@ -318,6 +318,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cc",
+ "libloading",
  "num-traits",
  "rayon",
  "realfft",
@@ -342,6 +343,16 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]

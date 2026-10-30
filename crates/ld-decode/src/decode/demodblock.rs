@@ -867,41 +867,17 @@ fn demod_head(
     st.mark(3);
 
     // Analog audio stage 1: per-channel sliced bandpass demod.
-    let fdiv = spec.filters.audio_fdiv;
     let mut audio: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
     for (ch, out) in audio.iter_mut().enumerate() {
         let af = &spec.filters.audio[ch];
-        // fft_do_slice(indata_fft)
         let nbins_half = af.nbins / 2;
-        // Slice-and-multiply fused: the previous shape materialised the slice
-        // copy only to overwrite every element with the filt1 product. The
-        // per-element arithmetic (np_cmul) and the slice order are unchanged —
-        // the two contiguous runs of the reference's `chain` are now two
-        // appends, which also drops the intermediate `Vec` and its ifft input
-        // copy.
-        let mut sliced: Vec<Complex64> = Vec::with_capacity(af.nbins);
-        np_cmul_extend(
+        *out = audio_stage1(
             &indata[af.lowbin..af.lowbin + nbins_half],
-            &af.filt1[..nbins_half],
-            &mut sliced,
-        );
-        np_cmul_extend(
             &indata[blocklen - af.lowbin - nbins_half..blocklen - af.lowbin],
-            &af.filt1[nbins_half..af.nbins],
-            &mut sliced,
+            ch,
+            spec,
+            cut,
         );
-        let a1 = ffi_ducc::ifft(&sliced);
-        // a1u = unwrap_hilbert(a1, a1_freq) + low_freq
-        let a1u = unwrap_hilbert(&a1, af.a1_freq);
-        let a1u_f32: Vec<f32> = a1u.iter().map(|&v| (v + af.low_freq) as f32).collect();
-        // Cut scaled by fdiv.
-        let cut_start = (spec.blockcut / fdiv).min(a1u_f32.len());
-        let cut_end = a1u_f32.len().saturating_sub(spec.blockcut_end / fdiv);
-        *out = if cut && cut_start < cut_end {
-            a1u_f32[cut_start..cut_end].to_vec()
-        } else {
-            a1u_f32
-        };
     }
 
     st.mark(6);
@@ -1128,6 +1104,36 @@ pub(crate) fn demod_assemble(head: DemodHead, videos: [Vec<f32>; 3]) -> BlockDec
             efm: head.efm,
         },
         rfhpf: head.rfhpf,
+    }
+}
+
+/// Analog audio stage 1 of one channel, from the two runs of the block
+/// spectrum it slices (`fft_do_slice`): bins `lowbin..lowbin + nbins/2` and
+/// the mirrored run below `blocklen - lowbin`.
+pub(crate) fn audio_stage1(lo: &[Complex64], hi: &[Complex64], ch: usize, spec: &DemodSpecRef, cut: bool) -> Vec<f32> {
+    let af = &spec.filters.audio[ch];
+    let fdiv = spec.filters.audio_fdiv;
+    let nbins_half = af.nbins / 2;
+    // Slice-and-multiply fused: the previous shape materialised the slice
+    // copy only to overwrite every element with the filt1 product. The
+    // per-element arithmetic (np_cmul) and the slice order are unchanged —
+    // the two contiguous runs of the reference's `chain` are now two
+    // appends, which also drops the intermediate `Vec` and its ifft input
+    // copy.
+    let mut sliced: Vec<Complex64> = Vec::with_capacity(af.nbins);
+    np_cmul_extend(lo, &af.filt1[..nbins_half], &mut sliced);
+    np_cmul_extend(hi, &af.filt1[nbins_half..af.nbins], &mut sliced);
+    let a1 = ffi_ducc::ifft(&sliced);
+    // a1u = unwrap_hilbert(a1, a1_freq) + low_freq
+    let a1u = unwrap_hilbert(&a1, af.a1_freq);
+    let a1u_f32: Vec<f32> = a1u.iter().map(|&v| (v + af.low_freq) as f32).collect();
+    // Cut scaled by fdiv.
+    let cut_start = (spec.blockcut / fdiv).min(a1u_f32.len());
+    let cut_end = a1u_f32.len().saturating_sub(spec.blockcut_end / fdiv);
+    if cut && cut_start < cut_end {
+        a1u_f32[cut_start..cut_end].to_vec()
+    } else {
+        a1u_f32
     }
 }
 
