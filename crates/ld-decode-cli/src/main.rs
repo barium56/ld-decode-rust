@@ -627,6 +627,10 @@ fn decode_all(
                 pf.prefetch(chunk);
             }
             refill_take(&mut pf, &mut window, chunk, &mut read_pos, &mut final_chunk, initial_base)?;
+            // A stall is served one chunk past the cap, then the decoder runs
+            // again (and the stall re-arms if that was not enough). Left set,
+            // it kept this loop reading to the end of the input.
+            stalled = false;
         }
 
         let t_d0 = std::time::Instant::now();
