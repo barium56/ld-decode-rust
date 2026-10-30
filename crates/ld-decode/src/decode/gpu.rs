@@ -1151,7 +1151,7 @@ fn lcg_complex(count: usize, seed: u64) -> Vec<Complex64> {
 /// inverse batch — the shapes `demod_block_cpu` issues).
 fn cpu_baselines(n: usize, blocks: usize) -> (f64, f64, usize) {
     let spec = DecoderSpec::new(&DecodeRequest::default()).expect("spec");
-    let levels = CalibLevels::defaults();
+    let levels = CalibLevels::defaults(spec.sys);
     let dspec = DemodSpecRef::with_plans(
         spec.freq,
         spec.freq_half,
@@ -3705,7 +3705,7 @@ fn gpu_late_group_matches_cpu() {
     use crate::decode::demodblock;
 
     let spec = DecoderSpec::new(&DecodeRequest::default()).expect("spec");
-    let levels = CalibLevels::defaults();
+    let levels = CalibLevels::defaults(spec.sys);
     let dspec = demodblock::DemodSpecRef::with_plans(
         spec.freq,
         spec.freq_half,

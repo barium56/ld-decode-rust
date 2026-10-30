@@ -70,6 +70,10 @@ struct Args {
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
     ntscj: bool,
+    /// Source is PAL (not covered by the byte-parity target: follows the
+    /// newer ld-decode's PAL processing).
+    #[arg(long = "PAL", short = 'p', visible_aliases = ["pal"])]
+    pal: bool,
     /// De-emphasis strength multiplier
     #[arg(long, default_value_t = 1.0)]
     deemp_str: f64,
@@ -223,7 +227,7 @@ fn main() -> Result<()> {
 
     let mut request = DecodeRequest::default();
     request.inputfreq = inputfreq;
-    request.system = ColorSystem::Ntsc;
+    request.system = if args.pal { ColorSystem::Pal } else { ColorSystem::Ntsc };
     request.mtf_level = args.mtf;
     request.mtf_offset = args.mtf_offset;
     request.use_agc = !args.no_agc;
@@ -262,7 +266,8 @@ fn main() -> Result<()> {
 
     let spec = Arc::new(DecoderSpec::new(&request)?);
     tracing::info!(
-        "System NTSC, {} MHz input, {} samples/line, {} lines/field",
+        "System {}, {} MHz input, {} samples/line, {} lines/field",
+        request.system.as_str(),
         request.inputfreq,
         spec.linelen(),
         spec.output_lines()
@@ -344,7 +349,8 @@ fn main() -> Result<()> {
     }
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
-    decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });
+    // PAL has no setup: black is blanking.
+    decoder.set_black_ire(if args.ntscj || args.pal { 0.0 } else { 7.5 });
     if args.disable_analog_audio {
         decoder.set_analog_audio(0.0);
     }

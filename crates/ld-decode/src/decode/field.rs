@@ -17,7 +17,7 @@ use crate::optimized::{
     sinc_lut,
     SincScaleParams,
 };
-use crate::spec::{CalibLevels, DecoderSpec, SYS_HZ_IRE, SYS_IRE0};
+use crate::spec::{CalibLevels, DecoderSpec};
 
 // Vblank state machine states (matching the Python HSYNC..EQPL2 order).
 pub(crate) const STATE_HSYNC: u8 = 0;
@@ -624,8 +624,10 @@ impl Field {
     }
 
     fn update_out_scale(&mut self) {
-        // NTSC: (0xC800 - 0x0400) / (100 - vsync_ire)
-        self.out_scale = (51200.0 - 1024.0) / (100.0 - self.levels.vsync_ire);
+        // (output_white - output_black) / (100 - vsync_ire); the codes are
+        // NTSC 0xC800 / 0x0400, PAL 0xD300 / 0x0100.
+        let (white, black) = if self.spec.sys.pal { (54016.0, 256.0) } else { (51200.0, 1024.0) };
+        self.out_scale = (white - black) / (100.0 - self.levels.vsync_ire);
     }
 
     pub fn is_first_field(&self) -> bool {
@@ -1179,9 +1181,12 @@ impl Field {
 
     #[allow(dead_code)]
     fn get_vblank_length(&self, is_first_field: bool) -> f64 {
-        let _ = is_first_field;
-        // NTSC
-        self.spec.sys_num_pulses as f64 * 3.0 * 0.5 + 1.0
+        let core = self.spec.sys_num_pulses as f64 * 3.0 * 0.5;
+        if self.spec.sys.pal {
+            core + 0.5 + if is_first_field { 0.0 } else { 1.0 }
+        } else {
+            core + 1.0
+        }
     }
 
     /// Port of `processVBlank`.
@@ -1279,12 +1284,22 @@ impl Field {
             let gap1 = validpulses[firstblank].start - validpulses[firstblank - 1].start;
             let gap2 = validpulses[lastblank + 1].start - validpulses[lastblank].start;
 
-            // NTSC only.
-            if inrange(
-                (gap2 + gap1).abs(),
-                self.inlinelen as f64 * 1.4,
-                self.inlinelen as f64 * 1.6,
-            ) {
+            if self.spec.sys.pal && inrange((gap2 - gap1).abs(), 0.0, self.spec.freq) {
+                let isfirstfield = inrange(gap1 / self.inlinelen as f64, 0.45, 0.55);
+                return (
+                    Some(validpulses[firstblank - 1].start),
+                    Some(isfirstfield),
+                    Some(firstblank),
+                    50,
+                );
+            }
+            if !self.spec.sys.pal
+                && inrange(
+                    (gap2 + gap1).abs(),
+                    self.inlinelen as f64 * 1.4,
+                    self.inlinelen as f64 * 1.6,
+                )
+            {
                 let isfirstfield = inrange(gap1 / self.inlinelen as f64, 0.95, 1.05);
                 return (
                     Some(validpulses[firstblank - 1].start),
@@ -1518,12 +1533,12 @@ impl Field {
         }
         self.is_first_field = is_first_field;
 
-        self.linecount = Some(if is_first_field.unwrap_or(false) { 263 } else { 262 });
+        self.linecount = Some(self.spec.sys_field_lines[if is_first_field.unwrap_or(false) { 0 } else { 1 }]);
         let linecount = self.linecount.unwrap();
 
         // Number of lines to actually process; the entire following VSYNC is
         // processed.
-        let proclines = self.outlinecount + self.lineoffset + 10;
+        let proclines = self.outlinecount + self.lineoffset + 10 + if self.spec.sys.pal { 3 } else { 0 };
 
         // lastlineloc comes from the next vblank (may be None).
         let lastlineloc = self.vblank_next;
@@ -1737,7 +1752,7 @@ impl Field {
             .into_par_iter()
             .map(|i| {
                 // skip VSYNC lines (they handle pulses differently)
-                if inrange(i as f64, 3.0, 6.0) {
+                if inrange(i as f64, 3.0, 6.0) || (self.spec.sys.pal && inrange(i as f64, 1.0, 2.0)) {
                     return (true, None, usize::MAX, None, None, None);
                 }
 
@@ -1936,7 +1951,7 @@ impl Field {
                 nextgood += 1;
             }
 
-            let firstcheck = 1; // NTSC
+            let firstcheck = if self.spec.sys.pal { 0 } else { 1 };
             if prevgood >= firstcheck && nextgood < linelocs.len() + self.lineoffset {
                 let gap = (linelocs[nextgood] - linelocs[prevgood as usize])
                     / (nextgood - prevgood as usize) as f64;
@@ -2381,7 +2396,8 @@ impl Field {
         // Each line's burst level is an independent pure gather+RMS, so the
         // 253 slice computations run in parallel; the median below sorts the
         // same 253 values either way, keeping the result bit-identical.
-        let burstlevel: Vec<f64> = (11..264)
+        let lines = if self.spec.sys.pal { 11..313 } else { 11..264 };
+        let burstlevel: Vec<f64> = lines
             .into_par_iter()
             .map(|l| self.get_burstlevel(l, None))
             .collect();
@@ -2790,6 +2806,10 @@ impl Field {
         for i in 1..end {
             rv.push(i);
         }
+        if self.spec.sys.pal {
+            let start2 = if self.is_first_field() { 311 } else { 310 };
+            rv.extend(start2..318);
+        }
         rv
     }
 
@@ -2797,6 +2817,94 @@ impl Field {
     #[allow(dead_code)]
     pub fn vsync_area_lines(&self) -> usize {
         (self.get_vblank_length(self.is_first_field()) + 0.6) as usize
+    }
+
+    /// `FieldPAL.process`: the lines are locked onto the 3.75 MHz pilot (two
+    /// passes, the second fine-tunes the adjusted line frequency), then the
+    /// output lines start at line 2 or 3 of the field.
+    fn process_pal(&mut self, spec: &DecoderSpec) {
+        self.update_out_scale();
+        let linelocs2 = self.linelocs2.clone();
+        let linelocs3 = self.refine_linelocs_pilot(&linelocs2);
+        let linelocs3a = self.refine_linelocs_pilot(&linelocs3);
+        self.linelocs = self.fix_badlines(spec, &linelocs3a, None);
+        self.burstmedian = self.calc_burstmedian(spec);
+        let first = self.is_first_field();
+        self.linecount = Some(if first { 312 } else { 313 });
+        self.lineoffset = if first { 2 } else { 3 };
+        self.linecode = [16, 17, 18]
+            .iter()
+            .map(|&l| self.decodephillipscode(spec, l + self.lineoffset))
+            .collect();
+        // The 8-field PAL sequence, continued from the previous field (the
+        // burst-based determination is not ported).
+        self.field_phase_id = match &self.prevfield {
+            Some(p) if p.valid => p.field_phase_id % 8 + 1,
+            _ => 1,
+        };
+    }
+
+    /// `FieldPAL.refine_linelocs_pilot` (`refine_pilot_zcs`): each line is
+    /// moved onto the mean phase of the pilot's zero crossings, measured in
+    /// half pilot periods at the line's own frequency.
+    fn refine_linelocs_pilot(&self, linelocs: &[f64]) -> Vec<f64> {
+        let mut out = linelocs.to_vec();
+        let n = 323.min(linelocs.len());
+        let pilot = &self.data.video.demod_burst;
+        let freq = self.spec.freq;
+        let linelen = self.inlinelen as f64;
+        let length_px = self.usectoinpx(6.0, None, None);
+        let mut zcs = vec![0.0f64; n];
+        let mut plen = vec![0.0f64; n];
+        let mut prev = 0.0;
+        for l in 0..n {
+            let mut adjfreq = freq;
+            if l > 1 {
+                let spacing = (linelocs[l] - linelocs[l - 1]) / linelen;
+                if spacing > 0.1 {
+                    adjfreq = freq / spacing;
+                }
+            }
+            let pl = (adjfreq / self.spec.sys.pilot_mhz) / 2.0;
+            plen[l] = pl;
+            let begin = linelocs[l];
+            let start = begin.max(0.0) as usize;
+            let stop = ((begin + length_px + 1.0).max(0.0) as usize).min(pilot.len());
+            let zc = if start < stop {
+                let pilots = &pilot[start..stop];
+                let peakloc = pilots
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, -1.0f32), |m, (i, &v)| if v.abs() > m.1 { (i, v.abs()) } else { m })
+                    .0;
+                calczc_do(pilots, peakloc, 0.0, 0, 16).map(|z| (z - (begin - start as f64)) / pl)
+            } else {
+                None
+            };
+            zcs[l] = zc.unwrap_or(prev);
+            prev = zcs[l];
+        }
+        // Circular mean of the fractional phases (`angular_mean_helper`).
+        let (mut c, mut sn) = (0.0f64, 0.0f64);
+        for &z in &zcs {
+            let x = z - z.trunc();
+            c += (2.0 * std::f64::consts::PI * x).cos();
+            sn += (2.0 * std::f64::consts::PI * x).sin();
+        }
+        let mut am = sn.atan2(c) / (2.0 * std::f64::consts::PI);
+        if am < 0.0 {
+            am += 1.0;
+        }
+        for l in 0..n {
+            let mut d = (zcs[l] - zcs[l].floor()) - am;
+            if d < -0.5 {
+                d += 1.0;
+            } else if d > 0.5 {
+                d -= 1.0;
+            }
+            out[l] += d * plen[l];
+        }
+        out
     }
 
     /// Port of `Field.process` + the NTSC additions from `FieldNTSC.process`.
@@ -2842,6 +2950,10 @@ impl Field {
         self.linebad = self.compute_deriv_error(&self.linelocs2, &self.linebad);
         self.linelocs = self.linelocs2.clone();
         self.valid = true;
+        if spec.sys.pal {
+            self.process_pal(&spec);
+            return Ok(());
+        }
 
         // ---- NTSC-specific process ----
         self.update_out_scale();
@@ -3063,7 +3175,7 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
             sorted[lo]
         };
         // NOTE: the Python computes IRE against the *spec* levels (spec=True).
-        let freq_ire = (f64::from(freq) - SYS_IRE0 as f64) / SYS_HZ_IRE as f64;
+        let freq_ire = (f64::from(freq) - spec.sys.ire0) / spec.sys.hz_ire;
 
         if inrange(freq_ire, 95.0, 110.0) {
             ire100_hzs.push(freq);

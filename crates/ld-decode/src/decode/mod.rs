@@ -722,6 +722,7 @@ impl Decoder {
         // Read before `spec` moves into the struct: the EFM PLL clocks at the
         // input rate.
         let sample_rate_hz = spec.freq_hz;
+        let levels = CalibLevels::defaults(spec.sys);
         Self {
             spec,
             dbg: DbgTiming {
@@ -750,7 +751,7 @@ impl Decoder {
                 df_plan: 0,
                 df_new: 0,
             },
-            levels: CalibLevels::defaults(),
+            levels,
             fdoffset,
             fdoffset_frac: 0.0,
             fields_written: 0,
@@ -2625,7 +2626,7 @@ impl Decoder {
         let blanking = ire_to_output(0.0);
         let white = ire_to_output(100.0);
         Some(DecoderMetadata {
-            system: ColorSystem::Ntsc.as_str(),
+            system: if self.spec.sys.pal { ColorSystem::Pal.as_str() } else { ColorSystem::Ntsc.as_str() },
             number_of_sequential_fields: self.fieldinfo.len(),
             field_width: self.spec.sys_outlinelen,
             sample_rate: self.spec.sys_outfreq * 1e6,
