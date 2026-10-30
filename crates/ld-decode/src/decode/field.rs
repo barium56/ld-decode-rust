@@ -351,9 +351,45 @@ pub(crate) fn calczc(
     }
 }
 
+/// The f32 threshold equivalent to the f64 predicate `f64::from(x) > high`.
+///
+/// The scan in [`findpulses`] compares every sample against `high` as f64,
+/// which costs a widen per sample. Because f32 -> f64 is exact and strictly
+/// order-preserving, `f64::from(x) > high` is *exactly* `x > t` when `t` is the
+/// **largest** f32 with `f64::from(t) <= high`: any `x > t` is at least the next
+/// f32 above `t`, which by construction exceeds `high`; and any `x <= t` cannot
+/// exceed it. NaN is neither `> t` nor `<= t`, matching the f64 comparison's
+/// unordered result, which is what leaves the pulse state unchanged on NaN.
+///
+/// So hoisting the comparison into f32 changes no decision, only its width.
+fn f32_threshold(high: f64) -> f32 {
+    debug_assert!(!high.is_nan(), "pulse threshold must not be NaN");
+    let t = high as f32;
+    if t.is_nan() || f64::from(t) <= high {
+        return t;
+    }
+    // One f32 step toward -inf: `bits - 1` for positive values, `bits + 1` for
+    // negative ones (the sign bit puts the magnitude order backwards).
+    let bits = t.to_bits();
+    let down = if t > 0.0 {
+        bits - 1
+    } else if t < 0.0 {
+        bits + 1
+    } else {
+        // `t` is a zero: `f64::from(t) > high` means `high < 0`, and the next
+        // value below either zero is the negative subnormal closest to it.
+        0x8000_0001
+    };
+    f32::from_bits(down)
+}
+
 /// Port of `findpulses_numba_raw` + `findpulses`: locate pulses by looking at
 /// areas of `sync_ref` below `high`.
-pub(crate) fn findpulses(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
+///
+/// The run boundaries are the only thing the state machine reacts to, so this is
+/// the scalar form of that machine — kept as the reference the vector path is
+/// differentially tested against, and used verbatim on targets without AVX2.
+pub(crate) fn findpulses_scalar(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
     let mut in_pulse = sync_ref.first().map_or(false, |&v| f64::from(v) <= high);
     let mut starts = Vec::new();
     let mut lengths = Vec::new();
@@ -383,6 +419,96 @@ pub(crate) fn findpulses(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
         .zip(lengths)
         .map(|(start, len)| Pulse { start, len })
         .collect()
+}
+
+/// [`findpulses_scalar`], with the sample scan done 16 at a time.
+///
+/// `compute_linelocs` runs this over the whole field's `demod_05` (~665k
+/// samples) on the *serial* tail, where it was **1.24 ms/field** — the largest
+/// single serial item left now that the demod pool runs ahead of the tail
+/// (`pffold` 0.63 ms). The state machine only changes state on a threshold
+/// crossing, so each 16-sample chunk becomes two bitmasks and the transitions
+/// are read out of them with `trailing_zeros`; the pulse bookkeeping is then
+/// identical arithmetic on identical indices, and the tail (< 16 samples) runs
+/// the scalar loop. See [`f32_threshold`] for why the compare may be f32.
+pub(crate) fn findpulses(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        findpulses_scalar(sync_ref, high)
+    }
+    #[cfg(target_feature = "avx2")]
+    {
+        use core::arch::x86_64::*;
+        let n = sync_ref.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let t = f32_threshold(high);
+        let mut starts: Vec<f64> = Vec::new();
+        let mut lengths: Vec<f64> = Vec::new();
+        let mut cur_start = 0usize;
+        let mut in_pulse = sync_ref[0] <= t;
+        let mut pos = 0usize;
+        unsafe {
+            let tv = _mm256_set1_ps(t);
+            while pos + 16 <= n {
+                let p = sync_ref.as_ptr().add(pos);
+                let a = _mm256_loadu_ps(p);
+                let b = _mm256_loadu_ps(p.add(8));
+                // Bit k set = sample pos+k is above `t` (resp. at/below it).
+                // NaN sets neither bit, exactly like the f64 predicates.
+                let mut g = (_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GT_OQ>(a, tv)) as u32)
+                    | ((_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GT_OQ>(b, tv)) as u32) << 8);
+                let mut l = (_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_LE_OQ>(a, tv)) as u32)
+                    | ((_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_LE_OQ>(b, tv)) as u32) << 8);
+                loop {
+                    // Only one kind of event can matter in the current state,
+                    // so an empty mask for that kind ends the chunk.
+                    let mask = if in_pulse { g } else { l };
+                    if mask == 0 {
+                        break;
+                    }
+                    let k = mask.trailing_zeros();
+                    if in_pulse {
+                        let length = pos + k as usize - cur_start;
+                        if length <= 5000 && cur_start != 0 {
+                            starts.push(cur_start as f64);
+                            lengths.push(length as f64);
+                        }
+                        in_pulse = false;
+                    } else {
+                        cur_start = pos + k as usize;
+                        in_pulse = true;
+                    }
+                    // k <= 15, so the shift is in range.
+                    let keep = u32::MAX << (k + 1);
+                    g &= keep;
+                    l &= keep;
+                }
+                pos += 16;
+            }
+        }
+        for (off, &value) in sync_ref[pos..].iter().enumerate() {
+            if in_pulse {
+                if value > t {
+                    let length = pos + off - cur_start;
+                    if length <= 5000 && cur_start != 0 {
+                        starts.push(cur_start as f64);
+                        lengths.push(length as f64);
+                    }
+                    in_pulse = false;
+                }
+            } else if value <= t {
+                cur_start = pos + off;
+                in_pulse = true;
+            }
+        }
+        starts
+            .into_iter()
+            .zip(lengths)
+            .map(|(start, len)| Pulse { start, len })
+            .collect()
+    }
 }
 
 fn median_f32(values: &mut [f32]) -> f32 {
@@ -3022,7 +3148,142 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::burst_window;
+    use super::{burst_window, findpulses, findpulses_scalar, f32_threshold};
+
+    /// `(start, len)` pairs as bits, so a mismatch prints the first index that
+    /// differs instead of a wall of floats.
+    fn triples(v: &[super::Pulse]) -> Vec<(u64, u64)> {
+        v.iter().map(|p| (p.start.to_bits(), p.len.to_bits())).collect()
+    }
+
+    /// The vector scan must reproduce the scalar state machine exactly — same
+    /// pulses, same order, same f64 values — including the cases the state
+    /// machine is fussy about: a run starting at index 0 (dropped by
+    /// `cur_start != 0`), a trailing run that never closes (dropped), runs over
+    /// the 5000-sample `max_synclen` filter, NaN/±inf samples (neither above
+    /// nor below, so they leave the state alone), and lengths that straddle the
+    /// 16-sample chunk boundary.
+    #[test]
+    fn findpulses_vector_scan_matches_the_scalar_machine() {
+        let mut seed = 0x5EED_1234_ABCD_0001u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Thresholds: exactly representable, between two f32s (the
+        // `f32_threshold` next-down branch), negative, zero, and extreme.
+        let thresholds = [
+            1000.0f64,
+            1000.000_000_1,
+            -1000.0,
+            -1000.000_000_1,
+            0.0,
+            -0.0,
+            1.0e-40,
+            -1.0e-40,
+            f32::MAX as f64,
+            (f32::MAX as f64) * 2.0,
+            f64::from(f32::MIN), // -inf as f32
+        ];
+        for &high in &thresholds {
+            for len in 0..40usize {
+                for _ in 0..8 {
+                    let data: Vec<f32> = (0..len)
+                        .map(|i| match (rand() % 16, i % 7) {
+                            (0, _) => f32::NAN,
+                            (1, _) => f32::INFINITY,
+                            (2, _) => f32::NEG_INFINITY,
+                            // Exactly on the threshold half the time.
+                            (3, _) => high as f32,
+                            (4, _) => -high as f32,
+                            _ => {
+                                let base = high as f32;
+                                let step = ((rand() >> 40) % 5) as f32 - 2.0;
+                                base + step
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        triples(&findpulses(&data, high)),
+                        triples(&findpulses_scalar(&data, high)),
+                        "high={high:?} len={len} data={data:?}"
+                    );
+                }
+            }
+        }
+
+        // Decoder-shaped: mostly above threshold with sync-length runs below,
+        // plus a >5000-sample no-signal run and a run at index 0.
+        let mut data = vec![1000.0f32; 20_000];
+        for k in 0..5 {
+            let start = 200 + k * 3000;
+            for s in data.iter_mut().skip(start).take(160) {
+                *s = -500.0;
+            }
+        }
+        for s in data.iter_mut().take(40) {
+            *s = -500.0;
+        }
+        for s in data.iter_mut().skip(9_000).take(7_000) {
+            *s = -500.0;
+        }
+        assert_eq!(triples(&findpulses(&data, 0.0)), triples(&findpulses_scalar(&data, 0.0)));
+        // Vetted count, so the differential test cannot pass with both paths
+        // wrong: the runs at 200/3200/6200 are kept, the one at index 0 is
+        // dropped (`cur_start != 0`), and the 7000-sample no-signal run swallows
+        // the 9200 and 12200 pulses and is itself over `max_synclen`.
+        assert_eq!(findpulses(&data, 0.0).len(), 3);
+    }
+
+    /// The f32 threshold must decide every sample exactly like the f64 compare
+    /// it replaces, on both sides of the boundary.
+    #[test]
+    fn f32_threshold_matches_the_f64_comparison() {
+        let mut seed = 0xFEED_FACE_0000_0003u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let highs = [
+            1.0e6f64,
+            1.0e6 + 1.0e-4,
+            6_500_000.0,
+            -1.0e6,
+            -1.0e6 - 1.0e-4,
+            0.0,
+            -0.0,
+            1.0e-45,
+            f32::MAX as f64,
+        ];
+        for &high in &highs {
+            let t = f32_threshold(high);
+            let near = high as f32;
+            let mut probes: Vec<f32> = vec![near, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+            for b in [near.to_bits().wrapping_sub(2), near.to_bits().wrapping_sub(1), near.to_bits(), near.to_bits() + 1, near.to_bits() + 2] {
+                probes.push(f32::from_bits(b));
+            }
+            for _ in 0..200 {
+                let base = high * (0.5 + (rand() % 1000) as f64 / 1000.0);
+                probes.push(base as f32);
+            }
+            for &x in &probes {
+                assert_eq!(
+                    f64::from(x) > high,
+                    x > t,
+                    "above: high={high:?} x={x:?} t={t:?}"
+                );
+                assert_eq!(
+                    f64::from(x) <= high,
+                    x <= t,
+                    "below: high={high:?} x={x:?} t={t:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn normal_window_is_a_half_open_slice() {
