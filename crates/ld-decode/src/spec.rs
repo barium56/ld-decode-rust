@@ -57,9 +57,8 @@ pub(crate) const DP_VIDEO_HPF_FREQ: f64 = 10000000.0;
 pub(crate) const DP_VIDEO_HPF_ORDER: usize = 4;
 
 /// Everything that differs between the two systems: the system constants
-/// (`SysParams_*`) and the filter parameters (`FilterParams_*`). NTSC is the
-/// 7.4.0 reference the port is byte-identical to; PAL follows the newer
-/// ld-decode (8.0) tables, without a parity target.
+/// (`SysParams_*`) and the filter parameters (`FilterParams_*`), both from
+/// ld-decode 7.4. PAL has no byte-parity target.
 #[derive(Clone, Copy)]
 pub(crate) struct SysTable {
     pub pal: bool,
@@ -190,12 +189,12 @@ pub(crate) const PAL: SysTable = SysTable {
     video_bpf_low_order: 2,
     video_bpf_high: 14_000_000.0,
     video_bpf_high_order: 3,
-    video_lpf_freq: 6_300_000.0,
-    video_lpf_order: 16,
+    video_lpf_freq: 5_800_000.0,
+    video_lpf_order: 7,
     mtf_basemult: 1.0,
     mtf_poledist: 0.70,
     mtf_freq: 10.0,
-    rf_zero_phase: true,
+    rf_zero_phase: false,
     lowband: (3_200_000.0, 13_000_000.0, 4_800_000.0),
 };
 
