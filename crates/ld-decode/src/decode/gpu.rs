@@ -6,10 +6,11 @@
 //! GPU could plausibly accelerate -- the demod FFT layer (~90% of that kernel's
 //! CPU) and the sinc resampler (the largest serial step) -- and the resulting
 //! end-to-end arithmetic against the pipeline's measured per-field budget.
-//! Second, **is it bit-exact?** Yes, and `gpu_late_group_matches_cpu` plus
-//! `gpu_bitexact_probe` are the gates; `--gpu` is therefore a speed knob, not a
-//! second decoder (see the late-group section at the bottom of this comment for
-//! the measured thread-count crossover).
+//! Second, **is it bit-exact?** Yes, and `gpu_late_group_f64_gate` (the one that
+//! matters: it compares in f64, the width the reference computes in) plus
+//! `gpu_late_group_matches_cpu` and `gpu_bitexact_probe` are the gates; `--gpu`
+//! is therefore a speed knob, not a second decoder (see the late-group section
+//! at the bottom of this comment for the measured thread-count crossover).
 //!
 //! Usage (release profile, this box):
 //!
@@ -1939,6 +1940,15 @@ __kernel void r2c_post_b(__global const double2 *res, __global double2 *sp,
     return;
   }
   int xi = nh - i;
+  // Each mirrored pair must be written by *one* work item, the lower index.
+  // Without this guard both work items compute both bins: the two forms are
+  // equal in exact arithmetic (`get(nh-j) == -conj(get(j))`), but the root
+  // table's entries are products of two rounded table values, so the two
+  // computations disagree in the last bit at ~half the bins -- and which store
+  // lands last is a race, i.e. the spectrum was 1 ulp off ducc's, differently
+  // from run to run. `r2c_post` and `c2r_pre_r` already have this guard; this
+  // is the batched form of the same loop (`gpu_late_group_f64_gate` pins it).
+  if (i > xi) return;
   double2 ri = res[rb + i];
   double2 rxi = res[rb + xi];
   double2 xe = (double2)(ri.x + rxi.x, ri.y - rxi.y);
@@ -3678,9 +3688,13 @@ fn gpu_bitexact_probe() {
 /// `gpu_bitexact_probe` pins the three transform shapes one at a time. This runs
 /// the *whole* production late group -- several blocks per launch, the filter
 /// products, the three-channel emit, one readback -- and compares it against the
-/// CPU path the decoder falls back to, bit for bit, for every sample of every
-/// channel. It is the test that makes `--gpu` a speed knob rather than a second
-/// decoder.
+/// CPU path the decoder falls back to, for every sample of every channel.
+///
+/// It compares the **f32** channels, which have a ~2^-29 blind spot per sample:
+/// a 1-ulp f64 error only moves the f32 when the value lands within a hair of a
+/// float midpoint, so this test is necessary but not sufficient. The f64 gate
+/// (`gpu_late_group_f64_gate`) is what pins the pipeline's arithmetic, and its
+/// absence is how the `r2c_post_b` mirror-pair race survived 0-of-285408 here.
 ///
 /// ```text
 /// cargo test -p ld-decode --release gpu_late_group_matches_cpu -- --ignored --nocapture
@@ -3766,4 +3780,229 @@ fn gpu_late_group_matches_cpu() {
         );
     }
     assert_eq!(bad, 0, "device late group is not bit-exact ({bad} of {total})");
+}
+
+/// **Is the batched late group bit-exact in f64?**
+///
+/// `gpu_late_group_matches_cpu` compares the three cut **f32** channels, and an
+/// f32 compare cannot see a 1-ulp f64 error: the f64 value has to land within
+/// 2^-29 of a float midpoint to move the f32 at all, so a systematic f64
+/// last-bit difference passes that gate 0-of-285408 and then shows up in a
+/// full decode as a handful of 1-LSB pixels. This gate compares the three steps
+/// the f32 test is blind to, in f64:
+///
+/// 1. the *batched* half-spectrum pack (`r2c_post_b`, not the probe's
+///    mirror-skipping `r2c_post`) against `ffi_ducc::rfft`;
+/// 2. the filter product against `np_cmul`;
+/// 3. the whole inverse path (`c2r_pre_r` + the plan chain + `1/n`) against
+///    `ducc_plan::c2r`, which is itself gated to `ffi_ducc::irfft`.
+///
+/// ```text
+/// cargo test -p ld-decode --release gpu_late_group_f64 -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs an OpenCL f64 device; skips cleanly when there is none"]
+fn gpu_late_group_f64_gate() {
+    let spec = DecoderSpec::new(&DecodeRequest::default()).expect("spec");
+    let lg = match LateGroup::open(spec.blocklen, &spec.filters.fvideo_rfft, 8) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("SKIP: {e}");
+            return;
+        }
+    };
+    let (n, nh, w) = (lg.blocklen, lg.nh, lg.w);
+    let bt = 6usize;
+    println!("\n[f64 gate] device {}", lg.describe());
+
+    // Demod-shaped data: the clamped demod series is a large positive offset
+    // plus a few kHz of structure, which is what sets the dynamic range of the
+    // spectrum and of the products' rounding.
+    let blocks: Vec<Vec<f64>> = (0..bt)
+        .map(|b| {
+            (0..n)
+                .map(|i| {
+                    let a = i as f64 * 0.0007 + b as f64 * 1.7;
+                    30000.0 + 8000.0 * a.sin() + ((i as f64) * 0.13).cos() * 400.0
+                })
+                .collect()
+        })
+        .collect();
+
+    // Upload, exactly as `run_inner` does.
+    {
+        let bytes = bt * n * 8;
+        let base = lg.dg.map(lg.inp, ffi::CL_MAP_WRITE, bytes).expect("map in");
+        for (b, blk) in blocks.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    blk.as_ptr() as *const u8,
+                    base.add(b * n * 8),
+                    n * 8,
+                );
+            }
+        }
+        lg.dg.unmap(lg.inp, base).expect("unmap in");
+    }
+
+    // --- 1. batched forward r2c, f64 ---
+    let dg = &lg.dg;
+    let res = dev_node(
+        dg,
+        &lg.fwd.nodes,
+        &lg.fwd.roots,
+        lg.fwd.root,
+        bt,
+        true,
+        lg.inp,
+        &lg.scratch(),
+    )
+    .expect("fwd chain");
+    dg.dispatch(
+        "r2c_post_b",
+        bt * w,
+        &[
+            Arg::Buf(dg.mems[res]),
+            Arg::Buf(dg.mems[lg.spec]),
+            Arg::Buf(dg.mems[lg.roots.v1]),
+            Arg::Buf(dg.mems[lg.roots.v2]),
+            Arg::Int(lg.roots.n),
+            Arg::Int(lg.roots.mask),
+            Arg::Int(lg.roots.shift),
+            Arg::Int(n as i32),
+        ],
+    )
+    .expect("r2c_post_b");
+    dg.finish().expect("finish r2c");
+    let mut sp = vec![(0.0f64, 0.0f64); bt * w];
+    dg.read(lg.spec, &mut sp).expect("read spec");
+
+    let mut bad_sp = 0usize;
+    let mut first_sp = None;
+    for b in 0..bt {
+        let want = ffi_ducc::rfft(&blocks[b]);
+        for i in 0..w {
+            let got = sp[b * w + i];
+            let wv = (want[i].re, want[i].im);
+            if bits(got) != bits(wv) {
+                bad_sp += 1;
+                if first_sp.is_none() {
+                    first_sp = Some((b, i, wv, got));
+                }
+            }
+        }
+    }
+    println!(
+        "[1] batched r2c: {bad_sp} of {} bins differ from ffi_ducc::rfft",
+        bt * w
+    );
+    if let Some((b, i, wv, got)) = first_sp {
+        println!("    first block {b} bin {i}: ducc {:+.17e}{:+.17e}i  gpu {:+.17e}{:+.17e}i", wv.0, wv.1, got.0, got.1);
+    }
+
+    // --- 2. filter product, f64 ---
+    dg.dispatch(
+        "video_prod",
+        bt * 3 * w,
+        &[
+            Arg::Buf(dg.mems[lg.spec]),
+            Arg::Buf(dg.mems[lg.filt]),
+            Arg::Buf(dg.mems[lg.prod]),
+            Arg::Int(w as i32),
+        ],
+    )
+    .expect("video_prod");
+    dg.finish().expect("finish prod");
+    let mut prod = vec![(0.0f64, 0.0f64); bt * 3 * w];
+    dg.read(lg.prod, &mut prod).expect("read prod");
+    let mut bad_prod = 0usize;
+    let mut first_prod = None;
+    for b in 0..bt {
+        for ch in 0..3 {
+            for i in 0..w {
+                let a = sp[b * w + i];
+                let f = spec.filters.fvideo_rfft[ch][i];
+                let want = crate::spec::np_cmul(
+                    Complex64::new(a.0, a.1),
+                    Complex64::new(f.re, f.im),
+                );
+                let got = prod[(b * 3 + ch) * w + i];
+                if bits(got) != bits((want.re, want.im)) {
+                    bad_prod += 1;
+                    if first_prod.is_none() {
+                        first_prod = Some((b, ch, i));
+                    }
+                }
+            }
+        }
+    }
+    println!("[2] product:     {bad_prod} of {} bins differ from np_cmul", bt * 3 * w);
+    if let Some((b, ch, i)) = first_prod {
+        println!("    first block {b} channel {ch} bin {i}");
+    }
+
+    // --- 3. the whole inverse path, f64 ---
+    dg.dispatch(
+        "c2r_pre_r",
+        3 * bt * nh,
+        &[
+            Arg::Buf(dg.mems[lg.prod]),
+            Arg::Buf(dg.mems[lg.cch]),
+            Arg::Buf(dg.mems[lg.roots.v1]),
+            Arg::Buf(dg.mems[lg.roots.v2]),
+            Arg::Int(lg.roots.n),
+            Arg::Int(lg.roots.mask),
+            Arg::Int(lg.roots.shift),
+            Arg::Int(n as i32),
+        ],
+    )
+    .expect("c2r_pre_r");
+    let row = dev_node(
+        dg,
+        &lg.inv.nodes,
+        &lg.inv.roots,
+        lg.inv.root,
+        3 * bt,
+        false,
+        lg.cch,
+        &lg.scratch(),
+    )
+    .expect("inv chain");
+    dg.finish().expect("finish inv");
+    let mut inv = vec![(0.0f64, 0.0f64); 3 * bt * nh];
+    dg.read(row, &mut inv).expect("read inv");
+    let fct = 1.0 / n as f64;
+    let mut bad_inv = 0usize;
+    let mut first_inv = None;
+    for b in 0..bt {
+        for ch in 0..3 {
+            let spectrum: Vec<Complex64> = (0..w)
+                .map(|i| {
+                    let v = prod[(b * 3 + ch) * w + i];
+                    Complex64::new(v.0, v.1)
+                })
+                .collect();
+            let want = ducc_plan::c2r(n, &to_c(&spectrum));
+            for j in 0..n {
+                let c = inv[(b * 3 + ch) * nh + (j >> 1)];
+                let got = if j & 1 == 1 { c.1 } else { c.0 } * fct;
+                if got.to_bits() != want[j].to_bits() {
+                    bad_inv += 1;
+                    if first_inv.is_none() {
+                        first_inv = Some((b, ch, j, want[j], got));
+                    }
+                }
+            }
+        }
+    }
+    println!("[3] inverse:     {bad_inv} of {} samples differ from ducc_plan::c2r", bt * 3 * n);
+    if let Some((b, ch, j, wv, got)) = first_inv {
+        println!("    first block {b} channel {ch} sample {j}: cpu {:+.17e}  gpu {:+.17e}", wv, got);
+    }
+
+    assert_eq!(
+        (bad_sp, bad_prod, bad_inv),
+        (0, 0, 0),
+        "batched late group is not f64-bit-exact"
+    );
 }
