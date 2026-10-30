@@ -393,6 +393,43 @@ struct AssembledField {
 
 
 
+/// Non-temporal copy for the per-field assembly stage (default; `LD_ASM_ST=1`
+/// is the ordinary-store control).
+///
+/// Pure data movement: the bytes written are identical to
+/// `copy_nonoverlapping`, only the store path differs — the destination is
+/// aligned for the 32-byte streaming stores, the unaligned head/tail go through
+/// the ordinary copy, and `_mm_sfence` makes the stores visible to the tail
+/// that reads them after the parallel join.
+#[cfg(target_feature = "avx2")]
+unsafe fn stream_copy(src: *const u8, dst: *mut u8, n: usize) {
+    use std::arch::x86_64::*;
+    let misalign = (dst as usize) & 31;
+    let head = if misalign == 0 { 0 } else { 32 - misalign }.min(n);
+    if head > 0 {
+        std::ptr::copy_nonoverlapping(src, dst, head);
+    }
+    let body = (n - head) & !31;
+    let mut i = 0usize;
+    while i < body {
+        let v = _mm256_loadu_si256(src.add(head + i) as *const __m256i);
+        _mm256_stream_si256(dst.add(head + i) as *mut __m256i, v);
+        i += 32;
+    }
+    std::ptr::copy_nonoverlapping(
+        src.add(head + body),
+        dst.add(head + body),
+        n - head - body,
+    );
+    _mm_sfence();
+}
+
+/// Scalar-target fallback: always the ordinary copy.
+#[cfg(not(target_feature = "avx2"))]
+unsafe fn stream_copy(src: *const u8, dst: *mut u8, n: usize) {
+    std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
 /// Per-field wall-clock accumulation for the LD_TIMING breakdown (temporary
 /// instrumentation; nanos per phase, set by decode_field/decode).
 #[derive(Clone, Copy)]
@@ -1970,8 +2007,22 @@ impl Decoder {
             // traffic slows the concurrent prefetch demod enough that the
             // exposed wait grows 1.21 -> 3.51 ms. Net loss, so it stays on the
             // global pool.
+            //
+            // Non-temporal stores (the default; `LD_ASM_ST=1` is the control):
+            // the assembly is 18 MB/field of write-once data whose readers are
+            // the serial tail a few ms later, so the RFO traffic the ordinary
+            // store path generates (a third of the traffic) buys L3 residency
+            // the working set cannot keep anyway. Measured on `.ddd.flac`
+            // `-s 300 -l 5000 -t 9`, two interleaved pairs: 46.80/47.01 ->
+            // 48.03/47.66 FPS (+2.0%), byte-identical output; s16 `-l 2000`
+            // 50.91 -> 51.48 (+1.0%).
+            let nt = std::env::var_os("LD_ASM_ST").is_none();
             all_jobs.into_par_iter().for_each(|job| unsafe {
-                std::ptr::copy_nonoverlapping(job.src, job.dst, job.nbytes);
+                if nt && job.nbytes >= 4096 {
+                    stream_copy(job.src, job.dst, job.nbytes);
+                } else {
+                    std::ptr::copy_nonoverlapping(job.src, job.dst, job.nbytes);
+                }
             });
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
             // `df_rest` subtracts the assembly stages, so the aggregate must
