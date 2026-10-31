@@ -73,14 +73,15 @@ fn dropout_detect_demod(field: &Field) -> Vec<bool> {
     let iretohz = |ire: f64| field.levels.iretohz(ire);
     let demod = &field.data.video.demod;
     let demod_05 = &field.data.video.demod_05;
-    let valid_min_default = iretohz(-50.0) as f32;
-    let valid_max = iretohz(160.0) as f32;
+    let pal = field.spec.sys.pal;
+    let valid_min_default = iretohz(if pal { -70.0 } else { -50.0 }) as f32;
+    let valid_max = iretohz(if pal { 150.0 } else { 160.0 }) as f32;
     let valid_min05_default = iretohz(-30.0) as f32;
     let valid_max05 = iretohz(115.0) as f32;
 
     let hsync_len = field.lt.hsync.1 as usize;
-    let vsync_ire = -40.0; // SysParams (spec) vsync_ire, NTSC
-    let sync_min = iretohz(vsync_ire - 35.0) as f32;
+    let vsync_ire = field.spec.sys.vsync_ire; // SysParams (spec) vsync_ire
+    let sync_min = iretohz(vsync_ire - if pal { 60.0 } else { 35.0 }) as f32;
     let sync_min_05 = iretohz(vsync_ire - 10.0) as f32;
 
     let vsync_lines = field.get_vsync_lines();

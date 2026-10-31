@@ -4,6 +4,7 @@ mod decode;
 mod envflag;
 pub mod ffi_ducc;
 pub mod logging;
+pub mod opencl;
 mod optimized;
 mod request;
 mod spec;

@@ -61,15 +61,23 @@ struct Args {
     /// Use lower-bandwidth (lowband) decode settings
     #[arg(long)]
     lowband: bool,
-    /// Run the demod late group (demod_fft + the three video channels) on an
-    /// OpenCL device, batched over a field's blocks. Output is byte-identical;
-    /// this is a speed knob only, and it needs an fp64 OpenCL device.
+    /// Run the FM demodulator on an OpenCL device (the driver's OpenCL
+    /// runtime, loaded at start-up). In double precision (the default) it
+    /// gave the CPU's bytes on whole test captures; see --gpu-precision.
     #[arg(long)]
     gpu: bool,
+    /// Precision of the --gpu demodulator: `double` (default) or `single`
+    /// (faster on consumer GPUs, not byte-identical).
+    #[arg(long, value_enum, default_value = "double")]
+    gpu_precision: GpuPrecision,
     /// Source is in NTSC-J format (IRE 0 black): `black16bIre` stays at the
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
     ntscj: bool,
+    /// Source is PAL (not covered by the byte-parity target: follows the
+    /// newer ld-decode's PAL processing).
+    #[arg(long = "PAL", short = 'p', visible_aliases = ["pal"])]
+    pal: bool,
     /// De-emphasis strength multiplier
     #[arg(long, default_value_t = 1.0)]
     deemp_str: f64,
@@ -159,6 +167,12 @@ impl std::io::Write for LogFileSink {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum GpuPrecision {
+    Single,
+    Double,
+}
+
 fn main() -> Result<()> {
     // With no positional arguments, show the same usage text as `--help`
     // instead of reporting missing required arguments.
@@ -223,7 +237,7 @@ fn main() -> Result<()> {
 
     let mut request = DecodeRequest::default();
     request.inputfreq = inputfreq;
-    request.system = ColorSystem::Ntsc;
+    request.system = if args.pal { ColorSystem::Pal } else { ColorSystem::Ntsc };
     request.mtf_level = args.mtf;
     request.mtf_offset = args.mtf_offset;
     request.use_agc = !args.no_agc;
@@ -262,7 +276,8 @@ fn main() -> Result<()> {
 
     let spec = Arc::new(DecoderSpec::new(&request)?);
     tracing::info!(
-        "System NTSC, {} MHz input, {} samples/line, {} lines/field",
+        "System {}, {} MHz input, {} samples/line, {} lines/field",
+        request.system.as_str(),
         request.inputfreq,
         spec.linelen(),
         spec.output_lines()
@@ -337,14 +352,15 @@ fn main() -> Result<()> {
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
     if args.gpu {
-        match decoder.enable_gpu() {
-            Ok(what) => tracing::info!("GPU late group: {what}"),
+        match decoder.enable_gpu(args.gpu_precision == GpuPrecision::Double) {
+            Ok(what) => tracing::info!("GPU demodulator: {what}"),
             Err(e) => anyhow::bail!("--gpu: {e}"),
         }
     }
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
-    decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });
+    // PAL has no setup: black is blanking.
+    decoder.set_black_ire(if args.ntscj || args.pal { 0.0 } else { 7.5 });
     if args.disable_analog_audio {
         decoder.set_analog_audio(0.0);
     }
@@ -611,6 +627,10 @@ fn decode_all(
                 pf.prefetch(chunk);
             }
             refill_take(&mut pf, &mut window, chunk, &mut read_pos, &mut final_chunk, initial_base)?;
+            // A stall is served one chunk past the cap, then the decoder runs
+            // again (and the stall re-arms if that was not enough). Left set,
+            // it kept this loop reading to the end of the input.
+            stalled = false;
         }
 
         let t_d0 = std::time::Instant::now();

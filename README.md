@@ -13,9 +13,13 @@ exists; parity is the constraint it is built under.
 
 ## What it does today
 
-- **NTSC only.** PAL is deliberately not ported: it needs pilot-based lineloc
-  refinement, a different V4300D notch and different field constants, and none
-  of it has been verified. The code assumes NTSC.
+- **NTSC is the byte-parity target.** PAL (`--PAL`) is ported from ld-decode
+  7.4's `FieldPAL` and PAL tables (pilot-based lineloc refinement, 312/313-line
+  fields, burst-based field phase, PAL dropout thresholds and VITS metrics) but
+  is **not** verified byte for byte against the Python reference: it is checked
+  by measurement only (line alignment, noise, field phase and VBI against
+  ld-decode's own decode of the same captures). Nothing in it changes an NTSC
+  output.
 - **Byte-parity verified end-to-end** on five full-disc paths:
   - `s16` capture (168,800 fields) — 4/4 outputs identical,
   - `.ddd.flac` from frame 300 (168,566 fields) — 4/4 outputs identical,
@@ -98,7 +102,8 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--no-dod` | off | Disable dropout detection. |
 | `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. |
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
-| `--gpu` | off | Run the demod late group (the block spectrum plus the three video channels) on an OpenCL device, batched over a field's blocks. Output is **byte-identical** (`gpu_late_group_matches_cpu` pins it), so it is purely a speed knob, and it needs an fp64 device. Measured on a 32-CU RDNA4 card, interleaved: **+63% at `-t 1`, +52% at `-t 2`, +31% at `-t 4`, +16% at `-t 6`, and +12–18% at the default thread count** (three interleaved 400-frame pairs: 46.37/47.19/49.48 against 41.45/40.87/41.87 FPS; 1000 frames at `-s 1000` gives 50.77 vs 43.37). `LD_GPU_STATS=1` prints its in-situ ms/block, `LD_GPU_PROF=1` splits a batch into host transfers and device kernels, and `LD_TIMING=1` adds the per-field device/CPU split. |
+| `--gpu` | off | Run the whole FM demodulator on an OpenCL device (the driver's OpenCL runtime, loaded at start-up; nothing to install or link). In double precision (the default) it is **byte-identical to the CPU on the test captures** (whole NTSC captures: `.tbc`, `.tbc.json`, `.pcm`, `.efm`; and PAL), but not by construction: its FFT is a radix-8 Stockham, not ducc's pass tree, so a different capture could round differently. `LD_GPU_CHECK=1` runs the CPU kernel alongside and logs how far apart the two are per block. A device failure falls back to the CPU for that batch. Measured on an RTX 5080 Laptop GPU (MSVC build, 645-field 75 MHz capture): 11.0 s on the CPU, 7.5 s with `--gpu`. |
+| `--gpu-precision` | `double` | `single` runs the `--gpu` demodulator in f32: faster on consumer cards with little f64 throughput, not byte-identical. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
 
@@ -163,13 +168,10 @@ is in its reference configuration.
 | `LD_FFT_ENGINE=sse2\|avx2fma\|avx2` | Pick one of the three ducc0 builds linked into the binary. **`sse2` is the default and the only parity-safe choice**: the AVX2 engines evaluate a different, differently-rounded sequence and are not bit-exact, so they are for experiments only. The engine in use is logged at startup. |
 | `LD_NO_FFMPEG=1` | Decode `.flac` and Ogg `.ldf` with claxon instead of `ffmpeg`. Bit-identical but slower (the demod pool starves on claxon's throughput), so `ffmpeg` stays the default. |
 | `LD_PF_POOL=n`, `LD_SIDE_POOL=n`, `LD_TAIL_THREADS=n` | Override the three pool sizes: prefetch demod, side work (dropout/audio), and the global pool that runs the serial tail. All three optima are measured and closed — `LD_TAIL_THREADS` exists as the instrument for re-sweeping the split (e.g. after a change like `--gpu` that moves work off the pool), not as a tuning knob: the tail floors at ~7.7 ms with 8 threads while the default 2 already yields the best FPS. |
-| `LD_GPU_STATS=1` | With `--gpu`, print the in-situ device cost per block (ms/block and ms/field) every 200 batches — the number that separates "slow kernel" from "the card dropped clock state between fields". |
-| `LD_GPU_PROF=1` | With `--gpu`, print where a batch's time goes: `upload`/`submit`/`finish`/`download` ms per block, the batch total, and the kernel sum from `clGetEventProfilingInfo`. `finish` minus `kernels` is the transfer and launch time inside the queue. The events cost a few µs per launch, so read it for attribution, not as an FPS number. |
-| `LD_GPU_X2=1` | With `--gpu`, run each batch twice and keep the first result's output — a deliberate, fixed lengthening of the device stage used to measure how much of it reaches the wall clock (currently **1:1**). A diagnostic only; on a big enough window it halves FPS. |
 | `LD_START_SAMPLE=n` | Start at an absolute sample instead of a frame. |
 | `LD_NO_ASYNC_PREFETCH=1`, `LD_NO_DOD_PRE=1` | Disable the async demod prefetch and the dropout pre-pass. |
 | `LD_PLLSPEC=1` | Print the EFM-PLL speculation commit/fallback counters. |
-| `LD_TIMING=1` | Per-field phase timings plus the prefetch-health fields `pfspan`/`pfwork`/`mtfpow`/`mtfmiss`. With `--gpu` it also reports the device split: `gpu=` (device ms in this field's window), `gpub=` (blocks) and `gpus=` (percent of the iteration), and every 500 fields a `GPUTIME` line — `device=… ms/field head_cpu=… ms/field (N cores) iter=… device_share=…%` — which is the read-out for "did the work leave the CPU or just move?". The counters are lock-free on purpose: reading them through the batch mutex would stall the main thread behind an in-flight batch, which both perturbs the run and hides the wait from the measurement. |
+| `LD_TIMING=1` | Per-field phase timings plus the prefetch-health fields `pfspan`/`pfwork`/`mtfpow`/`mtfmiss`. |
 | `LD_PROCTIME=1`, `LD_DEMODTIME=1`, `LD_SUBTIME=1` | Coarser stage and sub-stage timings. |
 | `LD_TRACE_MTF=1`, `LD_TRACE_AGC=1`, `LD_TRACE_KEEP=1`, `LD_TRACE_SEEK=1` | Text traces of the calibration and reader decisions. |
 | `LD_DUMP_*` | Binary dumps of intermediate stages (mostly with a `_RL` readloc filter). Targeted debugging only — they make runs crawl and fill disks. |
@@ -198,17 +200,9 @@ the suite needs no Python and runs unchanged on Windows and Linux. Expect
   `scripts/gen_pll_goldens.py`), so it needs no capture, no Python and no
   `LD_PLL_DIR`. Set `LD_PLL_DIR` to an `LD_DUMP_PLL` dump directory to replay a
   real capture instead.
-- The six `#[ignore]`d probes (`probe_block`, `kernel_shape_speed_census`,
-  `construction_fingerprint_probe`, `gpu_late_group_matches_cpu`, `gpu_fft_probe`,
-  `gpu_bitexact_probe`) read
-  dumps that are not in the repo, take minutes, or need an OpenCL f64 device;
-  run them with `cargo test -- --ignored` where their inputs exist. The three GPU
-  probes print `SKIP` and pass when there is no device. `gpu_bitexact_probe`
-  runs ducc's own pass tree through the device and asserts byte identity with
-  `ffi_ducc`; `gpu_late_group_matches_cpu` pins the whole `--gpu` late group
-  against the CPU's for a multi-block batch. `gpu_fft_probe` prices a batched
-  Stockham kernel (which cannot be bit-exact — a radix-2 decimation rounds
-  differently), so its numbers are a lower bound, not a plan.
+- The three `#[ignore]`d probes (`probe_block`, `kernel_shape_speed_census`,
+  `construction_fingerprint_probe`) read dumps that are not in the repo or take
+  minutes; run them with `cargo test -- --ignored` where their inputs exist.
 
 CI (`.github/workflows/ci.yml`) runs the same job on Windows and Linux: release
 build, tests in both profiles, and the shared `smoke.sh` — a zero-signal decode

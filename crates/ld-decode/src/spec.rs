@@ -56,6 +56,167 @@ pub(crate) const DP_VIDEO_HPF_FREQ: f64 = 10000000.0;
 #[allow(dead_code)]
 pub(crate) const DP_VIDEO_HPF_ORDER: usize = 4;
 
+/// Everything that differs between the two systems: the system constants
+/// (`SysParams_*`) and the filter parameters (`FilterParams_*`), both from
+/// ld-decode 7.4. PAL has no byte-parity target.
+#[derive(Clone, Copy)]
+pub(crate) struct SysTable {
+    pub pal: bool,
+    pub fsc_mhz: f64,
+    pub pilot_mhz: f64,
+    pub frame_lines: usize,
+    pub field_lines: [usize; 2],
+    pub line_period: f64,
+    pub active_video_us: [f64; 2],
+    pub fps: f64,
+    pub ire0: f64,
+    pub hz_ire: f64,
+    pub vsync_ire: f64,
+    pub audio_lfreq: f64,
+    pub audio_rfreq: f64,
+    pub color_burst_us: [f64; 2],
+    pub blacksnr_slice: [usize; 3],
+    pub first_field_h: [f64; 2],
+    pub num_pulses: usize,
+    pub hsync_pulse_us: f64,
+    pub eq_pulse_us: f64,
+    pub vsync_pulse_us: f64,
+    pub output_zero: i64,
+    pub field_phases: usize,
+    pub vits_whitelocs: &'static [[usize; 3]],
+    pub vits_code_slices: &'static [[usize; 4]],
+    // Filter parameters.
+    pub audio_notchwidth: f64,
+    pub audio_notchorder: usize,
+    pub audio_filterwidth: f64,
+    pub audio_filterorder: usize,
+    pub video_deemp: [f64; 2],
+    pub video_bpf_low: f64,
+    pub video_bpf_low_order: usize,
+    pub video_bpf_high: f64,
+    pub video_bpf_high_order: usize,
+    pub video_lpf_freq: f64,
+    pub video_lpf_order: usize,
+    pub mtf_basemult: f64,
+    pub mtf_poledist: f64,
+    pub mtf_freq: f64,
+    /// Amplitude-only pre-demod RF chain (PAL): the BPF and MTF phase across
+    /// the chroma sidebands demodulates as differential phase.
+    pub rf_zero_phase: bool,
+    /// The `lowband` preset: (bpf low, bpf high, lpf).
+    pub lowband: (f64, f64, f64),
+}
+
+pub(crate) const NTSC: SysTable = SysTable {
+    pal: false,
+    fsc_mhz: SYS_FSC_MHZ,
+    pilot_mhz: SYS_FSC_MHZ,
+    frame_lines: SYS_FRAME_LINES,
+    field_lines: SYS_FIELD_LINES,
+    // Line period, active video, frame rate and audio carriers derive from
+    // fsc (see `DecoderSpec::new` and `audio_freqs`).
+    line_period: 0.0,
+    active_video_us: [0.0, 0.0],
+    fps: 0.0,
+    ire0: SYS_IRE0,
+    hz_ire: SYS_HZ_IRE,
+    vsync_ire: SYS_VSYNC_IRE,
+    audio_lfreq: 0.0,
+    audio_rfreq: 0.0,
+    color_burst_us: SYS_COLOR_BURST_US,
+    blacksnr_slice: SYS_BLACKSNR_SLICE,
+    first_field_h: SYS_FIRST_FIELD_H,
+    num_pulses: SYS_NUM_PULSES,
+    hsync_pulse_us: SYS_HSYNC_PULSE_US,
+    eq_pulse_us: SYS_EQ_PULSE_US,
+    vsync_pulse_us: SYS_VSYNC_PULSE_US,
+    output_zero: SYS_OUTPUT_ZERO,
+    field_phases: SYS_FIELD_PHASES,
+    vits_whitelocs: &SYS_LD_VITS_WHITELOCS,
+    vits_code_slices: &SYS_LD_VITS_CODE_SLICES,
+    audio_notchwidth: DP_AUDIO_NOTCHWIDTH,
+    audio_notchorder: DP_AUDIO_NOTCHORDER,
+    audio_filterwidth: DP_AUDIO_FILTERWIDTH,
+    audio_filterorder: DP_AUDIO_FILTERORDER,
+    video_deemp: DP_VIDEO_DEEMP,
+    video_bpf_low: DP_VIDEO_BPF_LOW,
+    video_bpf_low_order: DP_VIDEO_BPF_LOW_ORDER,
+    video_bpf_high: DP_VIDEO_BPF_HIGH,
+    video_bpf_high_order: DP_VIDEO_BPF_HIGH_ORDER,
+    video_lpf_freq: DP_VIDEO_LPF_FREQ,
+    video_lpf_order: DP_VIDEO_LPF_ORDER,
+    mtf_basemult: DP_MTF_BASEMULT,
+    mtf_poledist: DP_MTF_POLEDIST,
+    mtf_freq: DP_MTF_FREQ,
+    rf_zero_phase: false,
+    lowband: (3_800_000.0, 12_500_000.0, 4_200_000.0),
+};
+
+/// PAL fsc: 283.75 x 15625 Hz + 25 Hz.
+pub(crate) const PAL_FSC_MHZ: f64 = (1.0 / 64.0) * 283.75 + 25.0 / 1e6;
+
+pub(crate) const PAL: SysTable = SysTable {
+    pal: true,
+    fsc_mhz: PAL_FSC_MHZ,
+    pilot_mhz: 3.75,
+    frame_lines: 625,
+    field_lines: [312, 313],
+    line_period: 64.0,
+    active_video_us: [10.5, 64.0 - 1.5],
+    fps: 25.0,
+    ire0: 7_100_000.0,
+    hz_ire: 800_000.0 / 100.0,
+    vsync_ire: -0.3 * (100.0 / 0.7),
+    audio_lfreq: (1e6 / 64.0) * 43.75,
+    audio_rfreq: (1e6 / 64.0) * 68.25,
+    color_burst_us: [5.6, 7.85],
+    blacksnr_slice: [22, 12, 50],
+    first_field_h: [1.0, 0.5],
+    num_pulses: 5,
+    hsync_pulse_us: 4.7,
+    eq_pulse_us: 2.35,
+    vsync_pulse_us: 27.3,
+    output_zero: 256,
+    field_phases: 8,
+    vits_whitelocs: &[[19, 12, 8]],
+    vits_code_slices: &[[16, 11, 49, 85], [17, 11, 49, 85]],
+    audio_notchwidth: 200_000.0,
+    audio_notchorder: 2,
+    audio_filterwidth: 100_000.0,
+    audio_filterorder: 900,
+    video_deemp: [100e-9, 400e-9],
+    video_bpf_low: 2_300_000.0,
+    video_bpf_low_order: 2,
+    video_bpf_high: 14_000_000.0,
+    video_bpf_high_order: 3,
+    video_lpf_freq: 5_800_000.0,
+    video_lpf_order: 7,
+    mtf_basemult: 1.0,
+    mtf_poledist: 0.70,
+    mtf_freq: 10.0,
+    rf_zero_phase: false,
+    lowband: (3_200_000.0, 13_000_000.0, 4_800_000.0),
+};
+
+impl SysTable {
+    pub(crate) fn of(system: ColorSystem) -> &'static SysTable {
+        match system {
+            ColorSystem::Ntsc => &NTSC,
+            ColorSystem::Pal => &PAL,
+        }
+    }
+
+    /// Analog audio carriers (Hz): NTSC's are multiples of the colour line
+    /// rate, PAL's of the line rate.
+    pub(crate) fn audio_freqs(&self) -> (f64, f64) {
+        if self.pal {
+            (self.audio_lfreq, self.audio_rfreq)
+        } else {
+            ((1e6 * SYS_FSC_MHZ / 227.5) * 146.25, (1e6 * SYS_FSC_MHZ / 227.5) * 178.75)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Small DSP helpers
 // ---------------------------------------------------------------------------
@@ -1282,8 +1443,20 @@ fn butter_ba(order: usize, wn: &[f64], band_type: FilterBandType) -> Result<(Vec
             let k2 = np_cdiv(one, np_cprod(&negp)).re;
             (z2, p2, k2)
         }
-        // (scipy's bandpass path is not used by any filter in this decoder.)
-        FilterBandType::Bandpass => unreachable!("butter bandpass not used"),
+        // lp2bp_zpk (used by PAL's pilot filter only, no parity target).
+        FilterBandType::Bandpass => {
+            let bw = warped[1] - warped[0];
+            let wo = (warped[0] * warped[1]).sqrt();
+            let p_lp: Vec<Complex64> = p0.iter().map(|&x| x * (bw / 2.0)).collect();
+            let sq: Vec<Complex64> = p_lp
+                .iter()
+                .map(|&x| np_csqrt(Complex64::new((x * x).re - wo * wo, (x * x).im)))
+                .collect();
+            let mut p_bp: Vec<Complex64> = p_lp.iter().zip(&sq).map(|(&x, &s)| x + s).collect();
+            p_bp.extend(p_lp.iter().zip(&sq).map(|(&x, &s)| x - s));
+            let z_bp = vec![Complex64::new(0.0, 0.0); order];
+            (z_bp, p_bp, bw.powi(order as i32))
+        }
         FilterBandType::Bandstop => {
             let bw = warped[1] - warped[0];
             let wo = (warped[0] * warped[1]).sqrt();
@@ -1380,13 +1553,8 @@ pub(crate) const LEVELS_IRE0_F32: u8 = 1;
 pub(crate) const LEVELS_ALL_F32: u8 = 2;
 
 impl CalibLevels {
-    pub fn defaults() -> Self {
-        Self {
-            ire0: SYS_IRE0 as f64,
-            hz_ire: SYS_HZ_IRE as f64,
-            vsync_ire: SYS_VSYNC_IRE as f64,
-            prec: LEVELS_F64,
-        }
+    pub fn defaults(sys: &SysTable) -> Self {
+        Self { ire0: sys.ire0, hz_ire: sys.hz_ire, vsync_ire: sys.vsync_ire, prec: LEVELS_F64 }
     }
 
     /// `ire0 + hz_ire * ire` exactly as the Python reference evaluates it for
@@ -1459,6 +1627,11 @@ pub(crate) struct Filters {
     pub fvideo05: Vec<Complex64>,
     pub f05_offset: usize,
     pub fvideo_burst_offset: usize,
+    /// PAL only: 7.4's `FVideoBurst` (video LPF x de-emphasis x fsc band-pass,
+    /// delay folded in), as a half spectrum. The third channel carries the
+    /// pilot on PAL, so the burst is rebuilt from the raw demod on the few
+    /// lines the field phase needs.
+    pub pal_burst_rfft: Option<Vec<Complex64>>,
     /// Analog audio channel filters, [left, right].
     pub audio: [AudioChannelFilters; 2],
     /// Sample-rate decimation of the stage-1 audio (blocklen / nbins).
@@ -1466,6 +1639,42 @@ pub(crate) struct Filters {
     /// Full-spectrum EFM equalisation filter (complex f64), applied to the
     /// raw input FFT before the video filters.
     pub fefm: Vec<Complex64>,
+}
+
+impl Filters {
+    /// Samples cut from the end of each demod block.
+    ///
+    /// The post-demod FIR delay (`f05_offset`) is the minimum. It is rounded up
+    /// to a multiple of the analog-audio decimation: the stage-1 audio is cut
+    /// by `blockcut_end / audio_fdiv`, and unless that division is exact the
+    /// audio blocks no longer tile at the video block stride (`blocksize /
+    /// audio_fdiv` would not be a whole number of audio samples), so the audio
+    /// drifts against the video. `audio_fdiv` follows the input rate (32 at
+    /// 30-40 MHz, 64 at 75 MHz), so this is what keeps other rates aligned. At
+    /// 40 MHz `f05_offset == audio_fdiv == 32` and the result is the reference's
+    /// 32.
+    pub(crate) fn block_cut_end(&self) -> usize {
+        self.f05_offset.div_ceil(self.audio_fdiv.max(1)) * self.audio_fdiv.max(1)
+    }
+}
+
+/// The input rate must leave every RF filter edge below Nyquist: a Butterworth
+/// edge at or past it has no digital equivalent, and the filter bank would come
+/// out as garbage rather than fail. Refused up front with the rate that works.
+fn check_nyquist(freq_hz_half: f64, edges: &[(&str, f64)]) -> Result<()> {
+    for &(name, hz) in edges {
+        if hz >= freq_hz_half {
+            bail!(
+                "input rate {:.3} MHz is too low: the {name} ({:.2} MHz) must be below \
+                 Nyquist ({:.3} MHz); this setting needs an input rate above {:.2} MHz",
+                freq_hz_half * 2.0 / 1e6,
+                hz / 1e6,
+                freq_hz_half / 1e6,
+                hz * 2.0 / 1e6
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Filter delays measured from a synthetic signal (`computedelays`).
@@ -1480,6 +1689,8 @@ pub(crate) struct Delays {
 
 /// Precomputed immutable decode configuration.
 pub struct DecoderSpec {
+    /// The system's constants and filter parameters.
+    pub(crate) sys: &'static SysTable,
     pub(crate) freq: f64,
     pub(crate) freq_half: f64,
     pub(crate) freq_hz: f64,
@@ -1545,20 +1756,21 @@ impl DecoderSpec {
     /// Build the NTSC Laserdisc decode configuration from a request. This
     /// computes the whole filter bank and the measured filter delays.
     pub fn new(request: &DecodeRequest) -> Result<Self> {
-        if request.system != ColorSystem::Ntsc {
-            bail!("only NTSC Laserdisc decoding is implemented so far");
-        }
+        let sys = SysTable::of(request.system);
 
         let freq = request.inputfreq;
         let freq_half = freq / 2.0;
         let freq_hz = freq * 1e6;
         let freq_hz_half = freq_hz / 2.0;
 
-        let line_period = 1.0 / (SYS_FSC_MHZ / 227.5);
-        let active_video_us = [9.45, line_period - 1.0];
-        let fps = 1e6 / (SYS_FRAME_LINES as f64 * line_period);
-        let outlinelen = (line_period * SYS_FSC_MHZ * 4.0).round() as usize;
-        let outfreq = 4.0 * SYS_FSC_MHZ;
+        let (line_period, active_video_us, fps) = if sys.pal {
+            (sys.line_period, sys.active_video_us, sys.fps)
+        } else {
+            let line_period = 1.0 / (SYS_FSC_MHZ / 227.5);
+            (line_period, [9.45, line_period - 1.0], 1e6 / (SYS_FRAME_LINES as f64 * line_period))
+        };
+        let outlinelen = (line_period * sys.fsc_mhz * 4.0).round() as usize;
+        let outfreq = 4.0 * sys.fsc_mhz;
 
         let linelen = (freq_hz / (1e6 / line_period)).round() as usize;
         let samplesperline = freq / linelen as f64;
@@ -1568,18 +1780,16 @@ impl DecoderSpec {
         // `FilterParams_NTSC_lowband` over `FilterParams_NTSC` and only then
         // applies `decoder_params_override`: the preset is the *starting point*,
         // so an explicit override of the same key still wins.
-        let mut video_bpf_low = DP_VIDEO_BPF_LOW;
-        let mut video_bpf_high = DP_VIDEO_BPF_HIGH;
-        let mut video_lpf_freq = DP_VIDEO_LPF_FREQ;
-        let mut mtf_basemult = DP_MTF_BASEMULT;
+        let mut video_bpf_low = sys.video_bpf_low;
+        let mut video_bpf_high = sys.video_bpf_high;
+        let mut video_lpf_freq = sys.video_lpf_freq;
+        let mut mtf_basemult = sys.mtf_basemult;
         if request.lowband {
-            // `FilterParams_NTSC_lowband` is a copy of `FilterParams_NTSC` with
+            // `FilterParams_*_lowband` is a copy of `FilterParams_*` with
             // exactly these three entries replaced ("settings for use with
             // noisier disks"); every other decoder param, including the filter
             // orders, is unchanged.
-            video_bpf_low = 3_800_000.0;
-            video_bpf_high = 12_500_000.0;
-            video_lpf_freq = 4_200_000.0;
+            (video_bpf_low, video_bpf_high, video_lpf_freq) = sys.lowband;
         }
         for (key, &value) in &request.decoder_params_override {
             match key.as_str() {
@@ -1595,7 +1805,7 @@ impl DecoderSpec {
 
         // De-emphasis coefficients: (t1 high-frequency, t2 low-frequency), in
         // seconds. The CLI passes usec, converted here.
-        let mut deemp = DP_VIDEO_DEEMP;
+        let mut deemp = sys.video_deemp;
         let (deemp_low, deemp_high) = request.deemp_coeff;
         if deemp_low > 0.0 {
             deemp[1] = 1.0 / (deemp_low * 1e6);
@@ -1605,12 +1815,23 @@ impl DecoderSpec {
         }
         let deemp_strength = request.deemp_str;
 
+        check_nyquist(
+            freq_hz_half,
+            &[
+                ("video band-pass high edge", video_bpf_high),
+                ("video band-pass low edge", video_bpf_low),
+                ("video low-pass", video_lpf_freq),
+                ("MTF pole frequency", sys.mtf_freq * 1e6),
+                ("dropout RF high-pass", DP_VIDEO_HPF_FREQ),
+            ],
+        )?;
+
         let blocklen = BLOCKSIZE;
         let blockcut = 1024;
-        let audio_lfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 146.25;
-        let audio_rfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 178.75;
+        let (audio_lfreq, audio_rfreq) = sys.audio_freqs();
 
         let (filters, lpf_f64, femp_f64) = compute_filters(
+            sys,
             freq_half,
             freq_hz,
             freq_hz_half,
@@ -1622,10 +1843,11 @@ impl DecoderSpec {
             deemp_strength,
             request.ntsc_color_notch,
         )?;
-        let blockcut_end = filters.f05_offset;
+        let blockcut_end = filters.block_cut_end();
         let blocksize = blocklen - blockcut - blockcut_end;
 
         let delays = compute_delays(
+            sys,
             freq,
             freq_half,
             freq_hz,
@@ -1636,29 +1858,30 @@ impl DecoderSpec {
         );
 
         Ok(Self {
+            sys,
             freq,
             freq_half,
             freq_hz,
             freq_hz_half,
-            sys_fsc_mhz: SYS_FSC_MHZ,
-            sys_frame_lines: SYS_FRAME_LINES,
-            sys_field_lines: SYS_FIELD_LINES,
+            sys_fsc_mhz: sys.fsc_mhz,
+            sys_frame_lines: sys.frame_lines,
+            sys_field_lines: sys.field_lines,
             sys_line_period: line_period,
             sys_active_video_us: active_video_us,
             sys_fps: fps,
             sys_outlinelen: outlinelen,
             sys_outfreq: outfreq,
-            sys_color_burst_us: SYS_COLOR_BURST_US,
-            sys_blacksnr_slice: SYS_BLACKSNR_SLICE,
-            sys_first_field_h: SYS_FIRST_FIELD_H,
-            sys_num_pulses: SYS_NUM_PULSES,
-            sys_hsync_pulse_us: SYS_HSYNC_PULSE_US,
-            sys_eq_pulse_us: SYS_EQ_PULSE_US,
-            sys_vsync_pulse_us: SYS_VSYNC_PULSE_US,
-            sys_output_zero: SYS_OUTPUT_ZERO,
-            sys_field_phases: SYS_FIELD_PHASES,
-            sys_ld_vits_whitelocs: SYS_LD_VITS_WHITELOCS.to_vec(),
-            sys_ld_vits_code_slices: SYS_LD_VITS_CODE_SLICES.to_vec(),
+            sys_color_burst_us: sys.color_burst_us,
+            sys_blacksnr_slice: sys.blacksnr_slice,
+            sys_first_field_h: sys.first_field_h,
+            sys_num_pulses: sys.num_pulses,
+            sys_hsync_pulse_us: sys.hsync_pulse_us,
+            sys_eq_pulse_us: sys.eq_pulse_us,
+            sys_vsync_pulse_us: sys.vsync_pulse_us,
+            sys_output_zero: sys.output_zero,
+            sys_field_phases: sys.field_phases,
+            sys_ld_vits_whitelocs: sys.vits_whitelocs.to_vec(),
+            sys_ld_vits_code_slices: sys.vits_code_slices.to_vec(),
             linelen,
             samplesperline,
             blocklen,
@@ -1690,7 +1913,11 @@ impl DecoderSpec {
 
     /// Samples read per field (port of `LDdecode.readlen` for NTSC).
     pub fn readlen(&self) -> usize {
-        ((self.linelen * 350) / 16384) * 16384
+        if self.sys.pal {
+            self.linelen * 400
+        } else {
+            ((self.linelen * 350) / 16384) * 16384
+        }
     }
 
     /// Demod block stride in input samples; the cut output of consecutive
@@ -1731,14 +1958,15 @@ impl DecoderSpec {
 /// demodulation filters (bandpass slice * short Hilbert) and the stage-2
 /// LPF * de-emphasis filters, plus the audio decimation factor.
 fn compute_audio_filters(
+    sys: &SysTable,
     freq_hz: f64,
     freq_hz_half: f64,
     blocklen: usize,
     audio_lfreq: f64,
     audio_rfreq: f64,
 ) -> ([AudioChannelFilters; 2], usize) {
-    let apass = DP_AUDIO_FILTERWIDTH;
-    let afilt_len = DP_AUDIO_FILTERORDER;
+    let apass = sys.audio_filterwidth;
+    let afilt_len = sys.audio_filterorder;
 
     let build = |center_freq: f64| -> AudioChannelFilters {
         let audio1_fir = firwin(
@@ -1814,7 +2042,10 @@ fn compute_fefm(freq_hz: f64, blocklen: usize) -> Vec<Complex64> {
         *v *= 8.0;
     }
     // self.Filters["Fefm"] *= gen_bpf_supergauss(20000, 1600000, 60, 20000000, blocklen)
-    let bpf = gen_bpf_supergauss(20000.0, 1600000.0, 60, 20000000.0, blocklen);
+    // The reference hard-codes the 40 MHz Nyquist (20 MHz); here it follows the
+    // input rate, which is the same value at 40 MHz and keeps the 20 kHz-1.6 MHz
+    // band put at any other rate.
+    let bpf = gen_bpf_supergauss(20000.0, 1600000.0, 60, freq_hz / 2.0, blocklen);
     if let Some(dir) = std::env::var_os("LD_DUMP_GD") {
         use std::io::Write;
         let d = dir.to_string_lossy().into_owned();
@@ -1839,6 +2070,7 @@ fn compute_fefm(freq_hz: f64, blocklen: usize) -> Vec<Complex64> {
 }
 
 fn compute_filters(
+    sys: &SysTable,
     freq_half: f64,
     freq_hz: f64,
     freq_hz_half: f64,
@@ -1851,7 +2083,7 @@ fn compute_filters(
     ntsc_color_notch: bool,
 ) -> Result<(Filters, Vec<Complex64>, Vec<Complex64>)> {
     // RF highpass for dropout detection.
-    let frfhpf = butter_ba(1, &[10.0 / freq_half], FilterBandType::Highpass)?;
+    let frfhpf = butter_ba(1, &[DP_VIDEO_HPF_FREQ / 1e6 / freq_half], FilterBandType::Highpass)?;
     if std::env::var_os("LD_DUMP_BA").is_some() {
         let hp = butter_ba(
             DP_VIDEO_BPF_LOW_ORDER,
@@ -1863,7 +2095,7 @@ fn compute_filters(
             &[video_bpf_high / freq_hz_half],
             FilterBandType::Lowpass,
         )?;
-        let frfhpf_d = butter_ba(1, &[10.0 / freq_half], FilterBandType::Highpass)?;
+        let frfhpf_d = butter_ba(1, &[DP_VIDEO_HPF_FREQ / 1e6 / freq_half], FilterBandType::Highpass)?;
         let video_lpf_d = butter_ba(
             DP_VIDEO_LPF_ORDER,
             &[DP_VIDEO_LPF_FREQ / freq_hz_half],
@@ -1911,20 +2143,20 @@ fn compute_filters(
     let frfhpf_rfft = frfhpf_fft[..rfft_len].to_vec();
 
     // MTF compensation filter: two poles symmetric about freq_half.
-    let mtf_polef_lo = DP_MTF_FREQ / freq_half;
-    let mtf_polef_hi = (freq_half + (freq_half - DP_MTF_FREQ)) / freq_half;
-    let to_z = |pole: f64| polar2z(DP_MTF_POLEDIST, PI * pole);
+    let mtf_polef_lo = sys.mtf_freq / freq_half;
+    let mtf_polef_hi = (freq_half + (freq_half - sys.mtf_freq)) / freq_half;
+    let to_z = |pole: f64| polar2z(sys.mtf_poledist, PI * pole);
     let mtf_ba = zpk2tf_poles(to_z(mtf_polef_lo), to_z(mtf_polef_hi));
-    let mtf = filtfft(&mtf_ba.0, &mtf_ba.1, blocklen);
+    let mut mtf = filtfft(&mtf_ba.0, &mtf_ba.1, blocklen);
 
     // RF video bandpass as a split highpass (low edge) + lowpass (high edge).
     let rfvideo_hp = butter_ba(
-        DP_VIDEO_BPF_LOW_ORDER,
+        sys.video_bpf_low_order,
         &[video_bpf_low / freq_hz_half],
         FilterBandType::Highpass,
     )?;
     let rfvideo_lp = butter_ba(
-        DP_VIDEO_BPF_HIGH_ORDER,
+        sys.video_bpf_high_order,
         &[video_bpf_high / freq_hz_half],
         FilterBandType::Lowpass,
     )?;
@@ -1949,27 +2181,39 @@ fn compute_filters(
     }
 
     // Audio notch filters: the analog audio carriers bleed into the RF video
-    // band on NTSC Laserdiscs.
-    let audio_lfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 146.25;
-    let audio_rfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 178.75;
-    let notch = |center: f64| -> Result<Vec<Complex64>> {
-        let (lo, hi) = (
-            (center - DP_AUDIO_NOTCHWIDTH) / freq_hz_half,
-            (center + DP_AUDIO_NOTCHWIDTH) / freq_hz_half,
-        );
-        let ba = butter_ba(DP_AUDIO_NOTCHORDER, &[lo, hi], FilterBandType::Bandstop)?;
-        Ok(filtfft(&ba.0, &ba.1, blocklen))
-    };
-    let cut_left = notch(audio_lfreq)?;
-    let cut_right = notch(audio_rfreq)?;
-    // Python: `SF["RFVideo"] *= SF["Fcutl"] * SF["Fcutr"]` (left-assoc).
-    let combined: Vec<Complex64> = cut_left
-        .iter()
-        .zip(&cut_right)
-        .map(|(&l, &r)| np_cmul(l, r))
-        .collect();
-    for (a, &b) in rfvideo.iter_mut().zip(&combined) {
-        *a = np_cmul(*a, b);
+    // band on NTSC Laserdiscs. On PAL they sit inside the video FM lower
+    // sideband, which the notches would bite into; ld-decode only applies
+    // them per block when the carriers are present, and they are left out
+    // here.
+    let (audio_lfreq, audio_rfreq) = sys.audio_freqs();
+    if !sys.pal {
+        let notch = |center: f64| -> Result<Vec<Complex64>> {
+            let (lo, hi) = (
+                (center - sys.audio_notchwidth) / freq_hz_half,
+                (center + sys.audio_notchwidth) / freq_hz_half,
+            );
+            let ba = butter_ba(sys.audio_notchorder, &[lo, hi], FilterBandType::Bandstop)?;
+            Ok(filtfft(&ba.0, &ba.1, blocklen))
+        };
+        let cut_left = notch(audio_lfreq)?;
+        let cut_right = notch(audio_rfreq)?;
+        // Python: `SF["RFVideo"] *= SF["Fcutl"] * SF["Fcutr"]` (left-assoc).
+        let combined: Vec<Complex64> = cut_left
+            .iter()
+            .zip(&cut_right)
+            .map(|(&l, &r)| np_cmul(l, r))
+            .collect();
+        for (a, &b) in rfvideo.iter_mut().zip(&combined) {
+            *a = np_cmul(*a, b);
+        }
+    }
+    if sys.rf_zero_phase {
+        // Amplitude-only pre-demod chain (BPF, MTF): their phase differs at
+        // the two chroma sidebands, an asymmetry that moves with the carrier
+        // (luma) and demodulates as differential phase.
+        for v in rfvideo.iter_mut().chain(mtf.iter_mut()) {
+            *v = Complex64::new(v.norm(), 0.0);
+        }
     }
 
     // Hilbert transform: turns the bandpassed RF into an analytic signal so
@@ -1981,7 +2225,7 @@ fn compute_filters(
 
     // Post-demod lowpass.
     let video_lpf = butter_ba(
-        DP_VIDEO_LPF_ORDER,
+        sys.video_lpf_order,
         &[video_lpf_freq / freq_hz_half],
         FilterBandType::Lowpass,
     )?;
@@ -2022,7 +2266,7 @@ fn compute_filters(
         .map(|(&a, &b)| np_cmul(a, np_cpow(b, strength)))
         .collect();
     let fvideo_pregd = fvideo.clone();
-    let fvideo_gd = build_groupdelay_equalizer(&fvideo_lpf, video_lpf_freq, freq_hz, blocklen);
+    let fvideo_gd = build_groupdelay_equalizer(sys, &fvideo_lpf, video_lpf_freq, freq_hz, blocklen);
     for (a, &b) in fvideo.iter_mut().zip(&fvideo_gd) {
         *a = np_cmul(*a, b);
     }
@@ -2042,13 +2286,25 @@ fn compute_filters(
     let fburst_taps = firwin(
         81,
         &[
-            (SYS_FSC_MHZ - 0.2) / freq_half,
-            (SYS_FSC_MHZ + 0.2) / freq_half,
+            (sys.fsc_mhz - 0.2) / freq_half,
+            (sys.fsc_mhz + 0.2) / freq_half,
         ],
         false,
     );
-    let fvideo_burst_offset = 40;
-    let fburst_fft = filtfft(&fburst_taps, &[1.0], blocklen);
+    // PAL: this third channel carries the 3.75 MHz pilot instead (the lines
+    // are locked onto it; the burst is measured on the video channel). A
+    // first-order IIR band-pass as in ld-decode; its constant phase shifts
+    // every line alike.
+    let (fvideo_burst_offset, fburst_fft) = if sys.pal {
+        let ba = butter_ba(
+            1,
+            &[(sys.pilot_mhz - 0.1) / freq_half, (sys.pilot_mhz + 0.1) / freq_half],
+            FilterBandType::Bandpass,
+        )?;
+        (0, filtfft(&ba.0, &ba.1, blocklen))
+    } else {
+        (40, filtfft(&fburst_taps, &[1.0], blocklen))
+    };
     let fvideo_burst: Vec<Complex64> = fvideo_lpf_eff
         .iter()
         .zip(&fdeemp)
@@ -2142,8 +2398,24 @@ fn compute_filters(
         ]
     };
 
+    let pal_burst_rfft = if sys.pal {
+        let fb = filtfft(&fburst_taps, &[1.0], blocklen);
+        Some(
+            (0..rfft_len)
+                .map(|k| {
+                    let v = np_cmul(np_cmul(fvideo_lpf_eff[k], fdeemp[k]), fb[k]);
+                    let (s, c) = numpy_sincos(2.0 * PI * 40.0 * k as f64 / blocklen as f64);
+                    np_cmul(v, Complex64::new(c, s))
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     // Analog audio channel filters and the EFM equalisation filter.
     let (audio, audio_fdiv) = compute_audio_filters(
+        sys,
         freq_hz,
         freq_hz_half,
         blocklen,
@@ -2163,6 +2435,7 @@ fn compute_filters(
             fvideo05,
             f05_offset,
             fvideo_burst_offset,
+            pal_burst_rfft,
             audio,
             audio_fdiv,
             fefm,
@@ -2175,14 +2448,25 @@ fn compute_filters(
 /// All-pass group-delay equaliser matching the IEC 60857 9.1.7 NTSC video
 /// group-delay pre-distortion (port of `build_groupdelay_equalizer`).
 fn build_groupdelay_equalizer(
+    sys: &SysTable,
     lpf_fft: &[Complex64],
     lpf_freq: f64,
     fs: f64,
     blocklen: usize,
 ) -> Vec<Complex64> {
     // IEC 60857 9.1.7 target group delay relative to 0.5 MHz, in seconds.
-    let gd_f = [0.0, 0.5e6, 2.0e6, 3.0e6, 3.58e6, 4.0e6, 4.2e6, 4.8e6];
-    let gd_t = [0.0, 0.0, 15e-9, 45e-9, 80e-9, 135e-9, 200e-9, 200e-9];
+    // PAL: IEC 60856 9.1.6 instead.
+    let (gd_f, gd_t) = if sys.pal {
+        (
+            [0.0, 0.5e6, 2.0e6, 3.0e6, 4.0e6, 4.4336e6, 4.8e6, 5.5e6],
+            [0.0, 0.0, 10e-9, 35e-9, 85e-9, 135e-9, 200e-9, 200e-9],
+        )
+    } else {
+        (
+            [0.0, 0.5e6, 2.0e6, 3.0e6, 3.58e6, 4.0e6, 4.2e6, 4.8e6],
+            [0.0, 0.0, 15e-9, 45e-9, 80e-9, 135e-9, 200e-9, 200e-9],
+        )
+    };
 
     let binfreq: Vec<f64> = (0..blocklen)
         .map(|k| {
@@ -2349,6 +2633,7 @@ fn build_groupdelay_equalizer(
 /// Measure the filter delays from a synthetic signal (port of
 /// `RFDecode.computedelays`). Uses the initial (spec) calibration levels.
 fn compute_delays(
+    sys: &SysTable,
     freq: f64,
     freq_half: f64,
     freq_hz: f64,
@@ -2357,7 +2642,7 @@ fn compute_delays(
     fvideo_lpf: &[Complex64],
     femp: &[Complex64],
 ) -> Delays {
-    let levels = CalibLevels::defaults();
+    let levels = CalibLevels::defaults(sys);
     let iretohz = |ire: f64| levels.iretohz(ire);
 
     let mut fakeoutput = vec![iretohz(0.0); blocklen];
@@ -2369,7 +2654,7 @@ fn compute_delays(
     let porch_end = 2000 + synclen_full + (0.6 * freq) as usize;
     let burst_end = porch_end + (1.2 * freq) as usize;
 
-    let rate = vec![SYS_FSC_MHZ; burst_end - porch_end];
+    let rate = vec![sys.fsc_mhz; burst_end - porch_end];
     let wave = genwave(&rate, freq / 2.0, 0.0);
     for (i, &w) in wave.iter().enumerate() {
         fakeoutput[porch_end + i] += w * levels.hz_ire as f64 * 20.0;
@@ -2380,13 +2665,13 @@ fn compute_delays(
     // white + burst
     fakeoutput[4500..5000].fill(iretohz(100.0));
 
-    let rate = vec![SYS_FSC_MHZ; 5500 - 4200];
+    let rate = vec![sys.fsc_mhz; 5500 - 4200];
     let wave = genwave(&rate, freq / 2.0, 0.0);
     for (i, &w) in wave.iter().enumerate() {
         fakeoutput[4200 + i] += w * levels.hz_ire as f64 * 20.0;
     }
 
-    let rate = vec![SYS_FSC_MHZ; synclen_full];
+    let rate = vec![sys.fsc_mhz; synclen_full];
     let wave = genwave(&rate, freq / 2.0, 0.0);
     for (i, &w) in wave.iter().enumerate() {
         fakeoutput[2000 + i] = iretohz(levels.vsync_ire as f64)
@@ -2463,6 +2748,53 @@ fn ifft_real(data: &[Complex64], blocklen: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec_at(mhz: f64) -> Result<DecoderSpec> {
+        let mut request = crate::request::DecodeRequest::default();
+        request.inputfreq = mhz;
+        DecoderSpec::new(&request)
+    }
+
+    /// Nothing the spec derives may depend on the input rate being 40 MHz: the
+    /// audio blocks must tile at the video block stride (whole audio samples per
+    /// block) and the cuts must never fall below the FIR delay they hide.
+    #[test]
+    fn blocks_tile_at_every_supported_input_rate() {
+        for mhz in [28.0, 30.0, 37.5, 40.0, 45.0, 60.0, 75.0] {
+            let spec = spec_at(mhz).unwrap_or_else(|e| panic!("{mhz} MHz: {e:#}"));
+            let fdiv = spec.filters.audio_fdiv;
+            assert!(fdiv >= 1 && spec.blocklen % fdiv == 0, "{mhz} MHz: fdiv {fdiv}");
+            assert_eq!(spec.blockcut % fdiv, 0, "{mhz} MHz: blockcut");
+            assert_eq!(spec.blockcut_end % fdiv, 0, "{mhz} MHz: blockcut_end");
+            assert_eq!(spec.blocksize % fdiv, 0, "{mhz} MHz: blocksize");
+            assert!(spec.blockcut_end >= spec.filters.f05_offset, "{mhz} MHz");
+            assert_eq!(
+                spec.blocksize,
+                spec.blocklen - spec.blockcut - spec.blockcut_end,
+                "{mhz} MHz"
+            );
+        }
+    }
+
+    /// The reference's cut at 40 MHz is unchanged by the rate-following rule.
+    #[test]
+    fn blockcut_end_at_40mhz_is_the_reference_value() {
+        let spec = spec_at(40.0).unwrap();
+        assert_eq!(spec.filters.audio_fdiv, 32);
+        assert_eq!(spec.blockcut_end, 32);
+        assert_eq!(spec.blocksize, 31712);
+    }
+
+    /// A rate whose Nyquist is under the 13.8 MHz video band edge is refused
+    /// with a message, not decoded through a nonsensical filter bank.
+    #[test]
+    fn too_low_an_input_rate_is_refused_with_the_reason() {
+        let err = match spec_at(20.0) {
+            Ok(_) => panic!("20 MHz must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("too low") && err.contains("27.60"), "{err}");
+    }
 
     /// Every value the spec *constructs*, as a `(name, FNV-1a hash)` list: the
     /// whole filter bank (which is the ducc-FFT output of the constructed
@@ -2985,7 +3317,7 @@ mod tests {
         let audio_lfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 146.25;
         let audio_rfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 178.75;
         let ([left, right], fdiv) =
-            compute_audio_filters(40e6, 20e6, 32768, audio_lfreq, audio_rfreq);
+            compute_audio_filters(&NTSC, 40e6, 20e6, 32768, audio_lfreq, audio_rfreq);
         assert_eq!(fdiv, 32);
         assert!((left.a1_freq - 1250000.0).abs() < 1e-6);
         assert!((right.low_freq - 2500000.0).abs() < 1e-6);

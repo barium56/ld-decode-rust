@@ -12,14 +12,9 @@
 
 mod audio;
 mod demodblock;
-// `ducc_plan` is a bit-exact CPU replica of ducc's 1-D plan, and `gpu` runs that
-// plan on an OpenCL device. Both are compiled unconditionally: `--gpu` is a
-// runtime decision (the ICD is probed at start-up), so the code has to exist in
-// the shipped binary. Their `#[ignore]`d probes still own the measurements.
-#[allow(dead_code)]
-mod ducc_plan;
-#[allow(dead_code)]
-mod gpu;
+// `--gpu`: the whole FM demodulator on an OpenCL device (`demod_gpu`). The
+// OpenCL runtime is loaded at run time, so the code is always compiled in.
+mod demod_gpu;
 #[cfg(test)]
 mod probe_test;
 mod dropouts;
@@ -458,16 +453,6 @@ struct DbgTiming {
     df_resolve: u64,
     df_plan: u64,
     df_new: u64,
-    /// `--gpu` running totals: device nanoseconds and blocks drained per field,
-    /// plus the field count, for the `GPUTIME` aggregate line.
-    gpu_ns_total: f64,
-    gpu_blocks_total: u64,
-    gpu_fields: u64,
-    /// CPU-side demod nanoseconds across the same fields. The device figure on
-    /// its own says nothing; the pair is what shows whether the demodulation
-    /// actually left the CPU or merely moved.
-    gpu_cpu_ns_total: f64,
-    gpu_iter_ns_total: f64,
 }
 
 /// Wall span of the most recent async prefetch batch, in nanoseconds: from just
@@ -539,13 +524,10 @@ struct DbgMeta {
 }
 
 /// Demodulate a batch of blocks: the CPU pool normally, or -- with `--gpu` --
-/// the heads on the pool and the late group batched on the device.
-///
-/// The two paths produce the same bytes (`LateGroup` is bit-exact), so this is a
-/// speed knob only. A device failure mid-decode falls back to the CPU for that
-/// batch rather than aborting: the CPU late group is the reference path.
+/// the whole demodulator on the device (`demod_gpu`). A device failure falls
+/// back to the CPU kernel.
 fn demod_batch(
-    gpu: Option<&Arc<Mutex<gpu::LateGroup>>>,
+    gpu: Option<&Arc<demod_gpu::GpuDemod>>,
     blocks: &[(u64, &[f32])],
     mtf: f64,
     dspec: &DemodSpecRef,
@@ -563,37 +545,8 @@ fn demod_batch(
             })
             .collect();
     };
-    let heads: Vec<(u64, demodblock::DemodHead, Option<usize>)> = blocks
-        .par_iter()
-        .map(|&(bnum, data)| {
-            let (head, dump) =
-                demodblock::demod_head_only(data, mtf, dspec, true, mtf_pow, rotdelay, bnum);
-            (bnum, head, dump)
-        })
-        .collect();
-    let (start, end) = demodblock::kept_range(dspec.blocklen, dspec, true);
-    let series: Vec<&[f64]> = heads
-        .iter()
-        .map(|(_, h, _)| h.demod_clamped.as_slice())
-        .collect();
-    let late = dev.lock().unwrap().run(&series, start, end - start);
-    match late {
-        Ok(videos) => heads
-            .into_par_iter()
-            .zip(videos)
-            .map(|((bnum, head, _), vids)| (bnum, demodblock::demod_assemble(head, vids)))
-            .collect(),
-        Err(err) => {
-            crate::teeprintln!("--gpu late group failed ({err}); using the CPU for this batch");
-            heads
-                .into_par_iter()
-                .map(|(bnum, head, dump)| {
-                    let vids = demodblock::demod_late_cpu(&head, dspec, true, dump);
-                    (bnum, demodblock::demod_assemble(head, vids))
-                })
-                .collect()
-        }
-    }
+    let out = gpu_demod_blocks(dev, blocks, mtf, mtf_pow, dspec, rotdelay);
+    blocks.iter().map(|b| b.0).zip(out).collect()
 }
 
 pub struct Decoder {
@@ -665,13 +618,9 @@ pub struct Decoder {
     /// pool free for the tail's own data-parallel sections (the sinc gather),
     /// which otherwise lose half their threads to the side work.
     side_pool: Arc<rayon::ThreadPool>,
-    /// `--gpu`: the demod late group batched over a field's blocks on an
-    /// OpenCL device. `None` is the normal path (and the fallback if the device
-    /// is lost mid-decode).
-    gpu: Option<Arc<Mutex<gpu::LateGroup>>>,
-    /// The device's own per-field counters, cloned out of `gpu` so `LD_TIMING`
-    /// can read them without taking the batch mutex.
-    gpu_stats: Option<Arc<gpu::GpuCounters>>,
+    /// `--gpu`: the FM demodulator on an OpenCL device. `None` is the CPU
+    /// kernel (and the fallback if the device fails mid-decode).
+    gpu: Option<Arc<demod_gpu::GpuDemod>>,
     /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
     /// slowly-varying scalar — constant for thousands of fields in steady
     /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
@@ -699,26 +648,28 @@ pub struct Decoder {
 
 
 impl Decoder {
-    /// Turn on the `--gpu` late group. Opening the device is done eagerly so a
-    /// host without OpenCL fails at start-up with a reason instead of decoding
-    /// half a disc on one path and the rest on the other.
-    pub fn enable_gpu(&mut self) -> Result<String, String> {
-        let lg = gpu::LateGroup::open(self.spec.blocklen, &self.spec.filters.fvideo_rfft, 64)?;
-        let what = format!(
-            "{} (blocklen {}, batches up to 64 blocks)",
-            lg.describe(),
-            lg.blocklen()
-        );
-        self.gpu_stats = Some(lg.counters());
-        self.gpu = Some(Arc::new(Mutex::new(lg)));
-        Ok(what)
+    /// Turn on the `--gpu` demodulator, in double (`f64`) or single precision.
+    /// Opening the device is done eagerly so a host without OpenCL fails at
+    /// start-up with a reason instead of decoding half a disc on one path and
+    /// the rest on the other.
+    pub fn enable_gpu(&mut self, f64: bool) -> Result<String, String> {
+        let spec = &self.spec;
+        let dspec = DemodSpecRef::with_plans(spec.freq, spec.freq_half, spec.freq_hz, spec.blocklen, &spec.filters, &self.levels);
+        let dev = demod_gpu::GpuDemod::new(&dspec, f64).map_err(|e| format!("{e:#}"))?;
+        let name = crate::opencl::Gpu::get().map(|g| g.name.clone()).unwrap_or_default();
+        self.gpu = Some(Arc::new(dev));
+        Ok(format!("{name} ({} precision)", if f64 { "double" } else { "single" }))
     }
 
     pub fn new(spec: Arc<DecoderSpec>, fdoffset: u64) -> Self {
         let output_lines = spec.output_lines();
         let bytes_per_field = spec.bytes_per_field() as f64;
         let linelen = spec.linelen;
-        let readlen = ((linelen * 350) / 16384) * 16384;
+        let readlen = if spec.sys.pal { linelen * 400 } else { ((linelen * 350) / 16384) * 16384 };
+        // Read before `spec` moves into the struct: the EFM PLL clocks at the
+        // input rate.
+        let sample_rate_hz = spec.freq_hz;
+        let levels = CalibLevels::defaults(spec.sys);
         Self {
             spec,
             dbg: DbgTiming {
@@ -737,17 +688,12 @@ impl Decoder {
                 pf_blocks: 0,
                 demod_calls: 0,
                 demod_cpu_ns: 0,
-                gpu_ns_total: 0.0,
-                gpu_blocks_total: 0,
-                gpu_fields: 0,
-                gpu_cpu_ns_total: 0.0,
-                gpu_iter_ns_total: 0.0,
                 pf_copy: 0,
                 df_resolve: 0,
                 df_plan: 0,
                 df_new: 0,
             },
-            levels: CalibLevels::defaults(),
+            levels,
             fdoffset,
             fdoffset_frac: 0.0,
             fields_written: 0,
@@ -756,7 +702,7 @@ impl Decoder {
             firstfield_linecode: None,
             lastvalidfield: [None, None],
             last_written: None,
-            efm_pll: EfmPll::new(),
+            efm_pll: EfmPll::new(sample_rate_hz),
             // Under LD_DUMP_PLL the reference debug stream comes straight from
             // the inline call, so keep speculation out of that path entirely.
             pll_spec: PllSpec::new(std::env::var_os("LD_DUMP_PLL").is_some()),
@@ -824,7 +770,6 @@ impl Decoder {
             mtf_hist: VecDeque::from([1.0, 1.0]),
             mtf_pow_memo: Arc::new(Mutex::new(HashMap::new())),
             gpu: None,
-            gpu_stats: None,
             pending_prefetch: None,
             metadata: None,
             output_lines,
@@ -1267,22 +1212,8 @@ impl Decoder {
             let d_dns = dns.saturating_sub(self.dbg.demod_cpu_ns);
             self.dbg.demod_calls = dcalls;
             self.dbg.demod_cpu_ns = dns;
-            // `--gpu`: drain the device's own time for this field's window, so
-            // the split is a field on the line rather than something inferred
-            // from `pffold` (which is a *wait*, and says nothing about whether
-            // the work moved or merely changed shape).
-            let (gpu_ms, gpu_blocks) = match self.gpu_stats.as_ref() {
-                Some(c) => c.take(),
-                None => (0.0, 0),
-            };
-            let iter_ms = t_iter_total as f64 / 1e6;
-            let gpu_share = if iter_ms > 0.0 {
-                gpu_ms / iter_ms * 100.0
-            } else {
-                0.0
-            };
             crate::teeprintln!(
-                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2} pfspan={:.2} pfwork={:.2} mtfpow={:.2} mtfmiss={} gpu={:.2} gpub={} gpus={:.1}",
+                "TIMING fw={} decf_total={:.2} demod={:.2} asm={:.2} asmI={:.2} asmE={:.2} phase2={:.2} prefetch={:.2} pffold={:.2} proc={:.2} dfrest={:.2} down={:.2} vits={:.2} meta={:.2} metaD={:.2} metaV={:.2} out={:.2} rest={:.2} iter={:.2} minb={} pfblk={} dcalls={} dcpu={:.1} pfcopy={:.2} dfres={:.2} dfplan={:.2} dfnew={:.2} pfspan={:.2} pfwork={:.2} mtfpow={:.2} mtfmiss={}",
                 self.fields_written,
                 ms(df_total),
                 ms(dbg.demod),
@@ -1314,42 +1245,7 @@ impl Decoder {
                 PF_WORK_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                 MTF_POW_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                 MTF_POW_MISSES.swap(0, std::sync::atomic::Ordering::Relaxed),
-                gpu_ms,
-                gpu_blocks,
-                gpu_share,
             );
-            // Rolling split, so a long run does not have to be read column by
-            // column: device ms/field against the pool's own demod ms/field
-            // (`dcpu`) and the iteration they sit in.
-            if self.gpu.is_some() {
-                self.dbg.gpu_ns_total += gpu_ms;
-                self.dbg.gpu_blocks_total += gpu_blocks;
-                self.dbg.gpu_cpu_ns_total += d_dns as f64 / 1e6;
-                self.dbg.gpu_iter_ns_total += iter_ms;
-                self.dbg.gpu_fields += 1;
-                if self.dbg.gpu_fields % 500 == 0 {
-                    let n = self.dbg.gpu_fields as f64;
-                    let dev = self.dbg.gpu_ns_total / n;
-                    let cpu = self.dbg.gpu_cpu_ns_total / n;
-                    let it = self.dbg.gpu_iter_ns_total / n;
-                    // `cpu` is CPU *thread* time summed over the pool, so it is
-                    // reported as cores' worth rather than as a share of wall
-                    // time: the pair (wall share of the device, cores still
-                    // spent on the head) is the split that decides whether
-                    // offloading more could pay.
-                    crate::teeprintln!(
-                        "GPUTIME fw={} fields={} device={:.2} ms/field head_cpu={:.2} ms/field ({:.1} cores) iter={:.2} ms/field device_share={:.0}% blocks/field={:.1}",
-                        self.fields_written,
-                        self.dbg.gpu_fields,
-                        dev,
-                        cpu,
-                        if it > 0.0 { cpu / it } else { 0.0 },
-                        it,
-                        if it > 0.0 { dev / it * 100.0 } else { 0.0 },
-                        self.dbg.gpu_blocks_total as f64 / n
-                    );
-                }
-            }
             if crate::decode::demodblock::demod_prof::enabled() {
                 let d = crate::decode::demodblock::stage_deltas();
                 let mut parts = String::new();
@@ -2590,7 +2486,8 @@ impl Decoder {
                 let minute_seconds = clv_minutes * 60;
                 if let Some(clv_seconds) = self.clv_seconds {
                     // newer CLV
-                    return Some((minute_seconds + clv_seconds) * 30 + self.clv_frame_num.unwrap_or(0));
+                    let clvfps = if self.spec.sys.pal { 25 } else { 30 };
+                    return Some((minute_seconds + clv_seconds) * clvfps + self.clv_frame_num.unwrap_or(0));
                 } else {
                     self.early_clv = true;
                     return Some(minute_seconds);
@@ -2622,7 +2519,7 @@ impl Decoder {
         let blanking = ire_to_output(0.0);
         let white = ire_to_output(100.0);
         Some(DecoderMetadata {
-            system: ColorSystem::Ntsc.as_str(),
+            system: if self.spec.sys.pal { ColorSystem::Pal.as_str() } else { ColorSystem::Ntsc.as_str() },
             number_of_sequential_fields: self.fieldinfo.len(),
             field_width: self.spec.sys_outlinelen,
             sample_rate: self.spec.sys_outfreq * 1e6,
@@ -2685,4 +2582,56 @@ fn write_par_concat<T: Copy + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
         .into_par_iter()
         .zip(parts.par_iter())
         .for_each(|(d, p)| d.copy_from_slice(p));
+}
+
+/// Demodulate `blocks` on the GPU. A GPU failure falls back to the CPU kernel
+/// (once reported); `LD_GPU_CHECK` also runs the CPU kernel and logs how far
+/// apart the two are.
+fn gpu_demod_blocks(
+    gpu: &demod_gpu::GpuDemod,
+    blocks: &[(u64, &[f32])],
+    mtf: f64,
+    pow: Option<&[Complex64]>,
+    dspec: &DemodSpecRef,
+    rotdelay: i64,
+) -> Vec<BlockDecode> {
+    let cpu = || -> Vec<BlockDecode> {
+        blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
+    };
+    let data: Vec<&[f32]> = blocks.iter().map(|b| b.1).collect();
+    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec) {
+        Ok(v) => v,
+        Err(e) => {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("GPU demod failed, using the CPU: {e:#}");
+            }
+            return cpu();
+        }
+    };
+    if std::env::var_os("LD_GPU_CHECK").is_some() {
+        let reference = cpu();
+        let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let rms = |a: &[f32], b: &[f32]| {
+            (a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum::<f64>() / a.len().max(1) as f64).sqrt()
+        };
+        for (g, c) in out.iter().zip(&reference) {
+            let e = g.video.efm.iter().zip(&c.video.efm).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap_or(0);
+            crate::teeprintln!(
+                "GPUCHECK len {}/{} demod max {:.2} rms {:.3} Hz | 05 max {:.2} | burst max {:.2} | raw max {:.2} | rfhpf max {:.3} rms {:.4} | efm max {} | audio max {:.2}",
+                g.video.demod.len(),
+                c.video.demod.len(),
+                worst(&g.video.demod, &c.video.demod),
+                rms(&g.video.demod, &c.video.demod),
+                worst(&g.video.demod_05, &c.video.demod_05),
+                worst(&g.video.demod_burst, &c.video.demod_burst),
+                worst(&g.video.demod_raw, &c.video.demod_raw),
+                worst(&g.rfhpf, &c.rfhpf),
+                rms(&g.rfhpf, &c.rfhpf),
+                e,
+                worst(&g.video.audio[0], &c.video.audio[0]),
+            );
+        }
+    }
+    out
 }
